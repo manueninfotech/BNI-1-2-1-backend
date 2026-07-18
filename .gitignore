@@ -1,0 +1,12 @@
+node_modules
+dist
+.env
+.env.local
+.vercel
+*.log
+.DS_Store
+
+# NEVER commit service account keys. Credentials come from FIREBASE_SERVICE_ACCOUNT.
+*serviceAccount*.json
+*firebase-adminsdk*.json
+.env*

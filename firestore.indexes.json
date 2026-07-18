@@ -1,0 +1,14 @@
+{
+  "indexes": [
+    {
+      "//": "startRound: find a conclave this admin is already running.",
+      "collectionGroup": "conclaves",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "startedBy", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

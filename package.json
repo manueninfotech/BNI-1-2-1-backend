@@ -1,0 +1,39 @@
+{
+  "name": "conclave-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BNI 121 Conclave \u2014 API and matching engine",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "create-admin": "tsx scripts/createAdmin.ts",
+    "seed": "tsx scripts/seed.ts",
+    "check-rules": "tsx scripts/checkRules.ts"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.2.1",
+    "firebase-admin": "^14.1.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.10.1",
+    "tsx": "^4.22.5",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  },
+  "overrides": {
+    "jose": "^4.15.9"
+  }
+}

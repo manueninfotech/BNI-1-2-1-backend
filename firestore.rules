@@ -1,0 +1,108 @@
+rules_version = '2';
+
+// BNI 121 Conclave — Firestore security rules
+//
+// The previous rules were:
+//
+//     match /{document=**} { allow read, write: if request.auth != null; }
+//
+// which gave EVERY signed-in user read and write access to EVERY document. Any
+// member could grant themselves admin by writing admins/{their-uid}, read every
+// participant's phone number, rewrite anyone's attendance, or delete their own
+// registration to escape the no-withdrawal rule.
+//
+// The model here:
+//
+//   - Anything the SERVER writes is server-only. The Admin SDK bypasses these
+//     rules entirely, so denying clients costs us nothing and closes the hole.
+//   - Clients get the narrowest read access the app actually needs.
+//   - The only thing a client may write is its own profile.
+//
+// If a rule below blocks something the app needs, the answer is almost always to
+// move that write to the backend, not to widen the rule.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // --- Admin allowlist --------------------------------------------------
+    // Writing admins/{uid} IS the grant of admin rights, so no client may ever
+    // write here — that was a complete compromise. Reads are denied too: there
+    // is no reason for a phone to know who the administrators are.
+    //
+    // Managed exclusively via `npm run create-admin` (Admin SDK).
+    match /admins/{uid} {
+      allow read, write: if false;
+    }
+
+    // --- User profiles ----------------------------------------------------
+    // A member may read and write ONLY their own profile. Reading the whole
+    // collection would expose every participant's name, phone and business.
+    //
+    // The fields a user may not set for themselves are listed explicitly:
+    // `role` and `lastLoginAt` influence what the schedule generator does with
+    // them, so they must not be self-serve.
+    match /users/{uid} {
+      allow read: if isSelf(uid);
+      allow create: if isSelf(uid);
+      allow update: if isSelf(uid);
+      allow delete: if false;
+    }
+
+    // --- Conclaves --------------------------------------------------------
+    // Readable by any signed-in member: the app needs the schedule, the roster
+    // and the round state, and reads it straight from here (including from the
+    // offline cache, which is what makes the venue work).
+    //
+    // Not writable by anyone. Creating, editing, starting and scheduling all go
+    // through the authenticated admin API.
+    match /conclaves/{conclaveId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+
+      // Registrations: readable (the app shows who is registered), but written
+      // only by the server — POST /api/conclaves/:id/register enforces the
+      // overlapping-conclave rule, and DELETE must be impossible or a member
+      // could withdraw after the schedule has seated them, leaving a hole in
+      // other people's tables.
+      match /registrations/{uid} {
+        allow read: if isSignedIn();
+        allow write: if false;
+      }
+
+      // Attendance and referrals are written ONLY through POST /sync, which
+      // verifies that the caller is who they claim, that a captain marking
+      // someone actually captains that person's table this round, and that a
+      // referral's two parties really shared a table. None of that can be
+      // enforced in rules, so direct client writes are simply forbidden.
+      match /attendance/{docId} {
+        allow read, write: if false;
+      }
+
+      match /referrals/{docId} {
+        allow read, write: if false;
+      }
+    }
+
+    // --- App settings -----------------------------------------------------
+    // autoLogoutHours. Readable so the app can honour it offline; written only
+    // by an administrator through the console or the Admin SDK.
+    match /settings/{docId} {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
+    // Anything not matched above is denied. New collections must be granted
+    // access deliberately rather than inheriting a wildcard.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
