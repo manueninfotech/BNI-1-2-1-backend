@@ -16,6 +16,8 @@
     "test:watch": "vitest",
     "create-admin": "tsx scripts/createAdmin.ts",
     "seed": "tsx scripts/seed.ts",
+    "seed-full": "tsx scripts/seedFullConclave.ts",
+    "delete-conclave": "tsx scripts/deleteSeededConclave.ts",
     "check-rules": "tsx scripts/checkRules.ts"
   },
   "dependencies": {

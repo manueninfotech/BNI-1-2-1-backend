@@ -40,7 +40,38 @@ export interface SyncResult {
     status: string;
     currentRound: number;
     currentRoundStartedAt: string | null;
+    title: string;
+    date: string | null;
+    venue: string;
   };
+  tableNumber: number | null;
+  captainName: string | null;
+  tableOccupants: Array<{
+    uid: string;
+    name: string;
+    company: string;
+    category: string;
+    chapter: string;
+    isCaptain: boolean;
+    isPresent: boolean;
+  }>;
+  mySchedule: Array<{
+    number: number;
+    status: string;
+    table: string;
+    tableNumber: number;
+    captain: string;
+    time: string;
+    participants: Array<{
+      uid: string;
+      name: string;
+      company: string;
+      category: string;
+      chapter: string;
+      isCaptain: boolean;
+      isPresent: boolean;
+    }>;
+  }>;
   errors: string[];
 }
 
@@ -248,6 +279,95 @@ export async function syncConclave(
     };
   });
 
+  const participants = Array.isArray(conclave.participants) ? conclave.participants : [];
+  const schedule = conclave.schedule;
+
+  const callerParticipant = participants.find((p: any) => p._originalUid === callerUid);
+
+  let tableNumber: number | null = null;
+  let captainName = "";
+  let tableOccupants: any[] = [];
+  let mySchedule: any[] = [];
+
+  const getRoundTimeLabel = (roundNum: number) => {
+    const times = [
+      "09:00 AM - 09:45 AM",
+      "10:15 AM - 11:00 AM",
+      "11:30 AM - 12:15 PM",
+      "01:30 PM - 02:15 PM",
+      "02:45 PM - 03:30 PM",
+      "04:00 PM - 04:45 PM",
+      "05:15 PM - 06:00 PM",
+      "06:30 PM - 07:15 PM"
+    ];
+    return times[roundNum - 1] || "TBD Time";
+  };
+
+  if (callerParticipant && schedule?.rounds) {
+    const pId = callerParticipant.id;
+    const currentRound = conclave.currentRound || 1;
+
+    const attSnap = await ref.collection(collections.attendance).get();
+    const presenceMap = new Map<string, boolean>();
+    attSnap.forEach(d => {
+      const a = d.data();
+      presenceMap.set(`${a.roundNumber}-${a.userId}`, !!a.isPresent);
+    });
+
+    mySchedule = schedule.rounds.map((r: any) => {
+      const table = r.tables.find((t: any) => t.captainId === pId || t.memberIds?.includes(pId));
+      if (!table) return null;
+
+      const rNum = r.roundNumber;
+      let status = "Upcoming";
+      if (rNum < currentRound) {
+        status = "Completed";
+      } else if (rNum === currentRound && conclave.status === "active") {
+        status = "Active";
+      }
+
+      const capObj = participants.find((p: any) => p.id === table.captainId);
+      const memObjs = participants.filter((p: any) => table.memberIds?.includes(p.id));
+      const occupantsList = [
+        ...(capObj ? [{
+          uid: capObj._originalUid,
+          name: capObj.name,
+          company: capObj.businessName,
+          category: capObj.businessCategory,
+          chapter: capObj.chapter,
+          isCaptain: true,
+          isPresent: presenceMap.get(`${rNum}-${capObj._originalUid}`) ?? true
+        }] : []),
+        ...memObjs.map((o: any) => ({
+          uid: o._originalUid,
+          name: o.name,
+          company: o.businessName,
+          category: o.businessCategory,
+          chapter: o.chapter,
+          isCaptain: false,
+          isPresent: presenceMap.get(`${rNum}-${o._originalUid}`) ?? false
+        }))
+      ];
+
+      return {
+        number: rNum,
+        status,
+        table: `Table ${table.tableNumber}`,
+        tableNumber: table.tableNumber,
+        captain: capObj ? capObj.name : "Unknown",
+        time: getRoundTimeLabel(rNum),
+        participants: occupantsList
+      };
+    }).filter(Boolean);
+
+    const currentRoundSeating = mySchedule.find(s => s.number === currentRound);
+    if (currentRoundSeating) {
+      tableNumber = currentRoundSeating.tableNumber;
+      captainName = currentRoundSeating.captain;
+      tableOccupants = currentRoundSeating.participants;
+    }
+  }
+
   return {
     // NTP-style pair. The client needs BOTH: with a single timestamp it cannot
     // tell network latency apart from server processing time, and the Firestore
@@ -263,7 +383,14 @@ export async function syncConclave(
       status: conclave.status ?? "draft",
       currentRound: conclave.currentRound ?? 0,
       currentRoundStartedAt: toIso(conclave.currentRoundStartedAt),
+      title: conclave.name || conclave.title || "BNI Conclave",
+      date: conclave.date || null,
+      venue: conclave.venueLocation || conclave.venue || "TBD Venue"
     },
+    tableNumber,
+    captainName,
+    tableOccupants,
+    mySchedule,
     errors,
   };
 }

@@ -27,6 +27,7 @@ interface CreateInput {
   chiefGuests?: unknown;
   personsPerTable?: number;
   roundCount?: number;
+  region?: string;
 }
 
 /**
@@ -36,7 +37,7 @@ interface CreateInput {
  * admin could create a conclave with 99 rounds and only discover it was invalid
  * after registration had closed. Fail at creation instead.
  */
-function validateConfig(personsPerTable: number, roundCount: number) {
+export function validateConfig(personsPerTable: number, roundCount: number) {
   if (!Number.isInteger(personsPerTable) || personsPerTable < MIN_PERSONS_PER_TABLE) {
     throw ApiError.badRequest(
       `personsPerTable must be a whole number of at least ${MIN_PERSONS_PER_TABLE}.`,
@@ -65,6 +66,7 @@ export async function createConclave(input: CreateInput) {
   const ref = await db.collection(collections.conclaves).add({
     name: input.name,
     venueLocation: input.venueLocation,
+    region: input.region || "Guntur Region",
     date: input.date ? new Date(input.date) : new Date(),
     // Start/end are flexible: either may be absent.
     startTime: input.startTime ? new Date(input.startTime) : null,
@@ -98,6 +100,7 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
   const updates: Record<string, unknown> = {};
   if (body.name !== undefined) updates.name = body.name;
   if (body.venueLocation !== undefined) updates.venueLocation = body.venueLocation;
+  if (body.region !== undefined) updates.region = body.region;
   if (body.date !== undefined) updates.date = body.date ? new Date(body.date as string) : null;
   if (body.startTime !== undefined) {
     updates.startTime = body.startTime ? new Date(body.startTime as string) : null;

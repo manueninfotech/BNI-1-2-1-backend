@@ -7,7 +7,7 @@ import {
   type ConclaveConfig,
 } from "../engine/index.js";
 import { resolveCaptains, type ServerParticipant } from "../domain/captains.js";
-import { getConclaveOrThrow, conclaveRef } from "./conclave.service.js";
+import { getConclaveOrThrow, conclaveRef, validateConfig } from "./conclave.service.js";
 import { fetchUsers, isActiveUser } from "./user.service.js";
 import { getAutoLogoutHours } from "./settings.service.js";
 
@@ -25,6 +25,8 @@ export interface GenerateOptions {
    * table, so it refuses to invent captains unless explicitly told to.
    */
   autoFillCaptains?: boolean;
+  personsPerTable?: number;
+  roundCount?: number;
 }
 
 export async function generateForConclave(conclaveId: string, opts: GenerateOptions) {
@@ -82,7 +84,18 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     );
   }
 
-  const personsPerTable = conclave.personsPerTable;
+  let personsPerTable = conclave.personsPerTable;
+  let roundCount = conclave.roundCount;
+
+  if (opts.personsPerTable !== undefined || opts.roundCount !== undefined) {
+    personsPerTable = opts.personsPerTable ?? conclave.personsPerTable;
+    roundCount = opts.roundCount ?? conclave.roundCount;
+    validateConfig(personsPerTable, roundCount);
+    await ref.update({
+      personsPerTable,
+      roundCount,
+    });
+  }
 
   // Captains. The admin designates them; we do not invent them.
   const tablesRequired = tableCountFor(participants.length, personsPerTable);
@@ -117,7 +130,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
 
   const config: ConclaveConfig = {
     personsPerTable,
-    roundCount: conclave.roundCount,
+    roundCount,
     seed,
   };
 

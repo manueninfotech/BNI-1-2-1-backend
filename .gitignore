@@ -9,4 +9,5 @@ dist
 # NEVER commit service account keys. Credentials come from FIREBASE_SERVICE_ACCOUNT.
 *serviceAccount*.json
 *firebase-adminsdk*.json
+firebase-service-account.json
 .env*
