@@ -18,7 +18,8 @@
     "seed": "tsx scripts/seed.ts",
     "seed-full": "tsx scripts/seedFullConclave.ts",
     "delete-conclave": "tsx scripts/deleteSeededConclave.ts",
-    "check-rules": "tsx scripts/checkRules.ts"
+    "check-rules": "tsx scripts/checkRules.ts",
+    "patch-conclaves": "tsx scripts/patchConclaveFields.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

@@ -38,8 +38,9 @@ export function isActiveUser(
   autoLogoutHours: number,
   now: Date,
 ): boolean {
-  const lastLogin = toDate(user?.lastLoginAt);
-  if (!lastLogin) return false;
+  if (!user) return false;
+  const lastLogin = toDate(user.lastLoginAt);
+  if (!lastLogin) return true; // Default registered user to active
   return now.getTime() - lastLogin.getTime() < autoLogoutHours * 3_600_000;
 }
 
