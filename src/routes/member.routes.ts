@@ -17,6 +17,8 @@ const router = Router();
  */
 router.use(requireUser);
 
+router.get("/me", asyncHandler(c.me));
+router.get("/conclaves", asyncHandler(c.listConclaves));
 router.post("/conclaves/:id/register", asyncHandler(c.register));
 router.post("/conclaves/:id/sync", syncLimiter, asyncHandler(c.syncConclave));
 

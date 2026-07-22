@@ -38,6 +38,7 @@ export const collections = {
   users: "users",
   admins: "admins",
   settings: "settings",
+  regions: "regions",
   // subcollections of a conclave
   registrations: "registrations",
   attendance: "attendance",

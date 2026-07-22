@@ -31,7 +31,13 @@ function bearerToken(req: Request): string | null {
  */
 export async function requireUser(req: Request, _res: Response, next: NextFunction) {
   const token = bearerToken(req);
-  if (!token) throw ApiError.unauthorized();
+  if (!token) {
+    if (env.allowInsecureAdmin) {
+      (req as AuthedRequest).uid = "insecure-dev-admin";
+      return next();
+    }
+    throw ApiError.unauthorized();
+  }
 
   try {
     const decoded = await auth.verifyIdToken(token);
@@ -75,13 +81,14 @@ export async function isAdmin(uid: string): Promise<boolean> {
  * written by hand via `npm run create-admin`.
  */
 export async function requireAdmin(req: Request, _res: Response, next: NextFunction) {
-  if (env.allowInsecureAdmin) {
-    (req as AuthedRequest).uid = "insecure-dev-admin";
-    return next();
-  }
-
   const token = bearerToken(req);
-  if (!token) throw ApiError.unauthorized("Missing admin credentials.");
+  if (!token) {
+    if (env.allowInsecureAdmin) {
+      (req as AuthedRequest).uid = "insecure-dev-admin";
+      return next();
+    }
+    throw ApiError.unauthorized("Missing admin credentials.");
+  }
 
   let uid: string;
   try {
