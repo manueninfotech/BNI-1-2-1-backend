@@ -8,8 +8,21 @@ import * as roles from "../services/role.service.js";
 import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
 
-export async function list(_req: AuthedRequest, res: Response) {
-  res.json(await conclaves.listConclaves());
+/** Fetch the admin doc for the caller — used to scope by region. */
+async function getAdminDoc(uid: string) {
+  const doc = await db.collection(collections.admins).doc(uid).get();
+  return doc.exists ? (doc.data() as Record<string, string>) : null;
+}
+
+export async function list(req: AuthedRequest, res: Response) {
+  const admin = await getAdminDoc(req.uid);
+  // Superadmin (role=superadmin OR region=Global) sees every conclave.
+  // Any other coordinator sees only their own region.
+  const region =
+    !admin || admin.role === "superadmin" || admin.region === "Global"
+      ? undefined   // no filter → all
+      : admin.region;
+  res.json(await conclaves.listConclaves(region));
 }
 
 export async function getOne(req: AuthedRequest, res: Response) {
@@ -25,7 +38,14 @@ export async function getOne(req: AuthedRequest, res: Response) {
 }
 
 export async function create(req: AuthedRequest, res: Response) {
-  const conclaveId = await conclaves.createConclave(req.body ?? {});
+  const admin = await getAdminDoc(req.uid);
+  // Auto-assign the creating admin's region to the conclave.
+  // Superadmin/Global can override by passing region explicitly in the body.
+  const body = req.body ?? {};
+  if (!body.region && admin?.region && admin.region !== "Global") {
+    body.region = admin.region;
+  }
+  const conclaveId = await conclaves.createConclave(body);
   res.status(201).json({
     message: "Conclave created. Registration is closed until you open it.",
     conclaveId,

@@ -295,11 +295,17 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
   return roundStartedAt;
 }
 
-export async function listConclaves() {
-  const snap = await db
+export async function listConclaves(region?: string) {
+  let query: FirebaseFirestore.Query = db
     .collection(collections.conclaves)
-    .orderBy("date", "desc")
-    .get();
+    .orderBy("date", "desc");
+
+  // Scope to a specific region unless the caller is superadmin/Global.
+  if (region) {
+    query = query.where("region", "==", region);
+  }
+
+  const snap = await query.get();
 
   return Promise.all(
     snap.docs.map(async (doc) => {
