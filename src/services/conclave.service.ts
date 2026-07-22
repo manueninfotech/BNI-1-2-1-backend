@@ -296,19 +296,20 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
 }
 
 export async function listConclaves(region?: string) {
-  let query: FirebaseFirestore.Query = db
+  // Firestore composite index (region + date) is not guaranteed to exist, so we
+  // fetch all conclaves ordered by date and filter in memory. The conclave
+  // collection is small enough that this is negligible overhead.
+  const snap = await db
     .collection(collections.conclaves)
-    .orderBy("date", "desc");
+    .orderBy("date", "desc")
+    .get();
 
-  // Scope to a specific region unless the caller is superadmin/Global.
-  if (region) {
-    query = query.where("region", "==", region);
-  }
-
-  const snap = await query.get();
+  const docs = region
+    ? snap.docs.filter((doc) => doc.data().region === region)
+    : snap.docs;
 
   return Promise.all(
-    snap.docs.map(async (doc) => {
+    docs.map(async (doc) => {
       const count = await doc.ref.collection(collections.registrations).count().get();
       const d = doc.data();
       return {
