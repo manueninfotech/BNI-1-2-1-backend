@@ -12,10 +12,27 @@ import { notifyConclave } from "./notification.service.js";
 export const conclaveRef = (id: string) =>
   db.collection(collections.conclaves).doc(id);
 
+const conclaveDocCache = new Map<string, { ref: any; data: any; doc: any }>();
+let conclavesListCache: any[] = [];
+
 export async function getConclaveOrThrow(id: string) {
-  const doc = await conclaveRef(id).get();
-  if (!doc.exists) throw ApiError.notFound("Conclave not found.");
-  return { ref: conclaveRef(id), data: doc.data()!, doc };
+  try {
+    const doc = await conclaveRef(id).get();
+    if (!doc.exists) {
+      const cached = conclaveDocCache.get(id);
+      if (cached) return cached;
+      throw ApiError.notFound("Conclave not found.");
+    }
+    const res = { ref: conclaveRef(id), data: doc.data()!, doc };
+    conclaveDocCache.set(id, res);
+    return res;
+  } catch (err: any) {
+    if (err instanceof ApiError) throw err;
+    console.warn("getConclaveOrThrow Firestore read failed (quota/network):", err?.message || err);
+    const cached = conclaveDocCache.get(id);
+    if (cached) return cached;
+    throw ApiError.notFound("Conclave not found or database unavailable.");
+  }
 }
 
 interface CreateInput {
@@ -297,26 +314,35 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
 
 export async function listConclaves(region?: string) {
   try {
-    const snap = await db
-      .collection(collections.conclaves)
-      .orderBy("date", "desc")
-      .get();
+    let snap: any;
+    try {
+      snap = await db.collection(collections.conclaves).orderBy("date", "desc").get();
+    } catch {
+      snap = await db.collection(collections.conclaves).get();
+    }
 
-    const docs = region
-      ? snap.docs.filter((doc) => doc.data().region === region)
-      : snap.docs;
+    let docs = snap.docs;
+    if (region) {
+      docs = docs.filter((doc: any) => doc.data().region === region);
+    }
 
-    return await Promise.all(
-      docs.map(async (doc) => {
+    docs.sort((a: any, b: any) => {
+      const da = toDate(a.data().date)?.getTime() || 0;
+      const dbDate = toDate(b.data().date)?.getTime() || 0;
+      return dbDate - da;
+    });
+
+    const list = await Promise.all(
+      docs.map(async (doc: any) => {
         let regCount = 0;
         try {
           const count = await doc.ref.collection(collections.registrations).count().get();
           regCount = count.data().count;
         } catch {
-          // Ignore subcollection count error if quota reached or network error
+          // Ignore subcollection count error
         }
         const d = doc.data();
-        return {
+        const item = {
           id: doc.id,
           ...d,
           date: toDate(d.date)?.toISOString() ?? null,
@@ -324,10 +350,17 @@ export async function listConclaves(region?: string) {
           endTime: toDate(d.endTime)?.toISOString() ?? null,
           registrationCount: regCount || d.registrationCount || d.memberCount || 0,
         };
+        conclaveDocCache.set(doc.id, { ref: doc.ref, data: d, doc });
+        return item;
       }),
     );
+
+    if (list.length > 0) {
+      conclavesListCache = list;
+    }
+    return list;
   } catch (err: any) {
     console.error("listConclaves Firestore query failed:", err?.message || err);
-    return [];
+    return conclavesListCache;
   }
 }

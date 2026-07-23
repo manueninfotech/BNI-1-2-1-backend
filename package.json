@@ -19,7 +19,8 @@
     "seed-full": "tsx scripts/seedFullConclave.ts",
     "delete-conclave": "tsx scripts/deleteSeededConclave.ts",
     "check-rules": "tsx scripts/checkRules.ts",
-    "patch-conclaves": "tsx scripts/patchConclaveFields.ts"
+    "patch-conclaves": "tsx scripts/patchConclaveFields.ts",
+    "emulator": "npx firebase-tools emulators:start --config ../firebase.json"
   },
   "dependencies": {
     "cors": "^2.8.5",

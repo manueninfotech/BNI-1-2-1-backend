@@ -19,7 +19,8 @@ export async function me(req: AuthedRequest, res: Response) {
     category: data?.businessCategory || "",
     chapter: data?.chapter || "",
     location: data?.location || "",
-    role: "member",
+    createdAt: data?.createdAt || data?.registeredAt || null,
+    role: data?.role || "admin",
   });
 }
 

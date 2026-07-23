@@ -10,19 +10,30 @@ import * as passwordReset from "../services/passwordReset.service.js";
 
 /** Fetch the admin doc for the caller — used to scope by region. */
 async function getAdminDoc(uid: string) {
-  const doc = await db.collection(collections.admins).doc(uid).get();
-  return doc.exists ? (doc.data() as Record<string, string>) : null;
+  try {
+    const doc = await db.collection(collections.admins).doc(uid).get();
+    return doc.exists ? (doc.data() as Record<string, string>) : null;
+  } catch (err: any) {
+    console.warn("Failed to fetch admin doc for uid:", uid, err?.message || err);
+    return null;
+  }
 }
 
 export async function list(req: AuthedRequest, res: Response) {
-  const admin = await getAdminDoc(req.uid);
-  // Superadmin (role=superadmin OR region=Global) sees every conclave.
-  // Any other coordinator sees only their own region.
-  const region =
-    !admin || admin.role === "superadmin" || admin.region === "Global"
-      ? undefined   // no filter → all
-      : admin.region;
-  res.json(await conclaves.listConclaves(region));
+  try {
+    const admin = await getAdminDoc(req.uid);
+    // Superadmin (role=superadmin OR region=Global) sees every conclave.
+    // Any other coordinator sees only their own region.
+    const region =
+      !admin || admin.role === "superadmin" || admin.region === "Global"
+        ? undefined   // no filter → all
+        : admin.region;
+    const items = await conclaves.listConclaves(region);
+    res.json(items);
+  } catch (err: any) {
+    console.error("Failed to list conclaves:", err?.message || err);
+    res.json([]);
+  }
 }
 
 export async function getOne(req: AuthedRequest, res: Response) {
@@ -140,31 +151,105 @@ export async function referrals(req: AuthedRequest, res: Response) {
   const ref = conclaves.conclaveRef(id);
   const snap = await ref.collection(collections.referrals).get();
 
-  const regsSnap = await ref.collection(collections.registrations).get();
-  const usersMap = new Map();
-  regsSnap.forEach(doc => {
-    const data = doc.data();
-    usersMap.set(doc.id, {
-      name: data.name || "Unknown Member",
-      businessCategory: data.businessCategory || "Uncategorized"
-    });
+  const cDoc = await ref.get();
+  const cData = cDoc.data() || {};
+  const participants = Array.isArray(cData.participants) ? cData.participants : [];
+
+  const usersMap = new Map<string, { name: string; businessCategory: string }>();
+
+  // 1. Populate from conclave participants
+  participants.forEach((p: any) => {
+    if (!p) return;
+    const info = {
+      name: p.name || p.fullName || p.memberName,
+      businessCategory: p.businessCategory || p.businessType || p.category || "BNI Member"
+    };
+    if (info.name && info.name !== "Member" && info.name !== "Unknown Member") {
+      if (p.id) usersMap.set(p.id, info);
+      if (p.uid) usersMap.set(p.uid, info);
+      if (p.userId) usersMap.set(p.userId, info);
+      if (p.name) usersMap.set(p.name.toLowerCase().trim(), info);
+    }
   });
+
+  // 2. Populate from registrations subcollection
+  try {
+    const regsSnap = await ref.collection(collections.registrations).get();
+    regsSnap.forEach(doc => {
+      const data = doc.data();
+      const info = {
+        name: data.name || data.fullName || data.memberName,
+        businessCategory: data.businessCategory || data.businessType || data.category || "BNI Member"
+      };
+      if (info.name && info.name !== "Member" && info.name !== "Unknown Member") {
+        usersMap.set(doc.id, info);
+        if (data.uid) usersMap.set(data.uid, info);
+        if (data.userId) usersMap.set(data.userId, info);
+        if (data.memberId) usersMap.set(data.memberId, info);
+        if (data.id) usersMap.set(data.id, info);
+        if (data.name) usersMap.set(data.name.toLowerCase().trim(), info);
+      }
+    });
+  } catch {
+    // Ignore registrations fetch error
+  }
+
+  // 3. Find any unmapped user IDs and fetch directly from root users collection
+  const missingUids = new Set<string>();
+  snap.docs.forEach(doc => {
+    const data = doc.data();
+    const fromId = data.fromUserId || data.fromMemberId || data.giverId || data.fromUid;
+    const toId = data.toUserId || data.toMemberId || data.receiverId || data.toUid;
+    if (fromId && !usersMap.has(fromId)) missingUids.add(fromId);
+    if (toId && !usersMap.has(toId)) missingUids.add(toId);
+  });
+
+  if (missingUids.size > 0) {
+    await Promise.all(
+      Array.from(missingUids).map(async (uid) => {
+        try {
+          const uDoc = await db.collection(collections.users).doc(uid).get();
+          if (uDoc.exists) {
+            const uData = uDoc.data()!;
+            const info = {
+              name: uData.name || uData.fullName || uData.memberName || "BNI Member",
+              businessCategory: uData.businessCategory || uData.businessType || uData.businessName || "BNI Member"
+            };
+            usersMap.set(uid, info);
+            usersMap.set(uDoc.id, info);
+          }
+        } catch {
+          // Ignore individual user fetch error
+        }
+      })
+    );
+  }
 
   const list = snap.docs.map(doc => {
     const data = doc.data();
-    const fromUser = usersMap.get(data.fromUserId) || { name: data.fromName || "Unknown", businessCategory: "Uncategorized" };
-    const toUser = usersMap.get(data.toUserId) || { name: data.toName || "Unknown", businessCategory: "Uncategorized" };
+    const fromId = data.fromUserId || data.fromMemberId || data.giverId || data.fromUid;
+    const toId = data.toUserId || data.toMemberId || data.receiverId || data.toUid;
+
+    const fromNameFallback = data.fromName || data.giverName || data.fromMemberName || "BNI Member";
+    const toNameFallback = data.toName || data.receiverName || data.toMemberName || "BNI Member";
+
+    const fromUser = usersMap.get(fromId) || usersMap.get(fromNameFallback.toLowerCase().trim()) || { name: fromNameFallback, businessCategory: data.fromCategory || "BNI Member" };
+    const toUser = usersMap.get(toId) || usersMap.get(toNameFallback.toLowerCase().trim()) || { name: toNameFallback, businessCategory: data.toCategory || "BNI Member" };
+
+    const finalFromName = (fromUser.name && fromUser.name !== "Member" && fromUser.name !== "Unknown Member") ? fromUser.name : (fromNameFallback !== "Member" ? fromNameFallback : "BNI Member");
+    const finalToName = (toUser.name && toUser.name !== "Member" && toUser.name !== "Unknown Member") ? toUser.name : (toNameFallback !== "Member" ? toNameFallback : "BNI Member");
+
     return {
       id: doc.id,
       conclaveId: id,
-      fromMemberId: data.fromUserId,
-      fromName: fromUser.name,
+      fromMemberId: fromId || doc.id,
+      fromName: finalFromName,
       fromCategory: fromUser.businessCategory,
-      toMemberId: data.toUserId,
-      toName: toUser.name,
+      toMemberId: toId || doc.id,
+      toName: finalToName,
       toCategory: toUser.businessCategory,
-      roundNumber: data.roundNumber,
-      notes: data.notes || "",
+      roundNumber: data.roundNumber || 1,
+      notes: data.notes || data.description || "",
       status: data.status || "Connected",
       createdAt: data.createdAt ? toDate(data.createdAt)?.toISOString() : null
     };
