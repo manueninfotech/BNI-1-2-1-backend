@@ -296,30 +296,38 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
 }
 
 export async function listConclaves(region?: string) {
-  // Firestore composite index (region + date) is not guaranteed to exist, so we
-  // fetch all conclaves ordered by date and filter in memory. The conclave
-  // collection is small enough that this is negligible overhead.
-  const snap = await db
-    .collection(collections.conclaves)
-    .orderBy("date", "desc")
-    .get();
+  try {
+    const snap = await db
+      .collection(collections.conclaves)
+      .orderBy("date", "desc")
+      .get();
 
-  const docs = region
-    ? snap.docs.filter((doc) => doc.data().region === region)
-    : snap.docs;
+    const docs = region
+      ? snap.docs.filter((doc) => doc.data().region === region)
+      : snap.docs;
 
-  return Promise.all(
-    docs.map(async (doc) => {
-      const count = await doc.ref.collection(collections.registrations).count().get();
-      const d = doc.data();
-      return {
-        id: doc.id,
-        ...d,
-        date: toDate(d.date)?.toISOString() ?? null,
-        startTime: toDate(d.startTime)?.toISOString() ?? null,
-        endTime: toDate(d.endTime)?.toISOString() ?? null,
-        registrationCount: count.data().count,
-      };
-    }),
-  );
+    return await Promise.all(
+      docs.map(async (doc) => {
+        let regCount = 0;
+        try {
+          const count = await doc.ref.collection(collections.registrations).count().get();
+          regCount = count.data().count;
+        } catch {
+          // Ignore subcollection count error if quota reached or network error
+        }
+        const d = doc.data();
+        return {
+          id: doc.id,
+          ...d,
+          date: toDate(d.date)?.toISOString() ?? null,
+          startTime: toDate(d.startTime)?.toISOString() ?? null,
+          endTime: toDate(d.endTime)?.toISOString() ?? null,
+          registrationCount: regCount || d.registrationCount || d.memberCount || 0,
+        };
+      }),
+    );
+  } catch (err: any) {
+    console.error("listConclaves Firestore query failed:", err?.message || err);
+    return [];
+  }
 }
