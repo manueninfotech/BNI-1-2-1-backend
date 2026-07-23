@@ -7,6 +7,7 @@ import * as schedule from "../services/schedule.service.js";
 import * as roles from "../services/role.service.js";
 import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
+import { fetchUsers } from "../services/user.service.js";
 
 /** Fetch the admin doc for the caller — used to scope by region. */
 async function getAdminDoc(uid: string) {
@@ -252,6 +253,37 @@ export async function referrals(req: AuthedRequest, res: Response) {
       notes: data.notes || data.description || "",
       status: data.status || "Connected",
       createdAt: data.createdAt ? toDate(data.createdAt)?.toISOString() : null
+    };
+  });
+
+  res.json(list);
+}
+
+export async function attendance(req: AuthedRequest, res: Response) {
+  const { id } = req.params;
+  const snap = await db
+    .collection(collections.conclaves)
+    .doc(id)
+    .collection(collections.attendance)
+    .get();
+
+  const userIds = [...new Set(snap.docs.map(d => d.data().userId).filter(Boolean))];
+  const users = await fetchUsers(userIds);
+
+  const list = snap.docs.map(doc => {
+    const data = doc.data();
+    const user = users.get(data.userId);
+    return {
+      id: doc.id,
+      userId: data.userId,
+      userName: user?.name || data.name || "Member",
+      userCategory: user?.businessCategory || "BNI Member",
+      roundNumber: data.roundNumber || 1,
+      tableNumber: data.tableNumber || null,
+      isPresent: !!data.isPresent,
+      source: data.source || "self",
+      markedBy: data.markedBy || data.userId,
+      markedAt: data.markedAt ? toDate(data.markedAt)?.toISOString() : null,
     };
   });
 

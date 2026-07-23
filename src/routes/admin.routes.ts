@@ -34,6 +34,7 @@ router.post("/conclaves/:id/registrations/:uid/role", asyncHandler(c.setRole));
 // Dashboard
 router.get("/conclaves/:id/stats", asyncHandler(c.statistics));
 router.get("/conclaves/:id/referrals", asyncHandler(c.referrals));
+router.get("/conclaves/:id/attendance", asyncHandler(c.attendance));
 
 // Members
 router.get("/users/search", asyncHandler(c.findUser));
