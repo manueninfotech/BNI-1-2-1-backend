@@ -19,7 +19,9 @@ router.use(requireUser);
 
 router.get("/me", asyncHandler(c.me));
 router.get("/conclaves", asyncHandler(c.listConclaves));
+router.get("/conclaves/:id/referrals", asyncHandler(c.getReferrals));
 router.post("/conclaves/:id/register", asyncHandler(c.register));
+router.delete("/conclaves/:id/register", asyncHandler(c.deregister));
 router.post("/conclaves/:id/sync", syncLimiter, asyncHandler(c.syncConclave));
 
 export default router;
