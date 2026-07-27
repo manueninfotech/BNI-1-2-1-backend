@@ -34,7 +34,7 @@ export const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
 ]);
 
 /** The engine's limits. A conclave outside these cannot be scheduled. */
-export const ROUND_LIMITS = { min: 4, max: 8 } as const;
+export const ROUND_LIMITS = { min: 1, max: 20 } as const;
 export const MIN_PERSONS_PER_TABLE = 2;
 
 /**
