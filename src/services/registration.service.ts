@@ -17,7 +17,12 @@ import { getConclaveOrThrow, conclaveRef } from "./conclave.service.js";
 export async function register(conclaveId: string, uid: string) {
   const { data: conclave } = await getConclaveOrThrow(conclaveId);
 
-  if (conclave.isRegistrationOpen !== true) {
+  if (
+    conclave.isRegistrationOpen === false ||
+    conclave.status === "completed" ||
+    conclave.status === "ended" ||
+    conclave.status === "cancelled"
+  ) {
     throw ApiError.conflict("Registration is not open for this conclave.");
   }
 
