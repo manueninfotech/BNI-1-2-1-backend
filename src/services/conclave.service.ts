@@ -6,7 +6,7 @@ import {
   MIN_PERSONS_PER_TABLE,
   TERMINAL_STATUSES,
 } from "../domain/conclave.js";
-import { toDate } from "../utils/firestore.js";
+import { toDate, toIso } from "../utils/firestore.js";
 import { notifyConclave } from "./notification.service.js";
 
 export const conclaveRef = (id: string) =>
@@ -15,22 +15,26 @@ export const conclaveRef = (id: string) =>
 const conclaveDocCache = new Map<string, { ref: any; data: any; doc: any }>();
 let conclavesListCache: any[] = [];
 
+export function clearConclaveCache() {
+  conclaveDocCache.clear();
+  conclavesListCache = [];
+}
+
 export async function getConclaveOrThrow(id: string) {
+  const cached = conclaveDocCache.get(id);
+  if (cached) return cached;
+
   try {
     const doc = await conclaveRef(id).get();
     if (!doc.exists) {
-      const cached = conclaveDocCache.get(id);
-      if (cached) return cached;
       throw ApiError.notFound("Conclave not found.");
     }
-    const res = { ref: conclaveRef(id), data: doc.data()!, doc };
+    const data = doc.data()!;
+    const res = { ref: conclaveRef(id), data, doc };
     conclaveDocCache.set(id, res);
     return res;
   } catch (err: any) {
     if (err instanceof ApiError) throw err;
-    console.warn("getConclaveOrThrow Firestore read failed (quota/network):", err?.message || err);
-    const cached = conclaveDocCache.get(id);
-    if (cached) return cached;
     throw ApiError.notFound("Conclave not found or database unavailable.");
   }
 }
@@ -39,8 +43,17 @@ interface CreateInput {
   name?: string;
   venueLocation?: string;
   date?: string;
+  startDate?: string;
+  endDate?: string;
+  regStartDate?: string;
+  regEndDate?: string;
+  dateRange?: string;
   startTime?: string;
   endTime?: string;
+  coordinator?: string;
+  creator?: string;
+  description?: string;
+  status?: string;
   chiefGuests?: unknown;
   personsPerTable?: number;
   roundCount?: number;
@@ -49,10 +62,6 @@ interface CreateInput {
 
 /**
  * Validates the knobs the engine depends on.
- *
- * These were previously only checked at schedule-generation time, which meant an
- * admin could create a conclave with 99 rounds and only discover it was invalid
- * after registration had closed. Fail at creation instead.
  */
 export function validateConfig(personsPerTable: number, roundCount: number) {
   if (!Number.isInteger(personsPerTable) || personsPerTable < MIN_PERSONS_PER_TABLE) {
@@ -71,6 +80,65 @@ export function validateConfig(personsPerTable: number, roundCount: number) {
   }
 }
 
+/**
+ * Evaluates conclave status dynamically based on current date/time vs reg dates and event start/end dates.
+ */
+export function evaluateConclaveStatus(data: any): { status: string; isRegistrationOpen: boolean } {
+  try {
+    const now = new Date();
+
+    const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
+    const regEnd = data?.regEndDate ? toDate(data.regEndDate) : null;
+
+    const eventStart = data?.date ? toDate(data.date) : (data?.startDate ? toDate(data.startDate) : null);
+    const eventEnd = data?.endDate ? toDate(data.endDate) : (data?.endTime ? toDate(data.endTime) : null);
+
+    const getLocalDateStr = (d: Date | null) => {
+      if (!d || !(d instanceof Date) || Number.isNaN(d.getTime())) return null;
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    };
+
+    const todayStr = getLocalDateStr(now);
+
+    // 1. Completed if event end date has passed
+    if (eventEnd) {
+      const endStr = getLocalDateStr(eventEnd);
+      if (endStr && todayStr && todayStr > endStr) {
+        return { status: ConclaveStatus.completed, isRegistrationOpen: false };
+      }
+    }
+
+    // 2. Running IF event start date is today or in the past (and event has not ended)
+    if (eventStart) {
+      const startStr = getLocalDateStr(eventStart);
+      if (startStr && todayStr && todayStr >= startStr) {
+        return { status: ConclaveStatus.running, isRegistrationOpen: false };
+      }
+    }
+
+    // 3. If registration close date has passed (and event hasn't started yet) -> Registration Closed
+    if (regEnd && now > regEnd) {
+      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    }
+
+    // 4. If registration start date is in the future -> Registration Not Open
+    if (regStart && now < regStart) {
+      return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
+    }
+
+    // 5. Otherwise (during active registration window) -> Registration Open
+    return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
+  } catch (err) {
+    return {
+      status: data?.status || ConclaveStatus.registrationOpen,
+      isRegistrationOpen: data?.isRegistrationOpen ?? true
+    };
+  }
+}
+
 export async function createConclave(input: CreateInput) {
   if (!input.name || !input.venueLocation) {
     throw ApiError.badRequest("name and venueLocation are required.");
@@ -80,29 +148,46 @@ export async function createConclave(input: CreateInput) {
   const roundCount = input.roundCount ?? 6;
   validateConfig(personsPerTable, roundCount);
 
+  const evalResult = evaluateConclaveStatus({
+    regStartDate: input.regStartDate,
+    regEndDate: input.regEndDate,
+    date: input.date,
+    startDate: input.startDate,
+    endDate: input.endDate,
+    startTime: input.startTime,
+    endTime: input.endTime
+  });
+
+  const statusToSet = input.status || evalResult.status;
+  const isRegOpen = evalResult.isRegistrationOpen;
+
   const ref = await db.collection(collections.conclaves).add({
     name: input.name,
     venueLocation: input.venueLocation,
-    region: input.region || "Guntur Region",
+    region: input.region || "Global BNI Network",
+    coordinator: input.coordinator || "",
+    creator: input.creator || "",
+    description: input.description || "",
+    dateRange: input.dateRange || "",
     date: input.date ? new Date(input.date) : new Date(),
-    // Start/end are flexible: either may be absent.
+    endDate: input.endDate ? new Date(input.endDate) : null,
+    regStartDate: input.regStartDate ? new Date(input.regStartDate) : null,
+    regEndDate: input.regEndDate ? new Date(input.regEndDate) : null,
     startTime: input.startTime ? new Date(input.startTime) : null,
     endTime: input.endTime ? new Date(input.endTime) : null,
     chiefGuests: Array.isArray(input.chiefGuests) ? input.chiefGuests : [],
-
-    // A new conclave is NOT accepting registrations. The admin opens the doors
-    // deliberately rather than the system opening them by default.
-    status: ConclaveStatus.registrationNotOpen,
-    isRegistrationOpen: false,
-
+    status: statusToSet,
+    isRegistrationOpen: isRegOpen,
     personsPerTable,
     roundCount,
     currentRound: 0,
     schedule: null,
     participants: null,
     createdAt: new Date(),
+    updatedAt: new Date(),
   });
 
+  clearConclaveCache();
   return ref.id;
 }
 
@@ -118,19 +203,27 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
   if (body.name !== undefined) updates.name = body.name;
   if (body.venueLocation !== undefined) updates.venueLocation = body.venueLocation;
   if (body.region !== undefined) updates.region = body.region;
+  if (body.coordinator !== undefined) updates.coordinator = body.coordinator;
+  if (body.creator !== undefined) updates.creator = body.creator;
+  if (body.description !== undefined) updates.description = body.description;
+  if (body.dateRange !== undefined) updates.dateRange = body.dateRange;
   if (body.date !== undefined) updates.date = body.date ? new Date(body.date as string) : null;
-  if (body.startTime !== undefined) {
-    updates.startTime = body.startTime ? new Date(body.startTime as string) : null;
-  }
-  if (body.endTime !== undefined) {
-    updates.endTime = body.endTime ? new Date(body.endTime as string) : null;
-  }
-  if (body.chiefGuests !== undefined) {
-    updates.chiefGuests = Array.isArray(body.chiefGuests) ? body.chiefGuests : [];
-  }
+  if (body.startDate !== undefined) updates.startDate = body.startDate ? new Date(body.startDate as string) : null;
+  if (body.endDate !== undefined) updates.endDate = body.endDate ? new Date(body.endDate as string) : null;
+  if (body.regStartDate !== undefined) updates.regStartDate = body.regStartDate ? new Date(body.regStartDate as string) : null;
+  if (body.regEndDate !== undefined) updates.regEndDate = body.regEndDate ? new Date(body.regEndDate as string) : null;
+  if (body.startTime !== undefined) updates.startTime = body.startTime ? new Date(body.startTime as string) : null;
+  if (body.endTime !== undefined) updates.endTime = body.endTime ? new Date(body.endTime as string) : null;
+  if (body.status !== undefined) updates.status = body.status;
 
-  // Table size and round count are baked into a generated schedule. Changing
-  // them afterwards would leave the schedule describing a different event.
+  const mergedData = { ...data, ...updates };
+  const evalResult = evaluateConclaveStatus(mergedData);
+  if (body.status === undefined) {
+    updates.status = evalResult.status;
+  }
+  updates.isRegistrationOpen = evalResult.isRegistrationOpen;
+  updates.updatedAt = new Date();
+
   if (body.personsPerTable !== undefined || body.roundCount !== undefined) {
     if (data.schedule) {
       throw ApiError.conflict(
@@ -149,6 +242,8 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
   }
 
   updates.updatedAt = new Date();
+
+  clearConclaveCache();
   await ref.update(updates);
   return Object.keys(updates);
 }
@@ -172,15 +267,6 @@ export async function setRegistrationOpen(id: string, open: boolean) {
 
 /**
  * Call a conclave off before it starts.
- *
- * Cancel means "this event is not happening". Once it IS happening, that is no
- * longer true — people are sitting at tables, attendance and referrals have been
- * recorded, and those records deserve a summary rather than a tombstone. Ending
- * a live event early is what `complete` is for; it keeps everything and lets
- * members see what they did.
- *
- * So this is deliberately blocked while running, and the error says which door
- * to use instead.
  */
 export async function cancelConclave(id: string) {
   const { ref, data } = await getConclaveOrThrow(id);
@@ -209,13 +295,20 @@ export async function cancelConclave(id: string) {
   });
 }
 
+/** Lock the schedule for a conclave without ending the conclave. */
+export async function lockConclaveSchedule(id: string) {
+  const { ref, data } = await getConclaveOrThrow(id);
+  const evalResult = evaluateConclaveStatus(data);
+  await ref.update({
+    isScheduleLocked: true,
+    status: data.status === ConclaveStatus.completed ? ConclaveStatus.completed : evalResult.status,
+    updatedAt: new Date()
+  });
+  clearConclaveCache();
+}
+
 /**
  * End the conclave.
- *
- * This is the transition the members' post-conclave summary depends on: until a
- * conclave is `completed`, nobody can see what they recorded or whether it
- * synced. It also nudges everyone to check their data made it off their phone —
- * the last moment they are all still in the room.
  */
 export async function completeConclave(id: string) {
   const { ref, data } = await getConclaveOrThrow(id);
@@ -249,12 +342,6 @@ export async function completeConclave(id: string) {
 
 /**
  * Start a round.
- *
- * One admin cannot run two conclaves at once: rounds are advanced by hand, by a
- * person standing in the room. They cannot be in two rooms, and a conclave whose
- * rounds nobody advances just stalls with everyone sitting at a table. A
- * DIFFERENT admin running a different conclave is fine — this constrains the
- * human, not the system.
  */
 export async function startRound(id: string, roundNumber: number, adminUid: string) {
   if (!Number.isInteger(roundNumber) || roundNumber < 1) {
@@ -301,13 +388,13 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
     ...(roundNumber === 1 ? { startedBy: adminUid } : {}),
   });
 
-  // A nudge, never the mechanism: the app derives round state from the conclave
-  // document, so a missed push costs a notification, not correctness.
-  await notifyConclave(id, {
-    title: `Round ${roundNumber} has started`,
-    body: "Go to your table — open the app to see who you're sitting with.",
-    data: { conclaveId: id, roundNumber: String(roundNumber), type: "round_started" },
-  });
+  try {
+    await notifyConclave(id, {
+      title: `Round ${roundNumber} has started`,
+      body: "Go to your table — open the app to see who you're sitting with.",
+      data: { conclaveId: id, roundNumber: String(roundNumber), type: "round_started" },
+    });
+  } catch {}
 
   return roundStartedAt;
 }
@@ -342,13 +429,34 @@ export async function listConclaves(region?: string) {
           // Ignore subcollection count error
         }
         const d = doc.data();
+        const countFromSubcoll = regCount;
+        const countFromParticipants = Array.isArray(d.participants) ? d.participants.length : 0;
+        const actualCount = countFromSubcoll > 0 ? countFromSubcoll : countFromParticipants;
+
+        // Self-heal: If status was marked completed before any rounds were run, reset to dynamic status
+        if (d.status === "completed" && (!d.currentRound || d.currentRound === 0)) {
+          const evalResult = evaluateConclaveStatus(d);
+          d.status = evalResult.status;
+          d.isRegistrationOpen = evalResult.isRegistrationOpen;
+          doc.ref.update({ status: evalResult.status, isRegistrationOpen: evalResult.isRegistrationOpen }).catch(() => {});
+        } else if (d.status !== ConclaveStatus.completed && d.status !== ConclaveStatus.cancelled) {
+          const evalResult = evaluateConclaveStatus(d);
+          d.status = evalResult.status;
+          d.isRegistrationOpen = evalResult.isRegistrationOpen;
+        }
+
         const item = {
           id: doc.id,
           ...d,
-          date: toDate(d.date)?.toISOString() ?? null,
-          startTime: toDate(d.startTime)?.toISOString() ?? null,
-          endTime: toDate(d.endTime)?.toISOString() ?? null,
-          registrationCount: regCount || d.registrationCount || d.memberCount || 0,
+          date: toIso(d.date),
+          endDate: toIso(d.endDate),
+          regStartDate: toIso(d.regStartDate),
+          regEndDate: toIso(d.regEndDate),
+          startTime: toIso(d.startTime),
+          endTime: toIso(d.endTime),
+          createdAt: toIso(d.createdAt),
+          updatedAt: toIso(d.updatedAt),
+          registrationCount: actualCount,
         };
         conclaveDocCache.set(doc.id, { ref: doc.ref, data: d, doc });
         return item;
@@ -360,7 +468,17 @@ export async function listConclaves(region?: string) {
     }
     return list;
   } catch (err: any) {
-    console.error("listConclaves Firestore query failed:", err?.message || err);
+    console.warn("listConclaves falling back to local cache:", err?.message || err);
     return conclavesListCache;
   }
 }
+
+export async function deleteConclave(id: string) {
+  const ref = db.collection(collections.conclaves).doc(id);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    throw ApiError.notFound(`Conclave with ID "${id}" does not exist.`);
+  }
+  await ref.delete();
+}
+
