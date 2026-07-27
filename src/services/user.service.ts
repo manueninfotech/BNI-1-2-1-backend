@@ -12,10 +12,14 @@ export interface UserDoc {
   /** Real, reachable contacts. Both are collected at registration. */
   email?: string;
   phone?: string;
+  company?: string;
+  category?: string;
   businessName?: string;
   businessCategory?: string;
-  location?: string;
+  location?: unknown;
   chapter?: string | null;
+  region?: string;
+  createdAt?: unknown;
   lastLoginAt?: unknown;
 }
 
@@ -40,7 +44,7 @@ export function isActiveUser(
 ): boolean {
   if (!user) return false;
   const lastLogin = toDate(user.lastLoginAt);
-  if (!lastLogin) return true; // Default registered user to active
+  if (!lastLogin) return false; // Must have logged in to be active
   return now.getTime() - lastLogin.getTime() < autoLogoutHours * 3_600_000;
 }
 
@@ -51,9 +55,14 @@ export interface Registrant {
   name: string;
   phone: string;
   email: string;
+  company?: string;
   businessName: string;
+  category?: string;
   businessCategory: string;
-  location: string;
+  chapter?: string;
+  region?: string;
+  location?: unknown;
+  createdAt?: string | null;
   isActive: boolean;
   lastLoginAt: string | null;
 }
@@ -72,22 +81,30 @@ export async function listRegistrants(conclaveId: string): Promise<Registrant[]>
   ]);
   const now = new Date();
 
-  const out = regsSnap.docs.map((doc) => {
+  const out: Registrant[] = regsSnap.docs.map((doc) => {
     const reg = doc.data();
     const u = users.get(doc.id);
+
+    const rawLoc = u?.location ?? reg?.location ?? "";
+
     return {
       uid: doc.id,
       role: (reg.role ?? "member") as "captain" | "member",
       registeredAt: toIso(reg.registeredAt),
-      name: u?.name ?? "",
+      name: u?.name ?? reg?.name ?? "",
       // Real contacts first. `identifier` is the fallback only for accounts
       // created before both were collected — and for a phone account it is a
       // synthetic address the admin cannot use.
-      phone: u?.phone ?? (u?.identifier?.includes("@") ? "" : u?.identifier ?? ""),
-      email: u?.email ?? (u?.identifier?.includes("@bni121.conclave") ? "" : u?.identifier ?? ""),
-      businessName: u?.businessName ?? "",
-      businessCategory: u?.businessCategory ?? "",
-      location: u?.location ?? "",
+      phone: u?.phone ?? reg?.phone ?? (u?.identifier?.includes("@") ? "" : u?.identifier ?? ""),
+      email: u?.email ?? reg?.email ?? (u?.identifier?.includes("@bni121.conclave") ? "" : u?.identifier ?? ""),
+      company: u?.company ?? u?.businessName ?? reg?.company ?? "",
+      businessName: u?.businessName ?? u?.company ?? reg?.company ?? "",
+      category: u?.category ?? u?.businessCategory ?? reg?.category ?? "",
+      businessCategory: u?.businessCategory ?? u?.category ?? reg?.category ?? "",
+      chapter: u?.chapter ?? reg?.chapter ?? "",
+      region: u?.region ?? reg?.region ?? "",
+      location: rawLoc,
+      createdAt: toIso(u?.createdAt) || toIso(reg?.registeredAt) || new Date().toISOString(),
       isActive: isActiveUser(u, autoLogoutHours, now),
       lastLoginAt: toIso(u?.lastLoginAt),
     };
