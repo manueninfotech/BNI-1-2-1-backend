@@ -13,6 +13,8 @@ import { ApiError } from "./errors.js";
 export interface AuthedRequest extends Omit<Request, "params"> {
   /** The verified uid of the caller. Never read a uid from the body. */
   uid: string;
+  /** Email from the verified Firebase token (may be undefined for phone-only accounts). */
+  email?: string;
   params: Record<string, string>;
 }
 
@@ -31,15 +33,30 @@ function bearerToken(req: Request): string | null {
  */
 export async function requireUser(req: Request, _res: Response, next: NextFunction) {
   if (env.allowInsecureAdmin) {
+    // Try Bearer token first so we always get req.email from the decoded claim.
+    // X-User-Id is only a fallback for requests with no valid token.
     const token = bearerToken(req);
     if (token) {
       try {
         const decoded = await auth.verifyIdToken(token);
         (req as AuthedRequest).uid = decoded.uid;
+        (req as AuthedRequest).email = decoded.email;
         return next();
       } catch {
-        // Fall back to insecure dev admin in dev mode
+        // Token invalid — fall through to X-User-Id
       }
+    }
+    const userIdHeader = req.headers["x-user-id"] as string;
+    if (userIdHeader) {
+      (req as AuthedRequest).uid = userIdHeader;
+      // Try to get email from X-User-Email header if frontend sends it
+      const emailHeader = req.headers["x-user-email"] as string;
+      if (emailHeader) (req as AuthedRequest).email = emailHeader;
+      return next();
+    }
+    if (token && token.includes("@")) {
+      (req as AuthedRequest).uid = token;
+      return next();
     }
     (req as AuthedRequest).uid = "insecure-dev-admin";
     return next();
@@ -53,6 +70,7 @@ export async function requireUser(req: Request, _res: Response, next: NextFuncti
   try {
     const decoded = await auth.verifyIdToken(token);
     (req as AuthedRequest).uid = decoded.uid;
+    (req as AuthedRequest).email = decoded.email;
     next();
   } catch {
     throw ApiError.unauthorized("Invalid or expired session. Please sign in again.");
