@@ -4,6 +4,7 @@
 // unambiguous everywhere.
 import { rateLimit, ipKeyGenerator } from "express-rate-limit";
 import type { Request } from "express";
+import { env } from "../config/env.js";
 
 /**
  * Rate limits.
@@ -28,19 +29,21 @@ const keyByUser = (req: Request) => {
  */
 export const syncLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 30,
+  limit: 300,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   keyGenerator: keyByUser,
+  skip: () => env.nodeEnv === "development",
   message: { error: "Too many sync requests. Slow down." },
 });
 
 /** Everything else: comfortably above real use, low enough to stop a script. */
 export const generalLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 120,
+  limit: 1_000,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   keyGenerator: keyByUser,
+  skip: () => env.nodeEnv === "development",
   message: { error: "Too many requests. Slow down." },
 });
