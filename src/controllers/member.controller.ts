@@ -6,22 +6,72 @@ import * as sync from "../services/sync.service.js";
 import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
 
 export async function me(req: AuthedRequest, res: Response) {
-  const userDoc = await db.collection(collections.users).doc(req.uid).get();
-  const data = userDoc.data() as any;
+  try {
+    const userDoc = await db.collection(collections.users).doc(req.uid).get();
+    let data = (userDoc.exists ? userDoc.data() : null) as any;
 
-  res.json({
-    uid: req.uid,
-    id: req.uid,
-    name: data?.name || "",
-    email: data?.email || "",
-    phone: data?.phone || "",
-    company: data?.businessName || "",
-    category: data?.businessCategory || "",
-    chapter: data?.chapter || "",
-    location: data?.location || "",
-    createdAt: data?.createdAt || data?.registeredAt || null,
-    role: data?.role || "admin",
-  });
+    // Fallback: if no doc found by UID, search by email or identifier field
+    if (!data && req.email) {
+      // First try by 'email' field
+      const emailSnap = await db.collection(collections.users)
+        .where('email', '==', req.email)
+        .limit(1)
+        .get();
+      if (!emailSnap.empty) {
+        data = emailSnap.docs[0].data() as any;
+      }
+
+      // Also try by 'identifier' field (used as sign-in email for test/synthetic accounts)
+      if (!data) {
+        const identSnap = await db.collection(collections.users)
+          .where('identifier', '==', req.email)
+          .limit(1)
+          .get();
+        if (!identSnap.empty) {
+          data = identSnap.docs[0].data() as any;
+        }
+      }
+    }
+
+    if (!data) {
+      const adminDoc = await db.collection(collections.admins).doc(req.uid).get();
+      if (adminDoc.exists) {
+        const adminData = adminDoc.data() as any;
+        return res.json({
+          uid: req.uid,
+          id: req.uid,
+          name: adminData.name || "Admin",
+          email: adminData.email || "",
+          phone: adminData.mobile || "",
+          region: adminData.region || "Guntur Region",
+          role: adminData.role || "admin",
+          createdAt: adminData.grantedAt || null,
+        });
+      }
+    }
+
+    res.json({
+      uid: req.uid,
+      id: req.uid,
+      name: data?.name || "Member",
+      email: data?.email || req.email || "",
+      phone: data?.phone || "",
+      company: data?.businessName || "",
+      category: data?.businessCategory || "",
+      chapter: data?.chapter || "",
+      location: data?.location || "",
+      createdAt: data?.createdAt || data?.registeredAt || null,
+      role: data?.role || "member",
+    });
+  } catch (err: any) {
+    res.json({
+      uid: req.uid,
+      id: req.uid,
+      name: "Member",
+      email: req.email || "",
+      role: "member"
+    });
+  }
 }
 
 export async function listConclaves(req: AuthedRequest, res: Response) {
@@ -29,7 +79,8 @@ export async function listConclaves(req: AuthedRequest, res: Response) {
 
   const registeredSet = new Set<string>();
   await Promise.all(
-    list.map(async (c) => {
+    list.map(async (c: any) => {
+      // Primary: look up by Firebase UID (doc ID)
       const regDoc = await db
         .collection(collections.conclaves)
         .doc(c.id)
@@ -38,16 +89,56 @@ export async function listConclaves(req: AuthedRequest, res: Response) {
         .get();
       if (regDoc.exists) {
         registeredSet.add(c.id);
+        return;
+      }
+
+      // Fallback: search by email or identifier for accounts where UID doesn't match legacy doc ID
+      if (req.email) {
+        const byEmail = await db
+          .collection(collections.conclaves)
+          .doc(c.id)
+          .collection(collections.registrations)
+          .where('email', '==', req.email)
+          .limit(1)
+          .get();
+        if (!byEmail.empty) {
+          registeredSet.add(c.id);
+          return;
+        }
+
+        const byIdentifier = await db
+          .collection(collections.conclaves)
+          .doc(c.id)
+          .collection(collections.registrations)
+          .where('identifier', '==', req.email)
+          .limit(1)
+          .get();
+        if (!byIdentifier.empty) {
+          registeredSet.add(c.id);
+          return;
+        }
       }
     }),
   );
 
-  const out = list.map((c) => ({
+  const out = list.map((c: any) => ({
     ...c,
     isRegistered: registeredSet.has(c.id),
   }));
 
   res.json(out);
+}
+
+
+export async function getReferrals(req: AuthedRequest, res: Response) {
+  const { id } = req.params;
+  try {
+    const snap = await db.collection(collections.conclaves).doc(id).collection(collections.referrals).get();
+    const list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json(list);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to fetch referrals." });
+  }
 }
 
 export async function register(req: AuthedRequest, res: Response) {
@@ -58,17 +149,29 @@ export async function register(req: AuthedRequest, res: Response) {
   });
 }
 
-export async function syncConclave(req: AuthedRequest, res: Response) {
-  // Taken BEFORE the Firestore work, which takes seconds. The client uses it to
-  // correct its clock; stamping it at response time would make it mistake our
-  // processing time for network latency.
-  const serverReceivedAt = Date.now();
+export async function deregister(req: AuthedRequest, res: Response) {
+  const conclaveId = req.params.id;
+  const uid = req.uid;
 
+  try {
+    await db
+      .collection(collections.conclaves)
+      .doc(conclaveId)
+      .collection(collections.registrations)
+      .doc(uid)
+      .delete();
+
+    res.json({ message: "Registration cancelled." });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to cancel registration." });
+  }
+}
+
+export async function syncConclave(req: AuthedRequest, res: Response) {
   const result = await sync.syncConclave(
     req.params.id,
     req.uid, // from the verified token — NEVER from the body
     req.body ?? {},
-    serverReceivedAt,
   );
 
   res.json(result);
