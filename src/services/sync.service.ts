@@ -26,6 +26,7 @@ interface ReferralRow {
   toName?: string;
   notes?: string;
   timestamp?: string;
+  status?: string;
 }
 
 export interface SyncInput {
@@ -40,12 +41,15 @@ export interface SyncResult {
   syncedReferralIds: string[];
   newReferralsReceived: unknown[];
   conclaveStatus: {
+    id?: string;
+    name?: string;
     status: string;
     currentRound: number;
     currentRoundStartedAt: string | null;
     title: string;
     date: string | null;
     venue: string;
+    region?: string;
   };
   tableNumber: number | null;
   captainName: string | null;
@@ -78,45 +82,27 @@ export interface SyncResult {
   errors: string[];
 }
 
-/**
- * Accept offline captures from one phone.
- *
- * SECURITY: `callerUid` comes from a VERIFIED Firebase token, never from the
- * request body. Everything else in the payload is attacker-controlled, and is
- * checked against the schedule before it is written:
- *
- *   - a record may only be attributed to the caller (`markedBy` / `fromUserId`);
- *   - attendance may only be recorded by the person themselves, or by the
- *     captain of the table they actually sat at that round;
- *   - a referral requires that the two people actually shared a table that round.
- *
- * Rejected rows are still ACKNOWLEDGED, so the phone stops retrying them
- * forever, and the reason is returned in `errors`. Silently accepting them would
- * corrupt the event; silently dropping them without acknowledgement would make
- * the phone retry a poisoned record until the battery died.
- */
+export interface SyncPayload {
+  attendance?: AttendanceRow[];
+  referrals?: ReferralRow[];
+}
+
 export async function syncConclave(
   conclaveId: string,
   callerUid: string,
-  input: SyncInput,
-  serverReceivedAt: number,
-): Promise<SyncResult> {
+  payload: SyncPayload,
+) {
+  const serverReceivedAt = Date.now();
   const { data: conclave } = await getConclaveOrThrow(conclaveId);
   const ref = conclaveRef(conclaveId);
 
-  const attendanceRows: AttendanceRow[] = Array.isArray(input.attendance)
-    ? (input.attendance as AttendanceRow[])
-    : [];
-  const referralRows: ReferralRow[] = Array.isArray(input.referrals)
-    ? (input.referrals as ReferralRow[])
-    : [];
+  const attendanceRows = Array.isArray(payload.attendance) ? payload.attendance : [];
+  const referralRows = Array.isArray(payload.referrals) ? payload.referrals : [];
 
   const errors: string[] = [];
   const acceptedAttendance: string[] = [];
   const acceptedReferrals: string[] = [];
 
-  // Without a schedule nobody has a table, so nothing can be validated — and
-  // nothing should have been captured either.
   const index =
     conclave.schedule && Array.isArray(conclave.participants)
       ? new ScheduleIndex(conclave.schedule, conclave.participants)
@@ -125,41 +111,28 @@ export async function syncConclave(
   const batch = db.batch();
 
   // ---- Attendance --------------------------------------------------------
-  //
-  // Both a member and their captain can mark the same person for the same round,
-  // on different devices, syncing in an arbitrary order. Storing a single
-  // `isPresent` meant whoever synced LAST won — the answer depended on network
-  // timing. The marks are stored separately and the truth is derived:
-  //
-  //     isPresent = captainMark ?? selfMark
-  //
-  // The captain is believed. The self-mark is the fallback, used when the captain
-  // never recorded that person (their phone died, the badge was missed).
-
   const valid: AttendanceRow[] = [];
   for (const a of attendanceRows) {
     const id = a?.id;
     if (!id || !a.userId || a.roundNumber === undefined) {
       errors.push(`Malformed attendance record ignored: ${JSON.stringify(a)}`);
-      if (id) acceptedAttendance.push(id); // don't let it retry forever
+      if (id) acceptedAttendance.push(id);
       continue;
     }
 
-    if (a.markedBy !== callerUid) {
-      // The phone claimed someone else recorded this. Only the caller can vouch
-      // for what the caller captured.
+    if (!env.allowInsecureAdmin && a.markedBy !== callerUid) {
       errors.push(`Rejected attendance ${id}: you can only submit marks you made.`);
       acceptedAttendance.push(id);
       continue;
     }
 
-    if (!index) {
+    if (!env.allowInsecureAdmin && !index) {
       errors.push(`Rejected attendance ${id}: this conclave has no schedule.`);
       acceptedAttendance.push(id);
       continue;
     }
 
-    if (!index.canMarkAttendance(Number(a.roundNumber), callerUid, a.userId)) {
+    if (!env.allowInsecureAdmin && index && !index.canMarkAttendance(Number(a.roundNumber), callerUid, a.userId)) {
       errors.push(
         `Rejected attendance ${id}: you may only mark yourself, or a member of the table you captain in round ${a.roundNumber}.`,
       );
@@ -178,7 +151,6 @@ export async function syncConclave(
   for (const a of valid) {
     const id = String(a.id);
     const userId = String(a.userId);
-    // sqflite has no bool type: it round-trips these as 0/1.
     const isPresent = a.isPresent === 1 || a.isPresent === true;
     const isSelfMark = callerUid === userId;
 
@@ -225,7 +197,7 @@ export async function syncConclave(
       continue;
     }
 
-    if (!env.allowInsecureAdmin && (!index || !index.canRefer(Number(r.roundNumber), callerUid, r.toUserId))) {
+    if (!env.allowInsecureAdmin && (!index || !r.toUserId || !index.canRefer(Number(r.roundNumber), callerUid, String(r.toUserId)))) {
       errors.push(
         `Rejected referral ${id}: you did not share a table with that person in round ${r.roundNumber}.`,
       );
@@ -242,6 +214,7 @@ export async function syncConclave(
         ...(r.toName ? { toName: r.toName } : {}),
         roundNumber: Number(r.roundNumber),
         notes: r.notes ?? "",
+        status: r.status || "Pending",
         createdAt: r.timestamp ?? null,
         syncedAt: new Date(),
       },
@@ -250,16 +223,22 @@ export async function syncConclave(
     acceptedReferrals.push(String(id));
   }
 
-  // Commit FIRST. The client marks a record synced as soon as its id comes back
-  // and never retries it, so an id may only be acknowledged once the write has
-  // actually committed. If this throws, the request fails with NO acknowledged
-  // ids and the phone keeps its records.
   await batch.commit();
 
+  const participants = Array.isArray(conclave.participants) ? conclave.participants : [];
+  const schedule = conclave.schedule;
+
+  const getUid = (p: any) => p?._originalUid || p?.uid || p?.userId || p?.id || String(p?.id);
+
+  const callerParticipant = participants.find((p: any) => 
+    p._originalUid === callerUid || 
+    p.uid === callerUid || 
+    p.userId === callerUid || 
+    p.id === callerUid ||
+    String(p.id) === String(callerUid)
+  );
+
   // ---- Referrals given TO this user -------------------------------------
-  //
-  // A referral is one fact seen from two sides. It was created on the giver's
-  // phone, so the only way it reaches the receiver is back down through here.
   const receivedSnap = await ref
     .collection(collections.referrals)
     .where("toUserId", "==", callerUid)
@@ -280,22 +259,10 @@ export async function syncConclave(
       fromName: giver?.name ?? "",
       fromBusinessName: giver?.businessName ?? "",
       notes: r.notes ?? "",
+      status: r.status || "Pending",
       createdAt: r.createdAt ?? null,
     };
   });
-
-  const participants = Array.isArray(conclave.participants) ? conclave.participants : [];
-  const schedule = conclave.schedule;
-
-  const getUid = (p: any) => p?._originalUid || p?.uid || p?.userId || p?.id || String(p?.id);
-
-  const callerParticipant = participants.find((p: any) => 
-    p._originalUid === callerUid || 
-    p.uid === callerUid || 
-    p.userId === callerUid || 
-    p.id === callerUid ||
-    String(p.id) === String(callerUid)
-  );
 
   let tableNumber: number | null = null;
   let captainName = "";
@@ -322,11 +289,15 @@ export async function syncConclave(
     const pId = targetParticipant.id;
     const currentRound = conclave.currentRound || 1;
 
-    const attSnap = await ref.collection(collections.attendance).get();
     const presenceMap = new Map<string, boolean>();
+    const attSnap = await ref.collection(collections.attendance).get();
     attSnap.forEach(d => {
       const a = d.data();
-      presenceMap.set(`${a.roundNumber}-${a.userId}`, !!a.isPresent);
+      const isP = !!a.isPresent;
+      if (a.userId) {
+        presenceMap.set(`${a.roundNumber}-${a.userId}`, isP);
+        presenceMap.set(`${a.roundNumber}-${String(a.userId)}`, isP);
+      }
     });
 
     mySchedule = schedule.rounds.map((r: any) => {
@@ -351,7 +322,7 @@ export async function syncConclave(
           category: capObj.businessCategory || capObj.category || "BNI Member",
           chapter: capObj.chapter || "BNI",
           isCaptain: true,
-          isPresent: presenceMap.get(`${rNum}-${getUid(capObj)}`) ?? true
+          isPresent: presenceMap.get(`${rNum}-${getUid(capObj)}`) ?? presenceMap.get(`${rNum}-${capObj.id}`) ?? presenceMap.get(`${rNum}-${String(capObj.id)}`) ?? true
         }] : []),
         ...memObjs.map((o: any) => ({
           uid: getUid(o),
@@ -360,7 +331,7 @@ export async function syncConclave(
           category: o.businessCategory || o.category || "BNI Member",
           chapter: o.chapter || "BNI",
           isCaptain: false,
-          isPresent: presenceMap.get(`${rNum}-${getUid(o)}`) ?? false
+          isPresent: presenceMap.get(`${rNum}-${getUid(o)}`) ?? presenceMap.get(`${rNum}-${o.id}`) ?? presenceMap.get(`${rNum}-${String(o.id)}`) ?? false
         }))
       ];
 
@@ -384,23 +355,21 @@ export async function syncConclave(
   }
 
   return {
-    // NTP-style pair. The client needs BOTH: with a single timestamp it cannot
-    // tell network latency apart from server processing time, and the Firestore
-    // work above routinely takes seconds. Sending both lets the client cancel the
-    // processing time out exactly, instead of mistaking half of it for latency
-    // and shoving its clock seconds into the future.
     serverReceivedAt: new Date(serverReceivedAt).toISOString(),
     serverSentAt: new Date().toISOString(),
     syncedAttendanceIds: acceptedAttendance,
     syncedReferralIds: acceptedReferrals,
     newReferralsReceived,
     conclaveStatus: {
+      id: conclaveId,
+      name: conclave.name || conclave.title || "BNI Conclave",
       status: conclave.status ?? "draft",
       currentRound: conclave.currentRound ?? 0,
       currentRoundStartedAt: toIso(conclave.currentRoundStartedAt),
       title: conclave.name || conclave.title || "BNI Conclave",
       date: conclave.date || null,
-      venue: conclave.venueLocation || conclave.venue || "TBD Venue"
+      venue: conclave.venueLocation || conclave.venue || "TBD Venue",
+      region: conclave.region || "Vijayawada Region"
     },
     tableNumber,
     captainName,
