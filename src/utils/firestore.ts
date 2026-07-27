@@ -17,9 +17,23 @@ export async function getAllDocs<T = FirebaseFirestore.DocumentData>(
   // Chunked so a very large conclave can't blow the request size limit.
   const CHUNK = 200;
   for (let i = 0; i < refs.length; i += CHUNK) {
-    const docs = await db.getAll(...refs.slice(i, i + CHUNK));
-    for (const d of docs) {
-      if (d.exists) out.set(d.id, d.data() as T);
+    if (typeof (db as any).getAll === "function") {
+      const docs = await db.getAll(...refs.slice(i, i + CHUNK));
+      for (const d of docs) {
+        if (d.exists) out.set(d.id, d.data() as T);
+      }
+    } else {
+      const chunk = refs.slice(i, i + CHUNK);
+      await Promise.all(
+        chunk.map(async (ref) => {
+          if (ref && typeof ref.get === "function") {
+            const snap = await ref.get();
+            if (snap && snap.exists) {
+              out.set(snap.id || (ref as any).id, snap.data() as T);
+            }
+          }
+        })
+      );
     }
   }
   return out;
