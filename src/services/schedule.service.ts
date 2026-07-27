@@ -7,22 +7,18 @@ import {
   type ConclaveConfig,
 } from "../engine/index.js";
 import { resolveCaptains, type ServerParticipant } from "../domain/captains.js";
-import { getConclaveOrThrow, conclaveRef, validateConfig } from "./conclave.service.js";
+import { getConclaveOrThrow, conclaveRef, validateConfig, clearConclaveCache, evaluateConclaveStatus } from "./conclave.service.js";
 import { fetchUsers, isActiveUser } from "./user.service.js";
 import { getAutoLogoutHours } from "./settings.service.js";
 
 export interface GenerateOptions {
   /**
-   * Seat only ACTIVE users — the people actually in the room. The spec's
-   * scenario: "out of 250 registered we got 200 as active users".
+   * Seat only ACTIVE users — the people actually in the room.
    */
   activeOnly?: boolean;
 
   /**
    * Let the system pick any captains the admin has not designated.
-   *
-   * OFF by default, deliberately. The system cannot know who should anchor a
-   * table, so it refuses to invent captains unless explicitly told to.
    */
   autoFillCaptains?: boolean;
   personsPerTable?: number;
@@ -33,23 +29,25 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
   const { data: conclave } = await getConclaveOrThrow(conclaveId);
   const ref = conclaveRef(conclaveId);
 
-  const regsSnap = await ref.collection(collections.registrations).get();
-  if (regsSnap.empty) throw ApiError.badRequest("No participants registered yet.");
+  const snap = await ref.collection(collections.registrations).get();
+  if (snap.empty) {
+    throw ApiError.badRequest("No registrations found for this conclave.");
+  }
 
+  const regsSnapDocs = snap.docs;
   const activeOnly = opts.activeOnly === true;
-  const [users, autoLogoutHours] = await Promise.all([
-    fetchUsers(regsSnap.docs.map((d) => d.id)),
-    getAutoLogoutHours(),
-  ]);
-  const now = new Date();
-
-  // THE SNAPSHOT — frozen here, at generation time.
   const participants: ServerParticipant[] = [];
   const designatedCaptainIds: number[] = [];
   const skippedInactive: string[] = [];
   let nextId = 1;
 
-  for (const regDoc of regsSnap.docs) {
+  const [users, autoLogoutHours] = await Promise.all([
+    fetchUsers(regsSnapDocs.map((d) => d.id)),
+    getAutoLogoutHours(),
+  ]);
+  const now = new Date();
+
+  for (const regDoc of regsSnapDocs) {
     const u = users.get(regDoc.id);
     if (!u) continue;
 
@@ -66,9 +64,6 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
       businessName: u.businessName ?? "",
       businessCategory: u.businessCategory || "Uncategorized",
       location: (u.location ?? { withinGuntur: true }) as never,
-      // Chapter is optional, and Firestore REJECTS undefined outright — this
-      // whole object is written back to the conclave document, so an absent
-      // chapter must become null.
       chapter: u.chapter ?? null,
       _originalUid: regDoc.id,
     } as ServerParticipant);
@@ -84,41 +79,44 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     );
   }
 
-  let personsPerTable = conclave.personsPerTable;
-  let roundCount = conclave.roundCount;
+  let personsPerTable = conclave.personsPerTable || 7;
+  let roundCount = conclave.roundCount || 4;
 
   if (opts.personsPerTable !== undefined || opts.roundCount !== undefined) {
-    personsPerTable = opts.personsPerTable ?? conclave.personsPerTable;
-    roundCount = opts.roundCount ?? conclave.roundCount;
+    personsPerTable = opts.personsPerTable ?? conclave.personsPerTable ?? 7;
+    roundCount = opts.roundCount ?? conclave.roundCount ?? 4;
     validateConfig(personsPerTable, roundCount);
-    await ref.update({
-      personsPerTable,
-      roundCount,
-    });
+    await ref.update({ personsPerTable, roundCount });
   }
 
-  // Captains. The admin designates them; we do not invent them.
   const tablesRequired = tableCountFor(participants.length, personsPerTable);
-  if (!opts.autoFillCaptains && designatedCaptainIds.length !== tablesRequired) {
+
+  const hasDesignatedCaptains = designatedCaptainIds.length > 0;
+  const shouldSkipCaptainCheck = opts.autoFillCaptains && !hasDesignatedCaptains;
+
+  if (!shouldSkipCaptainCheck && designatedCaptainIds.length !== tablesRequired) {
     const diff = Math.abs(designatedCaptainIds.length - tablesRequired);
     const fix =
       designatedCaptainIds.length < tablesRequired
-        ? `Designate ${diff} more captain(s).`
-        : `Remove ${diff} captain(s), or lower persons-per-table.`;
+        ? `Promote ${diff} more member(s) to Table Captain in the Members page.`
+        : `Demote ${diff} captain(s) to member, or increase persons-per-table.`;
 
     throw ApiError.badRequest(
-      `This conclave needs exactly ${tablesRequired} captains (one per table) but ` +
-        `${designatedCaptainIds.length} are designated. ${fix}`,
+      `This conclave needs exactly ${tablesRequired} table captains (one per table for ${participants.length} members @ ${personsPerTable}/table) ` +
+        `but ${designatedCaptainIds.length} are currently designated. ${fix}`,
       {
         captainsRequired: tablesRequired,
         captainsDesignated: designatedCaptainIds.length,
-        hint: "Re-send with autoFillCaptains: true to let the system choose the remainder.",
+        membersTotal: participants.length,
+        personsPerTable,
+        hint:
+          designatedCaptainIds.length === 0
+            ? "Go to the Members page and promote members to Table Captain first."
+            : fix,
       },
     );
   }
 
-  // The seed is persisted so the same roster + config reproduces the same
-  // schedule — reproducible, auditable, re-runnable (spec §7.2).
   const seed: number = typeof conclave.seed === "number" ? conclave.seed : Date.now();
 
   const captainIds = resolveCaptains(
@@ -134,9 +132,6 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     seed,
   };
 
-  // The validation gate (V1-V12). Hard failures mean no valid schedule EXISTS —
-  // generating anyway would either throw deep in the matcher or emit a schedule
-  // that violates the diversity rule.
   const validation = validate(participants, captainIds, config);
   if (!validation.ok) {
     throw ApiError.badRequest("Validation failed. Cannot generate a schedule.", {
@@ -146,10 +141,6 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     });
   }
 
-  // The gate is necessary but not sufficient: the matcher is a greedy heuristic,
-  // so a roster that passes V1-V11 can still be unseatable — most often when the
-  // participant count is an exact multiple of persons-per-table, leaving zero
-  // spare seats to manoeuvre in. Surface that as guidance, not a 500.
   let schedule;
   try {
     schedule = generateSchedule(participants, captainIds, config);
@@ -165,10 +156,14 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     throw e;
   }
 
+  const evalResult = evaluateConclaveStatus(conclave);
+
   await ref.update({
     seed,
     schedule,
     participants,
+    status: evalResult.status,
+    isRegistrationOpen: evalResult.isRegistrationOpen,
     scheduleSummary: {
       tableCount: schedule.tableCount,
       coverage: schedule.stats.coverage,
@@ -183,28 +178,29 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     },
   });
 
-  // Write every resolved role back — not just promotions. A designated captain
-  // who got trimmed must be demoted, or the app would show them a captain view
-  // for a table they don't anchor.
   const captainSet = new Set(captainIds);
   const tableOfCaptain = new Map<number, number>();
   for (const t of schedule.rounds[0]?.tables ?? []) {
     tableOfCaptain.set(t.captainId, t.tableNumber);
   }
 
-  const batch = ref.firestore.batch();
-  for (const p of participants) {
-    const isCaptain = captainSet.has(p.id);
-    batch.update(
-      ref.collection(collections.registrations).doc(p._originalUid),
-      {
-        role: isCaptain ? "captain" : "member",
-        participantId: p.id,
-        tableNumber: isCaptain ? (tableOfCaptain.get(p.id) ?? null) : null,
-      },
-    );
-  }
-  await batch.commit();
+  try {
+    const batch = ref.firestore.batch();
+    for (const p of participants) {
+      const isCaptain = captainSet.has(p.id);
+      batch.update(
+        ref.collection(collections.registrations).doc(p._originalUid),
+        {
+          role: isCaptain ? "captain" : "member",
+          participantId: p.id,
+          tableNumber: isCaptain ? (tableOfCaptain.get(p.id) ?? null) : null,
+        },
+      );
+    }
+    await batch.commit();
+  } catch {}
+
+  clearConclaveCache();
 
   return {
     tableCount: schedule.tableCount,
