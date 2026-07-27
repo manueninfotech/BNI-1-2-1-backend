@@ -46,8 +46,10 @@ export async function getOne(req: AuthedRequest, res: Response) {
     date: toDate(d.date)?.toISOString() ?? null,
     startTime: toDate(d.startTime)?.toISOString() ?? null,
     endTime: toDate(d.endTime)?.toISOString() ?? null,
+    currentRoundStartedAt: toDate(d.currentRoundStartedAt)?.toISOString() ?? null,
   });
 }
+
 
 export async function create(req: AuthedRequest, res: Response) {
   const admin = await getAdminDoc(req.uid);
@@ -82,6 +84,12 @@ export async function cancel(req: AuthedRequest, res: Response) {
   await conclaves.cancelConclave(req.params.id);
   res.json({ message: "Conclave cancelled." });
 }
+
+export async function lockSchedule(req: AuthedRequest, res: Response) {
+  await conclaves.lockConclaveSchedule(req.params.id);
+  res.json({ message: "Schedule locked and published successfully." });
+}
+
 
 export async function complete(req: AuthedRequest, res: Response) {
   const result = await conclaves.completeConclave(req.params.id);
@@ -523,3 +531,20 @@ export async function listAllUsers(_req: AuthedRequest, res: Response) {
     .filter(u => u.email !== "superadmin@bni.com");
   res.json(list);
 }
+
+export async function deleteConclave(req: AuthedRequest, res: Response) {
+  await conclaves.deleteConclave(req.params.id);
+  res.json({ message: "Conclave deleted successfully." });
+}
+
+export async function setUserRole(req: AuthedRequest, res: Response) {
+  const { uid } = req.params;
+  const { role } = req.body ?? {};
+  if (!role) {
+    return res.status(400).json({ error: "Role is required." });
+  }
+  await db.collection(collections.users).doc(uid).set({ role }, { merge: true });
+  res.json({ message: "User role updated successfully." });
+}
+
+
