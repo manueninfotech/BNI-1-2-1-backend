@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch --ignore src/data/** src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
@@ -20,6 +20,7 @@
     "delete-conclave": "tsx scripts/deleteSeededConclave.ts",
     "check-rules": "tsx scripts/checkRules.ts",
     "patch-conclaves": "tsx scripts/patchConclaveFields.ts",
+    "sync-db": "tsx src/scripts/syncDb.ts",
     "emulator": "npx firebase-tools emulators:start --config ../firebase.json"
   },
   "dependencies": {
