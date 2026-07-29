@@ -45,7 +45,7 @@ export async function me(req: AuthedRequest, res: Response) {
           phone: adminData.mobile || "",
           region: adminData.region || "Guntur Region",
           role: adminData.role || "admin",
-          createdAt: adminData.grantedAt || null,
+          createdAt: adminData.grantedAt || adminData.createdAt || new Date().toISOString(),
         });
       }
     }
@@ -60,7 +60,7 @@ export async function me(req: AuthedRequest, res: Response) {
       category: data?.businessCategory || "",
       chapter: data?.chapter || "",
       location: data?.location || "",
-      createdAt: data?.createdAt || data?.registeredAt || null,
+      createdAt: data?.createdAt || data?.registeredAt || new Date().toISOString(),
       role: data?.role || "member",
     });
   } catch (err: any) {
