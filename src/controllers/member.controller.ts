@@ -5,6 +5,18 @@ import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
 import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
 
+function toISO(val: any): string {
+  if (!val) return new Date().toISOString();
+  if (typeof val === 'string') return val;
+  if (typeof val === 'number') return new Date(val).toISOString();
+  if (typeof val === 'object') {
+    if (typeof val.toDate === 'function') return val.toDate().toISOString();
+    if (val._seconds) return new Date(val._seconds * 1000).toISOString();
+    if (val.seconds) return new Date(val.seconds * 1000).toISOString();
+  }
+  return new Date().toISOString();
+}
+
 export async function me(req: AuthedRequest, res: Response) {
   try {
     const userDoc = await db.collection(collections.users).doc(req.uid).get();
@@ -45,7 +57,7 @@ export async function me(req: AuthedRequest, res: Response) {
           phone: adminData.mobile || "",
           region: adminData.region || "Guntur Region",
           role: adminData.role || "admin",
-          createdAt: adminData.grantedAt || adminData.createdAt || new Date().toISOString(),
+          createdAt: toISO(adminData.grantedAt || adminData.createdAt),
         });
       }
     }
@@ -60,7 +72,7 @@ export async function me(req: AuthedRequest, res: Response) {
       category: data?.businessCategory || "",
       chapter: data?.chapter || "",
       location: data?.location || "",
-      createdAt: data?.createdAt || data?.registeredAt || new Date().toISOString(),
+      createdAt: toISO(data?.createdAt || data?.registeredAt),
       role: data?.role || "member",
     });
   } catch (err: any) {
