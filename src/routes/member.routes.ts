@@ -18,6 +18,8 @@ const router = Router();
 router.use(requireUser);
 
 router.get("/me", asyncHandler(c.me));
+router.put("/me", asyncHandler(c.updateMe));
+router.patch("/me", asyncHandler(c.updateMe));
 router.get("/conclaves", asyncHandler(c.listConclaves));
 router.get("/conclaves/:id/referrals", asyncHandler(c.getReferrals));
 router.post("/conclaves/:id/register", asyncHandler(c.register));

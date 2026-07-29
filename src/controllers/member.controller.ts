@@ -74,6 +74,52 @@ export async function me(req: AuthedRequest, res: Response) {
   }
 }
 
+export async function updateMe(req: AuthedRequest, res: Response) {
+  try {
+    const { name, email, phone, mobile, company, businessName, category, businessCategory, chapter, region, designation, organization } = req.body ?? {};
+
+    const updates: any = {};
+    if (name !== undefined) updates.name = name;
+    if (email !== undefined) updates.email = email;
+    if (phone !== undefined || mobile !== undefined) {
+      updates.phone = phone ?? mobile;
+      updates.mobile = mobile ?? phone;
+    }
+    if (company !== undefined || businessName !== undefined) {
+      updates.company = company ?? businessName;
+      updates.businessName = businessName ?? company;
+    }
+    if (category !== undefined || businessCategory !== undefined) {
+      updates.category = category ?? businessCategory;
+      updates.businessCategory = businessCategory ?? category;
+    }
+    if (chapter !== undefined) updates.chapter = chapter;
+    if (region !== undefined) updates.region = region;
+    if (designation !== undefined) updates.designation = designation;
+    if (organization !== undefined) updates.organization = organization;
+    updates.updatedAt = new Date().toISOString();
+
+    const userDocRef = db.collection(collections.users).doc(req.uid);
+    const userDoc = await userDocRef.get();
+
+    if (userDoc.exists) {
+      await userDocRef.set(updates, { merge: true });
+    } else {
+      const adminDocRef = db.collection(collections.admins).doc(req.uid);
+      const adminDoc = await adminDocRef.get();
+      if (adminDoc.exists) {
+        await adminDocRef.set(updates, { merge: true });
+      } else {
+        await userDocRef.set(updates, { merge: true });
+      }
+    }
+
+    res.json({ success: true, message: "Profile updated successfully.", profile: updates });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to update profile." });
+  }
+}
+
 export async function listConclaves(req: AuthedRequest, res: Response) {
   const list = await listConclaveRecords();
 
