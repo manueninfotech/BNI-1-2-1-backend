@@ -1,3 +1,5 @@
+import fs from "fs";
+import path from "path";
 import type { Response } from "express";
 import type { AuthedRequest } from "../middleware/auth.js";
 import { db, auth, collections } from "../config/firebase.js";
@@ -88,6 +90,63 @@ export async function cancel(req: AuthedRequest, res: Response) {
 export async function lockSchedule(req: AuthedRequest, res: Response) {
   await conclaves.lockConclaveSchedule(req.params.id);
   res.json({ message: "Schedule locked and published successfully." });
+}
+
+export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
+  const { id } = req.params;
+  const agendaDoc = req.body?.agendaDocument;
+
+  if (!agendaDoc) {
+    const ref = conclaves.conclaveRef(id);
+    await ref.set({
+      agendaDocument: null,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+    return res.json({ message: "Agenda document cleared.", agendaDocument: null });
+  }
+
+  let fileUrl = agendaDoc.dataUrl || agendaDoc.url || "";
+  let savedFileName = agendaDoc.name || "agenda.pdf";
+
+  // If dataUrl (base64) provided, write to physical disk inside uploads/agendas/
+  if (agendaDoc.dataUrl && agendaDoc.dataUrl.includes(";base64,")) {
+    try {
+      const uploadsDir = path.join(process.cwd(), "uploads", "agendas");
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+
+      const parts = agendaDoc.dataUrl.split(";base64,");
+      const base64Data = parts[1];
+      const buffer = Buffer.from(base64Data, "base64");
+
+      const cleanName = savedFileName.replace(/[^a-zA-Z0-9_.-]/g, "_");
+      const fileNameOnDisk = `${id}_${Date.now()}_${cleanName}`;
+      const filePathOnDisk = path.join(uploadsDir, fileNameOnDisk);
+
+      fs.writeFileSync(filePathOnDisk, buffer);
+      fileUrl = `/uploads/agendas/${fileNameOnDisk}`;
+    } catch (err: any) {
+      console.error("Failed to write agenda file to server disk:", err);
+    }
+  }
+
+  const finalDocRecord = {
+    name: savedFileName,
+    url: fileUrl,
+    dataUrl: agendaDoc.dataUrl || fileUrl,
+    type: agendaDoc.type || "application/pdf",
+    size: agendaDoc.size || "1.0 MB",
+    uploadedAt: new Date().toISOString()
+  };
+
+  const ref = conclaves.conclaveRef(id);
+  await ref.set({
+    agendaDocument: finalDocRecord,
+    updatedAt: new Date().toISOString()
+  }, { merge: true });
+
+  res.json({ message: "Agenda document uploaded and saved to server successfully.", agendaDocument: finalDocRecord });
 }
 
 
@@ -546,5 +605,6 @@ export async function setUserRole(req: AuthedRequest, res: Response) {
   await db.collection(collections.users).doc(uid).set({ role }, { merge: true });
   res.json({ message: "User role updated successfully." });
 }
+
 
 
