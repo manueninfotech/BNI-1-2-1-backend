@@ -134,7 +134,9 @@ export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
   const finalDocRecord = {
     name: savedFileName,
     url: fileUrl,
-    dataUrl: agendaDoc.dataUrl || fileUrl,
+    dataUrl: fileUrl || (agendaDoc.url ? agendaDoc.url : ""),
+    rawText: agendaDoc.rawText || agendaDoc.agendaText || "",
+    agendaText: agendaDoc.agendaText || agendaDoc.rawText || "",
     type: agendaDoc.type || "application/pdf",
     size: agendaDoc.size || "1.0 MB",
     uploadedAt: new Date().toISOString()

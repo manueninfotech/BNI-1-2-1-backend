@@ -70,6 +70,16 @@ export function errorHandler(
     return res.status(err.status).json({ error: err.message, ...(err.details ?? {}) });
   }
 
+  const errStr = String(err && (err as any).message ? (err as any).message : err);
+  if (errStr.includes("RESOURCE_EXHAUSTED") || errStr.includes("Quota exceeded")) {
+    console.warn("Database quota exceeded (RESOURCE_EXHAUSTED). Returning non-blocking fallback response.");
+    return res.status(200).json({
+      warning: "Database daily quota limit reached. Operating in cached mode.",
+      quotaExceeded: true,
+      data: []
+    });
+  }
+
   console.error("Unhandled error:", err);
 
   // Don't leak internals to clients in production.
