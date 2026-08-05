@@ -58,6 +58,15 @@ interface CreateInput {
   personsPerTable?: number;
   roundCount?: number;
   region?: string;
+  paymentDetails?: {
+    bankName?: string;
+    accountNumber?: string;
+    ifscCode?: string;
+    accountHolderName?: string;
+    upiId?: string;
+    upiQrImageUrl?: string;
+    registrationFee?: number;
+  };
 }
 
 /**
@@ -180,6 +189,7 @@ export async function createConclave(input: CreateInput) {
     isRegistrationOpen: isRegOpen,
     personsPerTable,
     roundCount,
+    paymentDetails: input.paymentDetails || null,
     currentRound: 0,
     schedule: null,
     participants: null,
@@ -207,6 +217,7 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
   if (body.creator !== undefined) updates.creator = body.creator;
   if (body.description !== undefined) updates.description = body.description;
   if (body.dateRange !== undefined) updates.dateRange = body.dateRange;
+  if (body.paymentDetails !== undefined) updates.paymentDetails = body.paymentDetails;
   if (body.date !== undefined) updates.date = body.date ? new Date(body.date as string) : null;
   if (body.startDate !== undefined) updates.startDate = body.startDate ? new Date(body.startDate as string) : null;
   if (body.endDate !== undefined) updates.endDate = body.endDate ? new Date(body.endDate as string) : null;
