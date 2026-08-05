@@ -25,10 +25,11 @@ async function getAdminDoc(uid: string) {
 export async function list(req: AuthedRequest, res: Response) {
   try {
     const admin = await getAdminDoc(req.uid);
-    // Superadmin (role=superadmin OR region=Global) sees every conclave.
+    const requestGlobal = req.query.global === 'true';
+    // Superadmin (role=superadmin OR region=Global) OR ?global=true sees every conclave.
     // Any other coordinator sees only their own region.
     const region =
-      !admin || admin.role === "superadmin" || admin.region === "Global"
+      !admin || admin.role === "superadmin" || admin.region === "Global" || requestGlobal
         ? undefined   // no filter → all
         : admin.region;
     const items = await conclaves.listConclaves(region);
