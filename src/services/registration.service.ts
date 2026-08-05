@@ -14,7 +14,7 @@ import { getConclaveOrThrow, conclaveRef } from "./conclave.service.js";
  *
  * Registration is deliberately FINAL. There is no withdraw endpoint.
  */
-export async function register(conclaveId: string, uid: string) {
+export async function register(conclaveId: string, uid: string, details: Record<string, any> = {}) {
   const { data: conclave } = await getConclaveOrThrow(conclaveId);
 
   if (
@@ -74,12 +74,47 @@ export async function register(conclaveId: string, uid: string) {
     }
   }
 
+  const {
+    name, email, phone, company, category, chapter,
+    region, state, country, mealPreference, needsAccommodation,
+    specialInstructions, utrNumber
+  } = details;
+
   await myReg.set({
     userId: uid, // denormalised so registrations are queryable by user
     registeredAt: new Date(),
     role: "member",
     status: "pending",
-  });
+    ...(name ? { name } : {}),
+    ...(email ? { email } : {}),
+    ...(phone ? { phone } : {}),
+    ...(company ? { company } : {}),
+    ...(category ? { category } : {}),
+    ...(chapter ? { chapter } : {}),
+    ...(region ? { region } : {}),
+    ...(state ? { state } : {}),
+    ...(country ? { country } : {}),
+    ...(mealPreference ? { mealPreference } : {}),
+    ...(needsAccommodation ? { needsAccommodation } : {}),
+    ...(specialInstructions ? { specialInstructions } : {}),
+    ...(utrNumber ? { utrNumber } : {}),
+  }, { merge: true });
+
+  // Sync region, state, country, chapter to user doc
+  const userRef = db.collection(collections.users).doc(uid);
+  const userUpdate: Record<string, any> = {};
+  if (region) userUpdate.region = region;
+  if (state) userUpdate.state = state;
+  if (country) userUpdate.country = country;
+  if (chapter) userUpdate.chapter = chapter;
+  if (company) userUpdate.company = company;
+  if (category) userUpdate.category = category;
+  if (name) userUpdate.name = name;
+  if (phone) userUpdate.phone = phone;
+
+  if (Object.keys(userUpdate).length > 0) {
+    await userRef.set(userUpdate, { merge: true }).catch(() => {});
+  }
 
   return { alreadyRegistered: false };
 }

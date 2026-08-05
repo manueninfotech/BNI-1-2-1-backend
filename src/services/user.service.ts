@@ -19,6 +19,8 @@ export interface UserDoc {
   location?: unknown;
   chapter?: string | null;
   region?: string;
+  state?: string;
+  country?: string;
   createdAt?: unknown;
   lastLoginAt?: unknown;
 }
@@ -61,6 +63,8 @@ export interface Registrant {
   businessCategory: string;
   chapter?: string;
   region?: string;
+  state?: string;
+  country?: string;
   location?: unknown;
   createdAt?: string | null;
   isActive: boolean;
@@ -103,6 +107,8 @@ export async function listRegistrants(conclaveId: string): Promise<Registrant[]>
       businessCategory: u?.businessCategory ?? u?.category ?? reg?.category ?? "",
       chapter: u?.chapter ?? reg?.chapter ?? "",
       region: u?.region ?? reg?.region ?? "",
+      state: u?.state ?? reg?.state ?? "",
+      country: u?.country ?? reg?.country ?? "",
       location: rawLoc,
       createdAt: toIso(u?.createdAt) || toIso(reg?.registeredAt) || new Date().toISOString(),
       isActive: isActiveUser(u, autoLogoutHours, now),

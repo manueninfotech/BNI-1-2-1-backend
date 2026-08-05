@@ -200,7 +200,7 @@ export async function getReferrals(req: AuthedRequest, res: Response) {
 }
 
 export async function register(req: AuthedRequest, res: Response) {
-  const result = await registration.register(req.params.id, req.uid);
+  const result = await registration.register(req.params.id, req.uid, req.body ?? {});
   res.json({
     message: result.alreadyRegistered ? "You are already registered." : "Registered.",
     ...result,
