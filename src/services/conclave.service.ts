@@ -57,6 +57,8 @@ interface CreateInput {
   chiefGuests?: unknown;
   personsPerTable?: number;
   roundCount?: number;
+  memberLimit?: number;
+  captainLimit?: number;
   region?: string;
   paymentDetails?: {
     bankName?: string;
@@ -189,6 +191,8 @@ export async function createConclave(input: CreateInput) {
     isRegistrationOpen: isRegOpen,
     personsPerTable,
     roundCount,
+    memberLimit: Number(input.memberLimit) || 100,
+    captainLimit: Number(input.captainLimit) || 12,
     paymentDetails: input.paymentDetails || null,
     currentRound: 0,
     schedule: null,
@@ -217,6 +221,8 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
   if (body.creator !== undefined) updates.creator = body.creator;
   if (body.description !== undefined) updates.description = body.description;
   if (body.dateRange !== undefined) updates.dateRange = body.dateRange;
+  if (body.memberLimit !== undefined) updates.memberLimit = Number(body.memberLimit) || 100;
+  if (body.captainLimit !== undefined) updates.captainLimit = Number(body.captainLimit) || 12;
   if (body.paymentDetails !== undefined) updates.paymentDetails = body.paymentDetails;
   if (body.date !== undefined) updates.date = body.date ? new Date(body.date as string) : null;
   if (body.startDate !== undefined) updates.startDate = body.startDate ? new Date(body.startDate as string) : null;
