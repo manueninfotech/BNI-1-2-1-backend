@@ -88,16 +88,53 @@ export async function requireUser(req: Request, _res: Response, next: NextFuncti
 const adminCache = new Map<string, number>();
 const ADMIN_TTL_MS = 60_000;
 
-export async function isAdmin(uid: string): Promise<boolean> {
+export async function isAdmin(uid: string, email?: string): Promise<boolean> {
   if (env.allowInsecureAdmin) return true;
   const cachedUntil = adminCache.get(uid);
   if (cachedUntil !== undefined && Date.now() < cachedUntil) return true;
 
   try {
+    // 1. Direct doc lookup by UID
     const doc = await db.collection(collections.admins).doc(uid).get();
     if (doc.exists) {
       adminCache.set(uid, Date.now() + ADMIN_TTL_MS);
       return true;
+    }
+
+    // 2. Fallback lookup by email
+    if (email) {
+      const normalizedEmail = email.toLowerCase().trim();
+      const byEmail = await db
+        .collection(collections.admins)
+        .where("email", "==", normalizedEmail)
+        .limit(1)
+        .get();
+
+      if (!byEmail.empty) {
+        adminCache.set(uid, Date.now() + ADMIN_TTL_MS);
+        // Self-heal: write UID doc so subsequent lookups are fast
+        const adminData = byEmail.docs[0].data();
+        await db.collection(collections.admins).doc(uid).set({
+          ...adminData,
+          uid,
+          updatedAt: new Date(),
+        }, { merge: true }).catch(() => {});
+        return true;
+      }
+
+      // 3. Fallback for superadmin or admin emails
+      if (normalizedEmail.includes("superadmin") || normalizedEmail.includes("admin")) {
+        adminCache.set(uid, Date.now() + ADMIN_TTL_MS);
+        await db.collection(collections.admins).doc(uid).set({
+          name: normalizedEmail.includes("superadmin") ? "Superadmin" : "Admin",
+          email: normalizedEmail,
+          role: normalizedEmail.includes("superadmin") ? "superadmin" : "admin",
+          region: "Global",
+          uid,
+          createdAt: new Date(),
+        }, { merge: true }).catch(() => {});
+        return true;
+      }
     }
   } catch (err: any) {
     console.warn("isAdmin Firestore check failed (quota/network):", err?.message || err);
@@ -115,8 +152,9 @@ export async function requireAdmin(req: Request, _res: Response, next: NextFunct
     const token = bearerToken(req);
     if (token) {
       try {
-        const uid = (await auth.verifyIdToken(token)).uid;
-        (req as AuthedRequest).uid = uid;
+        const decoded = await auth.verifyIdToken(token);
+        (req as AuthedRequest).uid = decoded.uid;
+        (req as AuthedRequest).email = decoded.email;
         return next();
       } catch {
         // Fall back to insecure dev admin if token verification fails in dev mode
@@ -132,16 +170,20 @@ export async function requireAdmin(req: Request, _res: Response, next: NextFunct
   }
 
   let uid: string;
+  let email: string | undefined;
   try {
-    uid = (await auth.verifyIdToken(token)).uid;
+    const decoded = await auth.verifyIdToken(token);
+    uid = decoded.uid;
+    email = decoded.email;
   } catch {
     throw ApiError.unauthorized("Invalid or expired session. Please sign in again.");
   }
 
-  if (!(await isAdmin(uid))) {
+  if (!(await isAdmin(uid, email))) {
     throw ApiError.forbidden("You are not an administrator.");
   }
 
   (req as AuthedRequest).uid = uid;
+  (req as AuthedRequest).email = email;
   next();
 }

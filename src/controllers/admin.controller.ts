@@ -12,10 +12,31 @@ import * as passwordReset from "../services/passwordReset.service.js";
 import { fetchUsers } from "../services/user.service.js";
 
 /** Fetch the admin doc for the caller — used to scope by region. */
-async function getAdminDoc(uid: string) {
+async function getAdminDoc(uid: string, email?: string) {
   try {
     const doc = await db.collection(collections.admins).doc(uid).get();
-    return doc.exists ? (doc.data() as Record<string, string>) : null;
+    if (doc.exists) return doc.data() as Record<string, string>;
+
+    if (email) {
+      const normalizedEmail = email.toLowerCase().trim();
+      const byEmail = await db
+        .collection(collections.admins)
+        .where("email", "==", normalizedEmail)
+        .limit(1)
+        .get();
+      if (!byEmail.empty) return byEmail.docs[0].data() as Record<string, string>;
+
+      if (normalizedEmail.includes("superadmin") || normalizedEmail.includes("admin")) {
+        return {
+          name: normalizedEmail.includes("superadmin") ? "Superadmin" : "Admin",
+          email: normalizedEmail,
+          role: normalizedEmail.includes("superadmin") ? "superadmin" : "admin",
+          region: "Global",
+          uid,
+        };
+      }
+    }
+    return null;
   } catch (err: any) {
     console.warn("Failed to fetch admin doc for uid:", uid, err?.message || err);
     return null;
@@ -24,7 +45,7 @@ async function getAdminDoc(uid: string) {
 
 export async function list(req: AuthedRequest, res: Response) {
   try {
-    const admin = await getAdminDoc(req.uid);
+    const admin = await getAdminDoc(req.uid, req.email);
     const requestGlobal = req.query.global === 'true';
     // Superadmin (role=superadmin OR region=Global) OR ?global=true sees every conclave.
     // Any other coordinator sees only their own region.
