@@ -2,7 +2,7 @@
   "name": "conclave-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "BNI 121 Conclave \u2014 API and matching engine",
+  "description": "BNI 121 Conclave — API and matching engine",
   "type": "module",
   "main": "src/index.ts",
   "engines": {
@@ -25,6 +25,7 @@
     "emulator": "npx firebase-tools emulators:start --config ../firebase.json"
   },
   "dependencies": {
+    "cloudinary": "^2.10.0",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",

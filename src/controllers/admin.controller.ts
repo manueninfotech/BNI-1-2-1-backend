@@ -10,6 +10,7 @@ import * as roles from "../services/role.service.js";
 import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
 import { fetchUsers } from "../services/user.service.js";
+import { uploadBufferToCloudinary, uploadBase64ToCloudinary } from "../services/cloudinary.service.js";
 
 /** Fetch the admin doc for the caller — used to scope by region. */
 async function getAdminDoc(uid: string, email?: string) {
@@ -129,34 +130,49 @@ export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
 
   let fileUrl = agendaDoc.dataUrl || agendaDoc.url || "";
   let savedFileName = agendaDoc.name || "agenda.pdf";
+  let cloudinaryPublicId = "";
 
-  // If dataUrl (base64) provided, write to physical disk inside uploads/agendas/
+  // Upload to Cloudinary if base64 dataUrl is provided
   if (agendaDoc.dataUrl && agendaDoc.dataUrl.includes(";base64,")) {
     try {
-      const uploadsDir = path.join(process.cwd(), "uploads", "agendas");
-      if (!fs.existsSync(uploadsDir)) {
-        fs.mkdirSync(uploadsDir, { recursive: true });
-      }
-
       const parts = agendaDoc.dataUrl.split(";base64,");
       const base64Data = parts[1];
       const buffer = Buffer.from(base64Data, "base64");
 
-      const cleanName = savedFileName.replace(/[^a-zA-Z0-9_.-]/g, "_");
-      const fileNameOnDisk = `${id}_${Date.now()}_${cleanName}`;
-      const filePathOnDisk = path.join(uploadsDir, fileNameOnDisk);
+      const cloudResult = await uploadBufferToCloudinary(buffer, savedFileName, "bni_conclaves/agendas");
+      if (cloudResult && cloudResult.secure_url) {
+        fileUrl = cloudResult.secure_url;
+        cloudinaryPublicId = cloudResult.public_id;
+        console.log(`[Cloudinary] Successfully uploaded agenda document to Cloudinary: ${fileUrl}`);
+      } else {
+        // Fallback to local disk if Cloudinary credentials are not set
+        const uploadsDir = path.join(process.cwd(), "uploads", "agendas");
+        if (!fs.existsSync(uploadsDir)) {
+          fs.mkdirSync(uploadsDir, { recursive: true });
+        }
+        const cleanName = savedFileName.replace(/[^a-zA-Z0-9_.-]/g, "_");
+        const fileNameOnDisk = `${id}_${Date.now()}_${cleanName}`;
+        const filePathOnDisk = path.join(uploadsDir, fileNameOnDisk);
 
-      fs.writeFileSync(filePathOnDisk, buffer);
-      fileUrl = `/uploads/agendas/${fileNameOnDisk}`;
+        fs.writeFileSync(filePathOnDisk, buffer);
+        fileUrl = `/uploads/agendas/${fileNameOnDisk}`;
+      }
     } catch (err: any) {
-      console.error("Failed to write agenda file to server disk:", err);
+      console.error("Failed to process agenda document upload:", err);
+    }
+  } else if (agendaDoc.dataUrl && agendaDoc.dataUrl.startsWith("data:")) {
+    const cloudResult = await uploadBase64ToCloudinary(agendaDoc.dataUrl, savedFileName, "bni_conclaves/agendas");
+    if (cloudResult && cloudResult.secure_url) {
+      fileUrl = cloudResult.secure_url;
+      cloudinaryPublicId = cloudResult.public_id;
     }
   }
 
   const finalDocRecord = {
     name: savedFileName,
     url: fileUrl,
-    dataUrl: fileUrl || (agendaDoc.url ? agendaDoc.url : ""),
+    dataUrl: fileUrl,
+    publicId: cloudinaryPublicId,
     rawText: agendaDoc.rawText || agendaDoc.agendaText || "",
     agendaText: agendaDoc.agendaText || agendaDoc.rawText || "",
     type: agendaDoc.type || "application/pdf",
