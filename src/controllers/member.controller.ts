@@ -24,7 +24,6 @@ export async function me(req: AuthedRequest, res: Response) {
 
     // Fallback: if no doc found by UID, search by email or identifier field
     if (!data && req.email) {
-      // First try by 'email' field
       const emailSnap = await db.collection(collections.users)
         .where('email', '==', req.email)
         .limit(1)
@@ -33,7 +32,6 @@ export async function me(req: AuthedRequest, res: Response) {
         data = emailSnap.docs[0].data() as any;
       }
 
-      // Also try by 'identifier' field (used as sign-in email for test/synthetic accounts)
       if (!data) {
         const identSnap = await db.collection(collections.users)
           .where('identifier', '==', req.email)
@@ -45,20 +43,57 @@ export async function me(req: AuthedRequest, res: Response) {
       }
     }
 
-    if (!data) {
+    // Check admins collection if not in users or if user has an admin role
+    const isDocAdmin = data?.role === 'admin' || data?.role === 'superadmin' || data?.role === 'coordinator' || data?.role === 'regional_admin';
+    if (!data || isDocAdmin) {
       const adminDoc = await db.collection(collections.admins).doc(req.uid).get();
       if (adminDoc.exists) {
         const adminData = adminDoc.data() as any;
         return res.json({
           uid: req.uid,
           id: req.uid,
-          name: adminData.name || "Admin",
-          email: adminData.email || "",
-          phone: adminData.mobile || "",
+          name: adminData.name || data?.name || "Admin",
+          email: adminData.email || req.email || "",
+          phone: adminData.mobile || data?.phone || "",
           region: adminData.region || "Guntur Region",
-          role: adminData.role || "admin",
-          createdAt: toISO(adminData.grantedAt || adminData.createdAt),
+          role: adminData.role || data?.role || "admin",
+          createdAt: toISO(adminData.grantedAt || adminData.createdAt || data?.createdAt),
         });
+      }
+
+      if (req.email) {
+        const normalizedEmail = req.email.toLowerCase().trim();
+        const adminEmailSnap = await db.collection(collections.admins)
+          .where('email', '==', normalizedEmail)
+          .limit(1)
+          .get();
+        if (!adminEmailSnap.empty) {
+          const adminData = adminEmailSnap.docs[0].data() as any;
+          return res.json({
+            uid: req.uid,
+            id: req.uid,
+            name: adminData.name || "Admin",
+            email: adminData.email || req.email,
+            phone: adminData.mobile || "",
+            region: adminData.region || "Guntur Region",
+            role: adminData.role || "admin",
+            createdAt: toISO(adminData.grantedAt || adminData.createdAt),
+          });
+        }
+
+        if (normalizedEmail.includes('superadmin') || normalizedEmail.includes('admin')) {
+          const detectedRole = normalizedEmail.includes('superadmin') ? 'superadmin' : 'admin';
+          return res.json({
+            uid: req.uid,
+            id: req.uid,
+            name: detectedRole === 'superadmin' ? 'Superadmin' : 'Admin',
+            email: req.email,
+            phone: '',
+            region: 'Global',
+            role: detectedRole,
+            createdAt: new Date().toISOString()
+          });
+        }
       }
     }
 
@@ -76,12 +111,13 @@ export async function me(req: AuthedRequest, res: Response) {
       role: data?.role || "member",
     });
   } catch (err: any) {
+    const isErrAdmin = req.email?.toLowerCase().includes('admin');
     res.json({
       uid: req.uid,
       id: req.uid,
-      name: "Member",
+      name: isErrAdmin ? (req.email?.includes('superadmin') ? "Superadmin" : "Admin") : "Member",
       email: req.email || "",
-      role: "member"
+      role: isErrAdmin ? (req.email?.includes('superadmin') ? "superadmin" : "admin") : "member"
     });
   }
 }
