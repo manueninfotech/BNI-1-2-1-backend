@@ -99,7 +99,53 @@ export async function me(req: AuthedRequest, res: Response) {
       }
     }
 
-    const finalRole = (data?.role || 'member').toLowerCase();
+    let isCaptainRole = false;
+
+    // Check if user is registered as a Captain in a currently RUNNING / ACTIVE conclave
+    if (req.email) {
+      try {
+        const conclavesSnap = await db.collection(collections.conclaves).get();
+        for (const cDoc of conclavesSnap.docs) {
+          const cData = cDoc.data();
+          const cStatus = (cData.status || '').toLowerCase();
+          
+          // Captain role only applies while a conclave is actively RUNNING or ACTIVE.
+          // Once a conclave ends/completes, captains revert to regular members!
+          const isConclaveRunning = cStatus === 'running' || cStatus === 'active' || cStatus === 'in_progress' || cStatus === 'ongoing';
+          
+          if (!isConclaveRunning) continue;
+
+          const regSnap = await db.collection(collections.conclaves).doc(cDoc.id).collection('registrations')
+            .where('email', '==', req.email)
+            .limit(1)
+            .get();
+          if (!regSnap.empty) {
+            const reg = regSnap.docs[0].data();
+            if (reg.role === 'captain' || reg.isCaptain === true || reg.isTableCaptain === true) {
+              isCaptainRole = true;
+              break;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    // Fallback to static user profile flag if user doc explicitly has isCaptain: true AND a running conclave exists
+    if (!isCaptainRole && (data?.isCaptain === true || (data?.role || '').toLowerCase() === 'captain')) {
+      try {
+        const activeSnap = await db.collection(collections.conclaves)
+          .where('status', 'in', ['running', 'active', 'in_progress', 'ongoing'])
+          .limit(1)
+          .get();
+        if (!activeSnap.empty) {
+          isCaptainRole = true;
+        }
+      } catch (_) {}
+    }
+
+    const dbRole = (data?.role || 'member').toLowerCase();
+    const isSpecialRole = dbRole === 'superadmin' || dbRole === 'admin' || dbRole === 'regional_admin' || dbRole === 'coordinator';
+    const finalRole = isCaptainRole ? 'captain' : (isSpecialRole ? dbRole : 'member');
     res.json({
       uid: req.uid,
       id: req.uid,
@@ -112,6 +158,7 @@ export async function me(req: AuthedRequest, res: Response) {
       location: data?.location || "",
       createdAt: toISO(data?.createdAt || data?.registeredAt),
       role: finalRole,
+      isCaptain: isCaptainRole,
     });
   } catch (err: any) {
     const isErrAdmin = req.email?.toLowerCase().includes('admin');

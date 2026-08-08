@@ -4,6 +4,7 @@
   "private": true,
   "description": "BNI 121 Conclave \u2014 API and matching engine",
   "type": "module",
+  "main": "src/index.ts",
   "engines": {
     "node": ">=20"
   },
