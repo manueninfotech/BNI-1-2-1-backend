@@ -19,10 +19,66 @@ function toISO(val: any): string {
 
 export async function me(req: AuthedRequest, res: Response) {
   try {
+    const normalizedEmail = (req.email || '').toLowerCase().trim();
+
+    // 1. ALWAYS check admins collection FIRST
+    const adminDoc = await db.collection(collections.admins).doc(req.uid).get();
+    if (adminDoc.exists) {
+      const adminData = adminDoc.data() as any;
+      const resolvedRole = (adminData.role || (normalizedEmail.includes('superadmin') ? 'superadmin' : 'admin')).toLowerCase();
+      return res.json({
+        uid: req.uid,
+        id: req.uid,
+        name: adminData.name || (resolvedRole === 'superadmin' ? "Superadmin" : "Admin"),
+        email: adminData.email || req.email || "",
+        phone: adminData.mobile || "",
+        region: adminData.region || "Guntur Region",
+        role: resolvedRole,
+        createdAt: toISO(adminData.grantedAt || adminData.createdAt),
+      });
+    }
+
+    // 2. Check admins collection by email
+    if (normalizedEmail) {
+      const adminEmailSnap = await db.collection(collections.admins)
+        .where('email', '==', normalizedEmail)
+        .limit(1)
+        .get();
+      if (!adminEmailSnap.empty) {
+        const adminData = adminEmailSnap.docs[0].data() as any;
+        const resolvedRole = (adminData.role || (normalizedEmail.includes('superadmin') ? 'superadmin' : 'admin')).toLowerCase();
+        return res.json({
+          uid: req.uid,
+          id: req.uid,
+          name: adminData.name || (resolvedRole === 'superadmin' ? "Superadmin" : "Admin"),
+          email: adminData.email || req.email,
+          phone: adminData.mobile || "",
+          region: adminData.region || "Guntur Region",
+          role: resolvedRole,
+          createdAt: toISO(adminData.grantedAt || adminData.createdAt),
+        });
+      }
+
+      // 3. Fallback for admin or superadmin email patterns
+      if (normalizedEmail.includes('superadmin') || normalizedEmail.includes('admin')) {
+        const detectedRole = normalizedEmail.includes('superadmin') ? 'superadmin' : 'admin';
+        return res.json({
+          uid: req.uid,
+          id: req.uid,
+          name: detectedRole === 'superadmin' ? 'Superadmin' : 'Admin',
+          email: req.email,
+          phone: '',
+          region: 'Global',
+          role: detectedRole,
+          createdAt: new Date().toISOString()
+        });
+      }
+    }
+
+    // 4. Query users collection by UID or email
     const userDoc = await db.collection(collections.users).doc(req.uid).get();
     let data = (userDoc.exists ? userDoc.data() : null) as any;
 
-    // Fallback: if no doc found by UID, search by email or identifier field
     if (!data && req.email) {
       const emailSnap = await db.collection(collections.users)
         .where('email', '==', req.email)
@@ -43,60 +99,7 @@ export async function me(req: AuthedRequest, res: Response) {
       }
     }
 
-    // Check admins collection if not in users or if user has an admin role
-    const isDocAdmin = data?.role === 'admin' || data?.role === 'superadmin' || data?.role === 'coordinator' || data?.role === 'regional_admin';
-    if (!data || isDocAdmin) {
-      const adminDoc = await db.collection(collections.admins).doc(req.uid).get();
-      if (adminDoc.exists) {
-        const adminData = adminDoc.data() as any;
-        return res.json({
-          uid: req.uid,
-          id: req.uid,
-          name: adminData.name || data?.name || "Admin",
-          email: adminData.email || req.email || "",
-          phone: adminData.mobile || data?.phone || "",
-          region: adminData.region || "Guntur Region",
-          role: adminData.role || data?.role || "admin",
-          createdAt: toISO(adminData.grantedAt || adminData.createdAt || data?.createdAt),
-        });
-      }
-
-      if (req.email) {
-        const normalizedEmail = req.email.toLowerCase().trim();
-        const adminEmailSnap = await db.collection(collections.admins)
-          .where('email', '==', normalizedEmail)
-          .limit(1)
-          .get();
-        if (!adminEmailSnap.empty) {
-          const adminData = adminEmailSnap.docs[0].data() as any;
-          return res.json({
-            uid: req.uid,
-            id: req.uid,
-            name: adminData.name || "Admin",
-            email: adminData.email || req.email,
-            phone: adminData.mobile || "",
-            region: adminData.region || "Guntur Region",
-            role: adminData.role || "admin",
-            createdAt: toISO(adminData.grantedAt || adminData.createdAt),
-          });
-        }
-
-        if (normalizedEmail.includes('superadmin') || normalizedEmail.includes('admin')) {
-          const detectedRole = normalizedEmail.includes('superadmin') ? 'superadmin' : 'admin';
-          return res.json({
-            uid: req.uid,
-            id: req.uid,
-            name: detectedRole === 'superadmin' ? 'Superadmin' : 'Admin',
-            email: req.email,
-            phone: '',
-            region: 'Global',
-            role: detectedRole,
-            createdAt: new Date().toISOString()
-          });
-        }
-      }
-    }
-
+    const finalRole = (data?.role || 'member').toLowerCase();
     res.json({
       uid: req.uid,
       id: req.uid,
@@ -108,16 +111,17 @@ export async function me(req: AuthedRequest, res: Response) {
       chapter: data?.chapter || "",
       location: data?.location || "",
       createdAt: toISO(data?.createdAt || data?.registeredAt),
-      role: data?.role || "member",
+      role: finalRole,
     });
   } catch (err: any) {
     const isErrAdmin = req.email?.toLowerCase().includes('admin');
+    const isErrSuper = req.email?.toLowerCase().includes('superadmin');
     res.json({
       uid: req.uid,
       id: req.uid,
-      name: isErrAdmin ? (req.email?.includes('superadmin') ? "Superadmin" : "Admin") : "Member",
+      name: isErrSuper ? "Superadmin" : isErrAdmin ? "Admin" : "Member",
       email: req.email || "",
-      role: isErrAdmin ? (req.email?.includes('superadmin') ? "superadmin" : "admin") : "member"
+      role: isErrSuper ? "superadmin" : isErrAdmin ? "admin" : "member"
     });
   }
 }
