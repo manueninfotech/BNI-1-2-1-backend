@@ -20,6 +20,13 @@ export const env = {
   firebaseServiceAccount: process.env.FIREBASE_SERVICE_ACCOUNT ?? "",
 
   /**
+   * Cloud Storage bucket for uploaded files (agenda PDFs). Defaults to this
+   * project's bucket; override per environment if needed.
+   */
+  firebaseStorageBucket:
+    process.env.FIREBASE_STORAGE_BUCKET ?? "conclave-1-2-1.firebasestorage.app",
+
+  /**
    * Bypasses admin authentication. LOCAL DEVELOPMENT ONLY — it makes every
    * admin endpoint public.
    */

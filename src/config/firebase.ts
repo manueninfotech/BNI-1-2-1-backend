@@ -2,6 +2,7 @@ import { initializeApp, cert, getApps, applicationDefault } from "firebase-admin
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import { getAuth, type Auth } from "firebase-admin/auth";
 import { getMessaging, type Messaging } from "firebase-admin/messaging";
+import { getStorage, type Storage } from "firebase-admin/storage";
 import { env } from "./env.js";
 
 /**
@@ -25,12 +26,16 @@ function credential() {
 }
 
 if (getApps().length === 0) {
-  initializeApp({ credential: credential() });
+  initializeApp({
+    credential: credential(),
+    storageBucket: env.firebaseStorageBucket,
+  });
 }
 
 export const db: Firestore = getFirestore();
 export const auth: Auth = getAuth();
 export const messaging: Messaging = getMessaging();
+export const storage: Storage = getStorage();
 
 /** Firestore collection names, so a typo can't silently create a new one. */
 export const collections = {

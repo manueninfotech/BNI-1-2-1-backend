@@ -10,7 +10,7 @@ import * as roles from "../services/role.service.js";
 import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
 import { fetchUsers } from "../services/user.service.js";
-import { uploadBufferToCloudinary, uploadBase64ToCloudinary } from "../services/cloudinary.service.js";
+import { uploadBufferToStorage } from "../services/storage.service.js";
 
 /** Fetch the admin doc for the caller — used to scope by region. */
 async function getAdminDoc(uid: string, email?: string) {
@@ -130,41 +130,36 @@ export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
 
   let fileUrl = agendaDoc.dataUrl || agendaDoc.url || "";
   let savedFileName = agendaDoc.name || "agenda.pdf";
-  let cloudinaryPublicId = "";
+  // Object path in Firebase Storage — kept so the file can be deleted later.
+  let storagePath = "";
 
-  // Upload to Cloudinary if base64 dataUrl is provided
-  if (agendaDoc.dataUrl && agendaDoc.dataUrl.includes(";base64,")) {
+  // Upload to Firebase Storage when a base64 data URL is provided.
+  if (agendaDoc.dataUrl && agendaDoc.dataUrl.startsWith("data:")) {
     try {
-      const parts = agendaDoc.dataUrl.split(";base64,");
-      const base64Data = parts[1];
+      // data:<contentType>;base64,<data>
+      const match = agendaDoc.dataUrl.match(/^data:([^;]+);base64,(.*)$/s);
+      const contentType = match?.[1] || agendaDoc.type || "application/pdf";
+      const base64Data = match?.[2] ?? agendaDoc.dataUrl.split(";base64,")[1] ?? "";
       const buffer = Buffer.from(base64Data, "base64");
 
-      const cloudResult = await uploadBufferToCloudinary(buffer, savedFileName, "bni_conclaves/agendas");
-      if (cloudResult && cloudResult.secure_url) {
-        fileUrl = cloudResult.secure_url;
-        cloudinaryPublicId = cloudResult.public_id;
-        console.log(`[Cloudinary] Successfully uploaded agenda document to Cloudinary: ${fileUrl}`);
+      const result = await uploadBufferToStorage(buffer, savedFileName, contentType, "agendas");
+      if (result) {
+        fileUrl = result.url;
+        storagePath = result.path;
+        console.log(`[Storage] Uploaded agenda to Firebase Storage: ${result.path}`);
       } else {
-        // Fallback to local disk if Cloudinary credentials are not set
+        // Fallback to local disk if Storage is unreachable.
         const uploadsDir = path.join(process.cwd(), "uploads", "agendas");
         if (!fs.existsSync(uploadsDir)) {
           fs.mkdirSync(uploadsDir, { recursive: true });
         }
         const cleanName = savedFileName.replace(/[^a-zA-Z0-9_.-]/g, "_");
         const fileNameOnDisk = `${id}_${Date.now()}_${cleanName}`;
-        const filePathOnDisk = path.join(uploadsDir, fileNameOnDisk);
-
-        fs.writeFileSync(filePathOnDisk, buffer);
+        fs.writeFileSync(path.join(uploadsDir, fileNameOnDisk), buffer);
         fileUrl = `/uploads/agendas/${fileNameOnDisk}`;
       }
     } catch (err: any) {
       console.error("Failed to process agenda document upload:", err);
-    }
-  } else if (agendaDoc.dataUrl && agendaDoc.dataUrl.startsWith("data:")) {
-    const cloudResult = await uploadBase64ToCloudinary(agendaDoc.dataUrl, savedFileName, "bni_conclaves/agendas");
-    if (cloudResult && cloudResult.secure_url) {
-      fileUrl = cloudResult.secure_url;
-      cloudinaryPublicId = cloudResult.public_id;
     }
   }
 
@@ -172,7 +167,10 @@ export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
     name: savedFileName,
     url: fileUrl,
     dataUrl: fileUrl,
-    publicId: cloudinaryPublicId,
+    // Storage object path (was Cloudinary public_id). `publicId` kept as an alias
+    // so any existing admin-panel code reading that field still works.
+    storagePath,
+    publicId: storagePath,
     rawText: agendaDoc.rawText || agendaDoc.agendaText || "",
     agendaText: agendaDoc.agendaText || agendaDoc.rawText || "",
     type: agendaDoc.type || "application/pdf",
