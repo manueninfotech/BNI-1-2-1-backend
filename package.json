@@ -25,7 +25,6 @@
     "emulator": "npx firebase-tools emulators:start --config ../firebase.json"
   },
   "dependencies": {
-    "cloudinary": "^2.10.0",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",

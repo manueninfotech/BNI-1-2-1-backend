@@ -43,10 +43,6 @@ export const env = {
     .map((s) => s.trim())
     .filter(Boolean),
 
-  cloudinaryCloudName: process.env.CLOUDINARY_CLOUD_NAME ?? "",
-  cloudinaryApiKey: process.env.CLOUDINARY_API_KEY ?? "",
-  cloudinaryApiSecret: process.env.CLOUDINARY_API_SECRET ?? "",
-
   /**
    * Razorpay. The SECRET must only ever live here — the app receives only the
    * key_id. When these are unset the server still boots; the payment endpoints
