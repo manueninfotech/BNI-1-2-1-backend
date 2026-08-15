@@ -4,6 +4,8 @@ import { db, collections } from "../config/firebase.js";
 import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
 import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
+import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
+import { ApiError } from "../middleware/errors.js";
 
 function toISO(val: any): string {
   if (!val) return new Date().toISOString();
@@ -292,6 +294,36 @@ export async function register(req: AuthedRequest, res: Response) {
     message: result.alreadyRegistered ? "You are already registered." : "Registered.",
     ...result,
   });
+}
+
+/**
+ * Open a Razorpay order for this conclave's registration fee.
+ *
+ * The eligibility check runs FIRST: we refuse to charge anyone who can't
+ * actually register (closed, already in, or a time clash). The amount is the
+ * conclave's fee — never a client-supplied number. The response carries the
+ * public key_id and order id only; the secret never leaves the server.
+ */
+export async function createPaymentOrder(req: AuthedRequest, res: Response) {
+  const conclaveId = req.params.id;
+
+  if (!razorpayConfigured()) {
+    // A clear, catchable signal so the app shows the offline path instead.
+    throw new ApiError(503, "Online payment is not available. Please pay offline.");
+  }
+
+  const check = await registration.assertRegisterable(conclaveId, req.uid);
+  if (check.alreadyRegistered) {
+    throw ApiError.conflict("You are already registered for this conclave.");
+  }
+
+  const fee = registration.registrationFeeOf(check.conclave);
+  if (fee <= 0) {
+    throw ApiError.badRequest("This conclave has no registration fee.");
+  }
+
+  const order = await createOrder({ amountRupees: fee, uid: req.uid, conclaveId });
+  res.json(order);
 }
 
 export async function deregister(req: AuthedRequest, res: Response) {

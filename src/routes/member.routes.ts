@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { requireUser } from "../middleware/auth.js";
 import { asyncHandler } from "../middleware/errors.js";
-import { syncLimiter } from "../middleware/rateLimit.js";
+import { syncLimiter, paymentOrderLimiter } from "../middleware/rateLimit.js";
 import * as c from "../controllers/member.controller.js";
 
 const router = Router();
@@ -22,6 +22,7 @@ router.put("/me", asyncHandler(c.updateMe));
 router.patch("/me", asyncHandler(c.updateMe));
 router.get("/conclaves", asyncHandler(c.listConclaves));
 router.get("/conclaves/:id/referrals", asyncHandler(c.getReferrals));
+router.post("/conclaves/:id/payment/order", paymentOrderLimiter, asyncHandler(c.createPaymentOrder));
 router.post("/conclaves/:id/register", asyncHandler(c.register));
 router.delete("/conclaves/:id/register", asyncHandler(c.deregister));
 router.post("/conclaves/:id/sync", syncLimiter, asyncHandler(c.syncConclave));

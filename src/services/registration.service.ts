@@ -3,18 +3,24 @@ import { ApiError } from "../middleware/errors.js";
 import { conclaveWindow, windowsOverlap } from "../domain/schedulingRules.js";
 import { TERMINAL_STATUSES } from "../domain/conclave.js";
 import { getConclaveOrThrow, conclaveRef } from "./conclave.service.js";
+import { verifyPayment } from "./razorpay.service.js";
+
+/** The registration fee for a conclave, in rupees. 0 (or unset) means free. */
+export function registrationFeeOf(conclave: any): number {
+  const fee = Number(conclave?.paymentDetails?.registrationFee);
+  return Number.isFinite(fee) && fee > 0 ? fee : 0;
+}
 
 /**
- * Register a member for a conclave.
+ * Everything that must be true before a member may register — reused by the
+ * payment-order endpoint so we never open a Razorpay order for someone who
+ * cannot actually register (registration closed, already in, or a time clash).
+ * Charging them and then rejecting the registration is the one outcome to avoid.
  *
- * This lives on the server because the rule it enforces cannot be checked from a
- * single client: a member may not hold registrations for two conclaves whose
- * times OVERLAP. Nobody can attend both, and the schedule has already seated and
- * paired them — a no-show leaves a hole in other people's tables.
- *
- * Registration is deliberately FINAL. There is no withdraw endpoint.
+ * Returns `{ alreadyRegistered: true }` when they're already in (idempotent),
+ * otherwise `{ conclave }`. Throws ApiError on a hard block.
  */
-export async function register(conclaveId: string, uid: string, details: Record<string, any> = {}) {
+export async function assertRegisterable(conclaveId: string, uid: string) {
   const { data: conclave } = await getConclaveOrThrow(conclaveId);
 
   if (
@@ -26,38 +32,29 @@ export async function register(conclaveId: string, uid: string, details: Record<
     throw ApiError.conflict("Registration is not open for this conclave.");
   }
 
-  const myReg = conclaveRef(conclaveId)
-    .collection(collections.registrations)
-    .doc(uid);
-
-  // Idempotent: a retry after a flaky network must not look like an error.
+  const myReg = conclaveRef(conclaveId).collection(collections.registrations).doc(uid);
   if ((await myReg.get()).exists) {
-    return { alreadyRegistered: true };
+    return { conclave, alreadyRegistered: true as const };
   }
 
   const target = conclaveWindow(conclave);
   if (!target) throw ApiError.conflict("This conclave has no date set yet.");
 
-  // Only conclaves that could still happen can clash.
   const others = await db
     .collection(collections.conclaves)
     .where("status", "not-in", [...TERMINAL_STATUSES])
     .get();
-
   const candidates = others.docs.filter((d) => d.id !== conclaveId);
 
   if (candidates.length > 0) {
     const regs = await db.getAll(
       ...candidates.map((d) => d.ref.collection(collections.registrations).doc(uid)),
     );
-
     for (let i = 0; i < candidates.length; i++) {
       if (!regs[i].exists) continue;
-
       const other = candidates[i].data();
       const otherWindow = conclaveWindow(other);
       if (!otherWindow || !windowsOverlap(target, otherWindow)) continue;
-
       throw ApiError.conflict(
         `This clashes with "${other.name}", which you are already registered for. ` +
           `Two conclaves at the same time cannot both be attended, and registrations cannot be withdrawn.`,
@@ -74,6 +71,82 @@ export async function register(conclaveId: string, uid: string, details: Record<
     }
   }
 
+  return { conclave, alreadyRegistered: false as const };
+}
+
+/**
+ * Register a member for a conclave.
+ *
+ * This lives on the server because the rule it enforces cannot be checked from a
+ * single client: a member may not hold registrations for two conclaves whose
+ * times OVERLAP. Nobody can attend both, and the schedule has already seated and
+ * paired them — a no-show leaves a hole in other people's tables.
+ *
+ * Registration is deliberately FINAL. There is no withdraw endpoint.
+ */
+export async function register(conclaveId: string, uid: string, details: Record<string, any> = {}) {
+  const check = await assertRegisterable(conclaveId, uid);
+  if (check.alreadyRegistered) return { alreadyRegistered: true };
+  const { conclave } = check;
+
+  const myReg = conclaveRef(conclaveId)
+    .collection(collections.registrations)
+    .doc(uid);
+
+  // --- Payment ---------------------------------------------------------------
+  // If the conclave charges a registration fee, it must be settled here. Online
+  // payments are verified against Razorpay (signature AND captured amount, see
+  // razorpay.service). Offline payments are recorded as `pending` for an admin
+  // to reconcile against the bank/UPI transfer. A free conclave skips all of it.
+  const fee = registrationFeeOf(conclave);
+  const payment = (details.payment ?? {}) as {
+    method?: string; orderId?: string; paymentId?: string; signature?: string;
+  };
+  let paymentRecord: Record<string, any> = {};
+  let regStatus = "pending";
+
+  if (fee > 0) {
+    if (payment.method === "online") {
+      await verifyPayment({
+        orderId: payment.orderId ?? "",
+        paymentId: payment.paymentId ?? "",
+        signature: payment.signature ?? "",
+        expectedRupees: fee,
+      });
+      paymentRecord = {
+        payment: {
+          method: "online",
+          status: "paid",
+          amount: fee,
+          currency: "INR",
+          orderId: payment.orderId,
+          paymentId: payment.paymentId,
+          signature: payment.signature,
+          paidAt: new Date(),
+        },
+      };
+      regStatus = "confirmed";
+    } else if (payment.method === "offline") {
+      // No money verified server-side — the member says they've paid by UPI/bank
+      // and (optionally) supplied a UTR. Stays pending until an admin confirms.
+      paymentRecord = {
+        payment: {
+          method: "offline",
+          status: "pending",
+          amount: fee,
+          currency: "INR",
+          utrNumber: details.utrNumber ?? null,
+        },
+      };
+      regStatus = "pending";
+    } else {
+      throw ApiError.badRequest(
+        "This conclave requires the registration fee to be paid before registering.",
+        { paymentRequired: true, registrationFee: fee },
+      );
+    }
+  }
+
   const {
     name, email, phone, company, category, chapter,
     region, state, country, mealPreference, needsAccommodation,
@@ -84,7 +157,8 @@ export async function register(conclaveId: string, uid: string, details: Record<
     userId: uid, // denormalised so registrations are queryable by user
     registeredAt: new Date(),
     role: "member",
-    status: "pending",
+    status: regStatus,
+    ...paymentRecord,
     ...(name ? { name } : {}),
     ...(email ? { email } : {}),
     ...(phone ? { phone } : {}),

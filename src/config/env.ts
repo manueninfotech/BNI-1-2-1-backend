@@ -39,6 +39,14 @@ export const env = {
   cloudinaryCloudName: process.env.CLOUDINARY_CLOUD_NAME ?? "",
   cloudinaryApiKey: process.env.CLOUDINARY_API_KEY ?? "",
   cloudinaryApiSecret: process.env.CLOUDINARY_API_SECRET ?? "",
+
+  /**
+   * Razorpay. The SECRET must only ever live here — the app receives only the
+   * key_id. When these are unset the server still boots; the payment endpoints
+   * return a clear 503 and the app falls back to offline payment.
+   */
+  razorpayKeyId: process.env.RAZORPAY_KEY_ID ?? "",
+  razorpayKeySecret: process.env.RAZORPAY_KEY_SECRET ?? "",
 } as const;
 
 export const isProduction = env.nodeEnv === "production";

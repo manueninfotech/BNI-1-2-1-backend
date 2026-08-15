@@ -37,6 +37,21 @@ export const syncLimiter = rateLimit({
   message: { error: "Too many sync requests. Slow down." },
 });
 
+/**
+ * Payment-order creation. Each call opens a REAL order on Razorpay, so this is
+ * tighter than everything else — enough for a member fumbling the flow a few
+ * times, low enough that nobody can spin up thousands of orders.
+ */
+export const paymentOrderLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 20,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: keyByUser,
+  skip: () => env.nodeEnv === "development",
+  message: { error: "Too many payment attempts. Please wait a few minutes." },
+});
+
 /** Everything else: comfortably above real use, low enough to stop a script. */
 export const generalLimiter = rateLimit({
   windowMs: 60_000,
