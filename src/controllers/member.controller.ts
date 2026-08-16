@@ -320,6 +320,111 @@ export async function getReferrals(req: AuthedRequest, res: Response) {
   }
 }
 
+/**
+ * This member's referrals across EVERY conclave — the ones they gave, and the
+ * ones they received. Self-scoped: the uid comes from the verified token, so a
+ * caller can only ever read their own network, never someone else's.
+ *
+ * Iterates conclaves and queries each `referrals` subcollection (equality on a
+ * single field, which the automatic index covers) rather than a collectionGroup
+ * query, so it needs no extra index deployed to work.
+ */
+export async function myReferrals(req: AuthedRequest, res: Response) {
+  const uid = req.uid;
+  const conclavesSnap = await db.collection(collections.conclaves).get();
+
+  type Row = {
+    id: string;
+    conclaveId: string;
+    conclaveName: string;
+    roundNumber: number;
+    otherUserId: string;
+    otherName: string;
+    otherBusinessName: string;
+    notes: string;
+    createdAt: string;
+  };
+
+  const given: Row[] = [];
+  const received: Row[] = [];
+
+  await Promise.all(
+    conclavesSnap.docs.map(async (c) => {
+      const conclaveName = (c.data() as any).name || "Conclave";
+      const refs = c.ref.collection(collections.referrals);
+
+      const [givenSnap, recvSnap] = await Promise.all([
+        refs.where("fromUserId", "==", uid).get(),
+        refs.where("toUserId", "==", uid).get(),
+      ]);
+
+      givenSnap.forEach((d) => {
+        const r = d.data() as any;
+        given.push({
+          id: d.id,
+          conclaveId: c.id,
+          conclaveName,
+          roundNumber: Number(r.roundNumber ?? 0),
+          otherUserId: String(r.toUserId ?? ""),
+          otherName: r.toName ?? "",
+          otherBusinessName: "",
+          notes: r.notes ?? "",
+          createdAt: toISO(r.createdAt || r.syncedAt),
+        });
+      });
+
+      recvSnap.forEach((d) => {
+        const r = d.data() as any;
+        received.push({
+          id: d.id,
+          conclaveId: c.id,
+          conclaveName,
+          roundNumber: Number(r.roundNumber ?? 0),
+          otherUserId: String(r.fromUserId ?? ""),
+          otherName: r.fromName ?? "",
+          otherBusinessName: "",
+          notes: r.notes ?? "",
+          createdAt: toISO(r.createdAt || r.syncedAt),
+        });
+      });
+    }),
+  );
+
+  // Resolve counterpart name + business from the users collection, so the list
+  // is consistent even for older referrals that didn't store a name inline.
+  const ids = [
+    ...new Set([...given, ...received].map((r) => r.otherUserId).filter(Boolean)),
+  ];
+  if (ids.length) {
+    const docs = await db.getAll(
+      ...ids.map((id) => db.collection(collections.users).doc(id)),
+    );
+    const users = new Map<string, { name: string; businessName: string }>();
+    docs.forEach((d) => {
+      if (d.exists) {
+        const u = d.data() as any;
+        users.set(d.id, {
+          name: u.name || "",
+          businessName: u.businessName || "",
+        });
+      }
+    });
+    for (const r of [...given, ...received]) {
+      const u = users.get(r.otherUserId);
+      if (u) {
+        if (!r.otherName) r.otherName = u.name;
+        r.otherBusinessName = u.businessName;
+      }
+    }
+  }
+
+  const byNewest = (a: Row, b: Row) => b.createdAt.localeCompare(a.createdAt);
+  given.sort(byNewest);
+  received.sort(byNewest);
+
+  res.json({ given, received });
+}
+
 export async function register(req: AuthedRequest, res: Response) {
   const result = await registration.register(req.params.id, req.uid, req.body ?? {});
   res.json({
