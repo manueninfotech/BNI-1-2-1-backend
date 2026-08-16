@@ -19,6 +19,38 @@ function toISO(val: any): string {
   return new Date().toISOString();
 }
 
+/**
+ * The member directory: every registered member, with ONLY the fields that are
+ * safe to show to other members.
+ *
+ * Contact details (email, phone, the synthetic sign-in identifier) are
+ * deliberately never included — the app exposes this list to every signed-in
+ * user, so projecting the safe fields HERE, on the server, is the only place the
+ * privacy line can be enforced (Firestore rules cannot hide individual fields).
+ */
+export async function listMembers(_req: AuthedRequest, res: Response) {
+  const snap = await db.collection(collections.users).get();
+  const members = snap.docs
+    .map((doc) => {
+      const d = doc.data() as any;
+      return {
+        uid: doc.id,
+        name: (d.name || "").trim(),
+        photoUrl: d.photoUrl || null,
+        businessName: (d.businessName || "").trim(),
+        businessCategory: (d.businessCategory || "").trim(),
+        location: (d.location || "").trim(),
+        chapter: d.chapter || null,
+      };
+    })
+    // Skip half-built docs (e.g. an interrupted registration that only wrote a
+    // login timestamp) — a nameless row is noise in a directory.
+    .filter((m) => m.name.length > 0)
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  res.json({ members });
+}
+
 export async function me(req: AuthedRequest, res: Response) {
   try {
     const normalizedEmail = (req.email || '').toLowerCase().trim();
