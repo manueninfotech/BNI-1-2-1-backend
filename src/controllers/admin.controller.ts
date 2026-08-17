@@ -10,7 +10,7 @@ import * as roles from "../services/role.service.js";
 import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
 import { fetchUsers } from "../services/user.service.js";
-import { uploadBufferToStorage } from "../services/storage.service.js";
+import { uploadBufferToCloudinary, uploadBase64ToCloudinary } from "../services/cloudinary.service.js";
 
 /** Fetch the admin doc for the caller — used to scope by region. */
 async function getAdminDoc(uid: string, email?: string) {
@@ -130,36 +130,41 @@ export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
 
   let fileUrl = agendaDoc.dataUrl || agendaDoc.url || "";
   let savedFileName = agendaDoc.name || "agenda.pdf";
-  // Object path in Firebase Storage — kept so the file can be deleted later.
-  let storagePath = "";
+  let cloudinaryPublicId = "";
 
-  // Upload to Firebase Storage when a base64 data URL is provided.
-  if (agendaDoc.dataUrl && agendaDoc.dataUrl.startsWith("data:")) {
+  // Upload to Cloudinary if base64 dataUrl is provided
+  if (agendaDoc.dataUrl && agendaDoc.dataUrl.includes(";base64,")) {
     try {
-      // data:<contentType>;base64,<data>
-      const match = agendaDoc.dataUrl.match(/^data:([^;]+);base64,(.*)$/s);
-      const contentType = match?.[1] || agendaDoc.type || "application/pdf";
-      const base64Data = match?.[2] ?? agendaDoc.dataUrl.split(";base64,")[1] ?? "";
+      const parts = agendaDoc.dataUrl.split(";base64,");
+      const base64Data = parts[1];
       const buffer = Buffer.from(base64Data, "base64");
 
-      const result = await uploadBufferToStorage(buffer, savedFileName, contentType, "agendas");
-      if (result) {
-        fileUrl = result.url;
-        storagePath = result.path;
-        console.log(`[Storage] Uploaded agenda to Firebase Storage: ${result.path}`);
+      const cloudResult = await uploadBufferToCloudinary(buffer, savedFileName, "bni_conclaves/agendas");
+      if (cloudResult && cloudResult.secure_url) {
+        fileUrl = cloudResult.secure_url;
+        cloudinaryPublicId = cloudResult.public_id;
+        console.log(`[Cloudinary] Successfully uploaded agenda document to Cloudinary: ${fileUrl}`);
       } else {
-        // Fallback to local disk if Storage is unreachable.
+        // Fallback to local disk if Cloudinary credentials are not set
         const uploadsDir = path.join(process.cwd(), "uploads", "agendas");
         if (!fs.existsSync(uploadsDir)) {
           fs.mkdirSync(uploadsDir, { recursive: true });
         }
         const cleanName = savedFileName.replace(/[^a-zA-Z0-9_.-]/g, "_");
         const fileNameOnDisk = `${id}_${Date.now()}_${cleanName}`;
-        fs.writeFileSync(path.join(uploadsDir, fileNameOnDisk), buffer);
+        const filePathOnDisk = path.join(uploadsDir, fileNameOnDisk);
+
+        fs.writeFileSync(filePathOnDisk, buffer);
         fileUrl = `/uploads/agendas/${fileNameOnDisk}`;
       }
     } catch (err: any) {
       console.error("Failed to process agenda document upload:", err);
+    }
+  } else if (agendaDoc.dataUrl && agendaDoc.dataUrl.startsWith("data:")) {
+    const cloudResult = await uploadBase64ToCloudinary(agendaDoc.dataUrl, savedFileName, "bni_conclaves/agendas");
+    if (cloudResult && cloudResult.secure_url) {
+      fileUrl = cloudResult.secure_url;
+      cloudinaryPublicId = cloudResult.public_id;
     }
   }
 
@@ -167,10 +172,7 @@ export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
     name: savedFileName,
     url: fileUrl,
     dataUrl: fileUrl,
-    // Storage object path (was Cloudinary public_id). `publicId` kept as an alias
-    // so any existing admin-panel code reading that field still works.
-    storagePath,
-    publicId: storagePath,
+    publicId: cloudinaryPublicId,
     rawText: agendaDoc.rawText || agendaDoc.agendaText || "",
     agendaText: agendaDoc.agendaText || agendaDoc.rawText || "",
     type: agendaDoc.type || "application/pdf",
@@ -429,7 +431,7 @@ export async function listRegions(_req: AuthedRequest, res: Response) {
   const conclaveCounts: Record<string, number> = {};
   conclavesSnap.docs.forEach(doc => {
     const data = doc.data();
-    const reg = data.region || "Guntur Region";
+    const reg = data.region || "Global";
     conclaveCounts[reg] = (conclaveCounts[reg] || 0) + 1;
   });
 
@@ -438,9 +440,7 @@ export async function listRegions(_req: AuthedRequest, res: Response) {
   usersSnap.docs.forEach(doc => {
     const data = doc.data();
     const loc = data.location;
-    const reg = loc
-      ? (typeof loc === "object" ? (loc.place || "Guntur Region") : loc)
-      : "Guntur Region";
+    const reg = data.region || (loc ? (typeof loc === "object" ? loc.place : loc) : undefined) || "Global";
     memberCounts[reg] = (memberCounts[reg] || 0) + 1;
   });
 
@@ -610,14 +610,12 @@ export async function listAllUsers(_req: AuthedRequest, res: Response) {
     .map(doc => {
       const data = doc.data();
       const loc = data.location;
-      const regionStr = loc
-        ? (typeof loc === "object" ? (loc.place || "Guntur Region") : loc)
-        : "Guntur Region";
+      const regionStr = data.region || (loc ? (typeof loc === "object" ? loc.place : loc) : undefined) || "Global";
       return {
         id: doc.id,
         name: data.name || "Unknown Member",
         company: data.businessName || data.company || "",
-        category: data.businessCategory || "",
+        category: data.businessCategory || data.category || "",
         region: regionStr,
         chapter: data.chapter || "",
         status: data.lastLoginAt ? "Active" : "Inactive",
@@ -643,6 +641,3 @@ export async function setUserRole(req: AuthedRequest, res: Response) {
   await db.collection(collections.users).doc(uid).set({ role }, { merge: true });
   res.json({ message: "User role updated successfully." });
 }
-
-
-

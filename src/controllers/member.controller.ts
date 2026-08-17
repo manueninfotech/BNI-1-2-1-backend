@@ -4,8 +4,6 @@ import { db, collections } from "../config/firebase.js";
 import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
 import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
-import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
-import { ApiError } from "../middleware/errors.js";
 
 function toISO(val: any): string {
   if (!val) return new Date().toISOString();
@@ -17,38 +15,6 @@ function toISO(val: any): string {
     if (val.seconds) return new Date(val.seconds * 1000).toISOString();
   }
   return new Date().toISOString();
-}
-
-/**
- * The member directory: every registered member, with ONLY the fields that are
- * safe to show to other members.
- *
- * Contact details (email, phone, the synthetic sign-in identifier) are
- * deliberately never included — the app exposes this list to every signed-in
- * user, so projecting the safe fields HERE, on the server, is the only place the
- * privacy line can be enforced (Firestore rules cannot hide individual fields).
- */
-export async function listMembers(_req: AuthedRequest, res: Response) {
-  const snap = await db.collection(collections.users).get();
-  const members = snap.docs
-    .map((doc) => {
-      const d = doc.data() as any;
-      return {
-        uid: doc.id,
-        name: (d.name || "").trim(),
-        photoUrl: d.photoUrl || null,
-        businessName: (d.businessName || "").trim(),
-        businessCategory: (d.businessCategory || "").trim(),
-        location: (d.location || "").trim(),
-        chapter: d.chapter || null,
-      };
-    })
-    // Skip half-built docs (e.g. an interrupted registration that only wrote a
-    // login timestamp) — a nameless row is noise in a directory.
-    .filter((m) => m.name.length > 0)
-    .sort((a, b) => a.name.localeCompare(b.name));
-
-  res.json({ members });
 }
 
 export async function me(req: AuthedRequest, res: Response) {
@@ -66,7 +32,7 @@ export async function me(req: AuthedRequest, res: Response) {
         name: adminData.name || (resolvedRole === 'superadmin' ? "Superadmin" : "Admin"),
         email: adminData.email || req.email || "",
         phone: adminData.mobile || "",
-        region: adminData.region || "Guntur Region",
+        region: adminData.region || "Global",
         role: resolvedRole,
         createdAt: toISO(adminData.grantedAt || adminData.createdAt),
       });
@@ -87,7 +53,7 @@ export async function me(req: AuthedRequest, res: Response) {
           name: adminData.name || (resolvedRole === 'superadmin' ? "Superadmin" : "Admin"),
           email: adminData.email || req.email,
           phone: adminData.mobile || "",
-          region: adminData.region || "Guntur Region",
+          region: adminData.region || "Global",
           role: resolvedRole,
           createdAt: toISO(adminData.grantedAt || adminData.createdAt),
         });
@@ -320,147 +286,12 @@ export async function getReferrals(req: AuthedRequest, res: Response) {
   }
 }
 
-/**
- * This member's referrals across EVERY conclave — the ones they gave, and the
- * ones they received. Self-scoped: the uid comes from the verified token, so a
- * caller can only ever read their own network, never someone else's.
- *
- * Iterates conclaves and queries each `referrals` subcollection (equality on a
- * single field, which the automatic index covers) rather than a collectionGroup
- * query, so it needs no extra index deployed to work.
- */
-export async function myReferrals(req: AuthedRequest, res: Response) {
-  const uid = req.uid;
-  const conclavesSnap = await db.collection(collections.conclaves).get();
-
-  type Row = {
-    id: string;
-    conclaveId: string;
-    conclaveName: string;
-    roundNumber: number;
-    otherUserId: string;
-    otherName: string;
-    otherBusinessName: string;
-    notes: string;
-    createdAt: string;
-  };
-
-  const given: Row[] = [];
-  const received: Row[] = [];
-
-  await Promise.all(
-    conclavesSnap.docs.map(async (c) => {
-      const conclaveName = (c.data() as any).name || "Conclave";
-      const refs = c.ref.collection(collections.referrals);
-
-      const [givenSnap, recvSnap] = await Promise.all([
-        refs.where("fromUserId", "==", uid).get(),
-        refs.where("toUserId", "==", uid).get(),
-      ]);
-
-      givenSnap.forEach((d) => {
-        const r = d.data() as any;
-        given.push({
-          id: d.id,
-          conclaveId: c.id,
-          conclaveName,
-          roundNumber: Number(r.roundNumber ?? 0),
-          otherUserId: String(r.toUserId ?? ""),
-          otherName: r.toName ?? "",
-          otherBusinessName: "",
-          notes: r.notes ?? "",
-          createdAt: toISO(r.createdAt || r.syncedAt),
-        });
-      });
-
-      recvSnap.forEach((d) => {
-        const r = d.data() as any;
-        received.push({
-          id: d.id,
-          conclaveId: c.id,
-          conclaveName,
-          roundNumber: Number(r.roundNumber ?? 0),
-          otherUserId: String(r.fromUserId ?? ""),
-          otherName: r.fromName ?? "",
-          otherBusinessName: "",
-          notes: r.notes ?? "",
-          createdAt: toISO(r.createdAt || r.syncedAt),
-        });
-      });
-    }),
-  );
-
-  // Resolve counterpart name + business from the users collection, so the list
-  // is consistent even for older referrals that didn't store a name inline.
-  const ids = [
-    ...new Set([...given, ...received].map((r) => r.otherUserId).filter(Boolean)),
-  ];
-  if (ids.length) {
-    const docs = await db.getAll(
-      ...ids.map((id) => db.collection(collections.users).doc(id)),
-    );
-    const users = new Map<string, { name: string; businessName: string }>();
-    docs.forEach((d) => {
-      if (d.exists) {
-        const u = d.data() as any;
-        users.set(d.id, {
-          name: u.name || "",
-          businessName: u.businessName || "",
-        });
-      }
-    });
-    for (const r of [...given, ...received]) {
-      const u = users.get(r.otherUserId);
-      if (u) {
-        if (!r.otherName) r.otherName = u.name;
-        r.otherBusinessName = u.businessName;
-      }
-    }
-  }
-
-  const byNewest = (a: Row, b: Row) => b.createdAt.localeCompare(a.createdAt);
-  given.sort(byNewest);
-  received.sort(byNewest);
-
-  res.json({ given, received });
-}
-
 export async function register(req: AuthedRequest, res: Response) {
   const result = await registration.register(req.params.id, req.uid, req.body ?? {});
   res.json({
     message: result.alreadyRegistered ? "You are already registered." : "Registered.",
     ...result,
   });
-}
-
-/**
- * Open a Razorpay order for this conclave's registration fee.
- *
- * The eligibility check runs FIRST: we refuse to charge anyone who can't
- * actually register (closed, already in, or a time clash). The amount is the
- * conclave's fee — never a client-supplied number. The response carries the
- * public key_id and order id only; the secret never leaves the server.
- */
-export async function createPaymentOrder(req: AuthedRequest, res: Response) {
-  const conclaveId = req.params.id;
-
-  if (!razorpayConfigured()) {
-    // A clear, catchable signal so the app shows the offline path instead.
-    throw new ApiError(503, "Online payment is not available. Please pay offline.");
-  }
-
-  const check = await registration.assertRegisterable(conclaveId, req.uid);
-  if (check.alreadyRegistered) {
-    throw ApiError.conflict("You are already registered for this conclave.");
-  }
-
-  const fee = registration.registrationFeeOf(check.conclave);
-  if (fee <= 0) {
-    throw ApiError.badRequest("This conclave has no registration fee.");
-  }
-
-  const order = await createOrder({ amountRupees: fee, uid: req.uid, conclaveId });
-  res.json(order);
 }
 
 export async function deregister(req: AuthedRequest, res: Response) {
