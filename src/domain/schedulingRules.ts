@@ -4,12 +4,17 @@
 // touching Firestore.
 
 /** A Firestore Timestamp, a Date, or nothing. */
-type MaybeTime = { toDate?: () => Date } | Date | null | undefined;
+type MaybeTime = { toDate?: () => Date } | Date | string | null | undefined;
 
 function asDate(v: MaybeTime): Date | null {
   if (!v) return null;
-  if (v instanceof Date) return v;
-  return typeof v.toDate === "function" ? v.toDate() : null;
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : v;
+  if (typeof v === "string") {
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const maybe = v as { toDate?: () => Date };
+  return typeof maybe.toDate === "function" ? maybe.toDate() : null;
 }
 
 export interface TimeWindow {
@@ -28,15 +33,18 @@ export interface TimeWindow {
  */
 export function conclaveWindow(c: {
   date?: MaybeTime;
+  startDate?: MaybeTime;
+  regStartDate?: MaybeTime;
+  regEndDate?: MaybeTime;
   startTime?: MaybeTime;
   endTime?: MaybeTime;
 }): TimeWindow | null {
-  const start = asDate(c.startTime);
+  const start = asDate(c.startTime) ?? asDate(c.startDate);
   const end = asDate(c.endTime);
 
   if (start && end) return { start, end };
 
-  const date = asDate(c.date) ?? start;
+  const date = asDate(c.date) ?? start ?? asDate(c.regEndDate) ?? asDate(c.regStartDate) ?? new Date();
   if (!date) return null;
 
   const dayEnd = new Date(date);
