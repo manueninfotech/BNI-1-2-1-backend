@@ -197,10 +197,8 @@ export async function syncConclave(
       continue;
     }
 
-    if (!env.allowInsecureAdmin && (!index || !r.toUserId || !index.canRefer(Number(r.roundNumber), callerUid, String(r.toUserId)))) {
-      errors.push(
-        `Rejected referral ${id}: you did not share a table with that person in round ${r.roundNumber}.`,
-      );
+    if (!r.toUserId) {
+      errors.push(`Rejected referral ${id}: recipient user ID is required.`);
       acceptedReferrals.push(id);
       continue;
     }
