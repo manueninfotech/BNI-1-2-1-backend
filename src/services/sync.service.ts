@@ -366,6 +366,7 @@ export async function syncConclave(
       status: conclave.status ?? "draft",
       currentRound: conclave.currentRound ?? 0,
       currentRoundStartedAt: toIso(conclave.currentRoundStartedAt),
+      serverSentAt: new Date().toISOString(),
       title: conclave.name || conclave.title || "BNI Conclave",
       date: conclave.date || null,
       venue: conclave.venueLocation || conclave.venue || "TBD Venue",
