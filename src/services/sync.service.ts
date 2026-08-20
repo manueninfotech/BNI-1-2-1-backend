@@ -189,10 +189,9 @@ export async function syncConclave(
       continue;
     }
 
-    const effectiveFromUid = (env.allowInsecureAdmin && r.fromUserId) ? r.fromUserId : callerUid;
-
-    if (!env.allowInsecureAdmin && r.fromUserId !== callerUid) {
-      errors.push(`Rejected referral ${id}: you can only give referrals as yourself.`);
+    const isGiverOrReceiver = callerUid === r.fromUserId || callerUid === r.toUserId;
+    if (!env.allowInsecureAdmin && !isGiverOrReceiver) {
+      errors.push(`Rejected referral ${id}: you can only update referrals you gave or received.`);
       acceptedReferrals.push(id);
       continue;
     }
@@ -206,7 +205,7 @@ export async function syncConclave(
     batch.set(
       ref.collection(collections.referrals).doc(String(id)),
       {
-        fromUserId: String(effectiveFromUid),
+        fromUserId: String(r.fromUserId),
         toUserId: String(r.toUserId),
         ...(r.fromName ? { fromName: r.fromName } : {}),
         ...(r.toName ? { toName: r.toName } : {}),
