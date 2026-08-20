@@ -435,7 +435,11 @@ export async function listConclaves(region?: string) {
 
     let docs = snap.docs;
     if (region) {
-      docs = docs.filter((doc: any) => doc.data().region === region);
+      const targetNorm = String(region || '').toLowerCase().replace(/\s+region$/, '').trim();
+      docs = docs.filter((doc: any) => {
+        const docNorm = String(doc.data().region || '').toLowerCase().replace(/\s+region$/, '').trim();
+        return !targetNorm || docNorm === targetNorm || docNorm.includes(targetNorm) || targetNorm.includes(docNorm);
+      });
     }
 
     docs.sort((a: any, b: any) => {
