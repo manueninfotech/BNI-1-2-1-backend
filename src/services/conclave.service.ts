@@ -191,7 +191,7 @@ export async function createConclave(input: CreateInput) {
     date: input.date ? new Date(input.date) : new Date(),
     endDate: input.endDate ? new Date(input.endDate) : null,
     regStartDate: input.regStartDate ? new Date(input.regStartDate) : null,
-    regEndDate: input.regEndDate ? new Date(input.regEndDate) : null,
+    regEndDate: input.regEndDate ? (() => { const d = new Date(input.regEndDate); d.setHours(23, 59, 59, 999); return d; })() : null,
     startTime: input.startTime ? new Date(input.startTime) : null,
     endTime: input.endTime ? new Date(input.endTime) : null,
     chiefGuests: Array.isArray(input.chiefGuests) ? input.chiefGuests : [],
@@ -236,7 +236,15 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
   if (body.startDate !== undefined) updates.startDate = body.startDate ? new Date(body.startDate as string) : null;
   if (body.endDate !== undefined) updates.endDate = body.endDate ? new Date(body.endDate as string) : null;
   if (body.regStartDate !== undefined) updates.regStartDate = body.regStartDate ? new Date(body.regStartDate as string) : null;
-  if (body.regEndDate !== undefined) updates.regEndDate = body.regEndDate ? new Date(body.regEndDate as string) : null;
+  if (body.regEndDate !== undefined) {
+    if (body.regEndDate) {
+      const d = new Date(body.regEndDate as string);
+      d.setHours(23, 59, 59, 999);
+      updates.regEndDate = d;
+    } else {
+      updates.regEndDate = null;
+    }
+  }
   if (body.startTime !== undefined) updates.startTime = body.startTime ? new Date(body.startTime as string) : null;
   if (body.endTime !== undefined) updates.endTime = body.endTime ? new Date(body.endTime as string) : null;
   if (body.status !== undefined) updates.status = body.status;

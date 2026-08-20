@@ -56,6 +56,7 @@ async function updateUpcomingRegDates() {
       if (!regEndDate || Number.isNaN(regEndDate.getTime())) {
         regEndDate = new Date(eventDate.valueOf() - 1 * 24 * 60 * 60 * 1000);
       }
+      regEndDate.setHours(23, 59, 59, 999);
 
       const updatedData = {
         ...data,
