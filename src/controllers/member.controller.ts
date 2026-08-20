@@ -275,6 +275,11 @@ export async function updateMe(req: AuthedRequest, res: Response) {
 
 export async function listConclaves(req: AuthedRequest, res: Response) {
   const list = await listConclaveRecords();
+  const userDoc = await db.collection(collections.users).doc(req.uid).get();
+  const userData = (userDoc.exists ? userDoc.data() : {}) as any;
+  const userEmail = (userData.email || req.email || '').toLowerCase().trim();
+  const rawPhone = String(userData.phone || userData.mobile || userData.identifier || '').replace(/\D/g, '');
+  const userPhone = rawPhone.length >= 10 ? rawPhone.slice(-10) : rawPhone;
 
   const registeredSet = new Set<string>();
   await Promise.all(
@@ -291,13 +296,13 @@ export async function listConclaves(req: AuthedRequest, res: Response) {
         return;
       }
 
-      // Fallback: search by email or identifier for accounts where UID doesn't match legacy doc ID
-      if (req.email) {
+      // Fallback: search by email or identifier
+      if (userEmail) {
         const byEmail = await db
           .collection(collections.conclaves)
           .doc(c.id)
           .collection(collections.registrations)
-          .where('email', '==', req.email)
+          .where('email', '==', userEmail)
           .limit(1)
           .get();
         if (!byEmail.empty) {
@@ -309,12 +314,30 @@ export async function listConclaves(req: AuthedRequest, res: Response) {
           .collection(collections.conclaves)
           .doc(c.id)
           .collection(collections.registrations)
-          .where('identifier', '==', req.email)
+          .where('identifier', '==', userEmail)
           .limit(1)
           .get();
         if (!byIdentifier.empty) {
           registeredSet.add(c.id);
           return;
+        }
+      }
+
+      // Fallback: search by Phone number matching
+      if (userPhone) {
+        const regsSnap = await db
+          .collection(collections.conclaves)
+          .doc(c.id)
+          .collection(collections.registrations)
+          .get();
+        for (const doc of regsSnap.docs) {
+          const r = doc.data() as any;
+          const regPhoneRaw = String(r.phone || r.mobile || r.identifier || '').replace(/\D/g, '');
+          const regPhone = regPhoneRaw.length >= 10 ? regPhoneRaw.slice(-10) : regPhoneRaw;
+          if (regPhone && userPhone && regPhone === userPhone) {
+            registeredSet.add(c.id);
+            return;
+          }
         }
       }
     }),
