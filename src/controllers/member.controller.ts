@@ -54,6 +54,16 @@ export async function listMembers(_req: AuthedRequest, res: Response) {
 export async function me(req: AuthedRequest, res: Response) {
   try {
     const normalizedEmail = (req.email || '').toLowerCase().trim();
+    const nowIso = new Date().toISOString();
+
+    // Touch user activity timestamp in Firestore
+    if (req.uid) {
+      db.collection(collections.users).doc(req.uid).set({
+        lastLoginAt: nowIso,
+        lastActiveAt: nowIso,
+        isActive: true
+      }, { merge: true }).catch(() => {});
+    }
 
     // 1. ALWAYS check admins collection FIRST
     const adminDoc = await db.collection(collections.admins).doc(req.uid).get();
