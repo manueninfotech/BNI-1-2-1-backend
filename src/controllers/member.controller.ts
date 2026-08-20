@@ -211,12 +211,18 @@ export async function updateMe(req: AuthedRequest, res: Response) {
   try {
     const { name, email, phone, mobile, company, businessName, category, businessCategory, chapter, region, designation, organization } = req.body ?? {};
 
-    const updates: any = {};
+    const updates: any = { id: req.uid };
     if (name !== undefined) updates.name = name;
     if (email !== undefined) updates.email = email;
     if (phone !== undefined || mobile !== undefined) {
-      updates.phone = phone ?? mobile;
-      updates.mobile = mobile ?? phone;
+      const raw = String(phone ?? mobile ?? "").trim();
+      let digitsOnly = raw.replace(/\D/g, "");
+      if (digitsOnly.length === 10) {
+        digitsOnly = "91" + digitsOnly;
+      }
+      updates.phone = digitsOnly ? `+${digitsOnly}` : raw;
+      updates.mobile = digitsOnly.length >= 10 ? digitsOnly.slice(-10) : raw;
+      updates.identifier = digitsOnly ? `${digitsOnly}@bni121.conclave` : `${raw}@bni121.conclave`;
     }
     if (company !== undefined || businessName !== undefined) {
       updates.company = company ?? businessName;
@@ -227,9 +233,13 @@ export async function updateMe(req: AuthedRequest, res: Response) {
       updates.businessCategory = businessCategory ?? category;
     }
     if (chapter !== undefined) updates.chapter = chapter;
-    if (region !== undefined) updates.region = region;
+    if (region !== undefined) {
+      updates.region = region;
+      updates.location = String(region).toLowerCase();
+    }
     if (designation !== undefined) updates.designation = designation;
     if (organization !== undefined) updates.organization = organization;
+    updates.country = updates.country ?? "India";
     updates.updatedAt = new Date().toISOString();
 
     const userDocRef = db.collection(collections.users).doc(req.uid);
