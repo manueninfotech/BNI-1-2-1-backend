@@ -131,13 +131,21 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
     }
 
     // 3. If registration close date has passed (and event hasn't started yet) -> Registration Closed
-    if (regEnd && now > regEnd) {
-      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    if (regEnd) {
+      const regEndDay = new Date(regEnd);
+      regEndDay.setHours(23, 59, 59, 999);
+      if (now > regEndDay) {
+        return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+      }
     }
 
     // 4. If registration start date is in the future -> Registration Not Open
-    if (regStart && now < regStart) {
-      return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
+    if (regStart) {
+      const regStartDay = new Date(regStart);
+      regStartDay.setHours(0, 0, 0, 0);
+      if (now < regStartDay) {
+        return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
+      }
     }
 
     // 5. Otherwise (during active registration window) -> Registration Open
