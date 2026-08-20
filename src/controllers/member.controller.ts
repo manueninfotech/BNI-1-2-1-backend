@@ -385,6 +385,7 @@ export async function myReferrals(req: AuthedRequest, res: Response) {
     otherName: string;
     otherBusinessName: string;
     notes: string;
+    status: string;
     createdAt: string;
   };
 
