@@ -412,6 +412,7 @@ export async function myReferrals(req: AuthedRequest, res: Response) {
           otherName: r.toName ?? "",
           otherBusinessName: "",
           notes: r.notes ?? "",
+          status: r.status || "Pending",
           createdAt: toISO(r.createdAt || r.syncedAt),
         });
       });
@@ -427,6 +428,7 @@ export async function myReferrals(req: AuthedRequest, res: Response) {
           otherName: r.fromName ?? "",
           otherBusinessName: "",
           notes: r.notes ?? "",
+          status: r.status || "Pending",
           createdAt: toISO(r.createdAt || r.syncedAt),
         });
       });
