@@ -5,7 +5,18 @@ import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
 import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
+import { notifyUser } from "../services/notification.service.js";
 import { ApiError } from "../middleware/errors.js";
+
+/** A member's display name, for notification copy. */
+async function displayName(uid: string): Promise<string> {
+  try {
+    const d = await db.collection(collections.users).doc(uid).get();
+    return ((d.data() as any)?.name || "A member").toString();
+  } catch {
+    return "A member";
+  }
+}
 
 function toISO(val: any): string {
   if (!val) return new Date().toISOString();
@@ -574,6 +585,14 @@ export async function createOneToOne(req: AuthedRequest, res: Response) {
     updatedAt: now,
   });
 
+  // Direct FCM to the invited member — no scheduler.
+  const fromName = await displayName(uid);
+  void notifyUser(toUserId, {
+    title: "New 1-2-1 request",
+    body: `${fromName} wants a one-to-one with you.`,
+    data: { type: "one_to_one", id: ref.id },
+  });
+
   res.json({ id: ref.id });
 }
 
@@ -659,6 +678,23 @@ export async function updateOneToOne(req: AuthedRequest, res: Response) {
   }
 
   await ref.set({ status, updatedAt: new Date().toISOString() }, { merge: true });
+
+  // Notify the OTHER party of the change.
+  const actorName = await displayName(uid);
+  if (status === "accepted" || status === "declined") {
+    void notifyUser(m.fromUserId, {
+      title: `1-2-1 ${status}`,
+      body: `${actorName} ${status} your 1-2-1 request.`,
+      data: { type: "one_to_one", id },
+    });
+  } else if (status === "cancelled") {
+    void notifyUser(isSender ? m.toUserId : m.fromUserId, {
+      title: "1-2-1 cancelled",
+      body: `${actorName} cancelled a 1-2-1.`,
+      data: { type: "one_to_one", id },
+    });
+  }
+
   res.json({ ok: true, status });
 }
 
