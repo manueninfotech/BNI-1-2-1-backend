@@ -43,6 +43,9 @@ export async function listMembers(_req: AuthedRequest, res: Response) {
         chapter: d.chapter || null,
         region: d.region || null,
         membership: (d.membership || "").trim(),
+        // Matchmaking: what they want, and what they bring.
+        lookingFor: (d.lookingFor || "").trim(),
+        canOffer: (d.canOffer || "").trim(),
       };
     })
     // Skip half-built docs (e.g. an interrupted registration that only wrote a
