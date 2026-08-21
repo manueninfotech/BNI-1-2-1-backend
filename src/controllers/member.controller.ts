@@ -538,6 +538,130 @@ export async function updateReferralOutcome(req: AuthedRequest, res: Response) {
   res.json({ ok: true, outcome, closedAmount: outcome === "closed" ? amount : 0 });
 }
 
+// ---------------------------------------------------------------------------
+// 1-2-1 meeting requests
+//
+// A member proposes a one-to-one with another member; the invited member
+// accepts or declines. Stored in a top-level `oneToOnes` collection. The uid
+// always comes from the verified token — you can only act on your own.
+// ---------------------------------------------------------------------------
+const ONE_TO_ONES = "oneToOnes";
+
+export async function createOneToOne(req: AuthedRequest, res: Response) {
+  const uid = req.uid;
+  const toUserId = String(req.body?.toUserId || "").trim();
+  const proposedAt = String(req.body?.proposedAt || "").trim();
+  const location = String(req.body?.location || "").trim();
+  const note = String(req.body?.note || "").trim();
+
+  if (!toUserId) throw new ApiError(400, "Choose a member.");
+  if (toUserId === uid) throw new ApiError(400, "You can't book a 1-2-1 with yourself.");
+  if (!proposedAt || Number.isNaN(Date.parse(proposedAt))) {
+    throw new ApiError(400, "Pick a valid date and time.");
+  }
+  const toDoc = await db.collection(collections.users).doc(toUserId).get();
+  if (!toDoc.exists) throw new ApiError(404, "Member not found.");
+
+  const now = new Date().toISOString();
+  const ref = await db.collection(ONE_TO_ONES).add({
+    fromUserId: uid,
+    toUserId,
+    proposedAt,
+    location,
+    note,
+    status: "pending",
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  res.json({ id: ref.id });
+}
+
+export async function listOneToOnes(req: AuthedRequest, res: Response) {
+  const uid = req.uid;
+  const col = db.collection(ONE_TO_ONES);
+  const [sentSnap, recvSnap] = await Promise.all([
+    col.where("fromUserId", "==", uid).get(),
+    col.where("toUserId", "==", uid).get(),
+  ]);
+
+  const raw: {
+    id: string;
+    direction: "sent" | "received";
+    otherUserId: string;
+    data: any;
+  }[] = [];
+  sentSnap.forEach((d) =>
+    raw.push({ id: d.id, direction: "sent", otherUserId: (d.data() as any).toUserId, data: d.data() }),
+  );
+  recvSnap.forEach((d) =>
+    raw.push({ id: d.id, direction: "received", otherUserId: (d.data() as any).fromUserId, data: d.data() }),
+  );
+
+  const ids = [...new Set(raw.map((r) => r.otherUserId).filter(Boolean))];
+  const users = new Map<string, { name: string; businessName: string; photoUrl: string | null }>();
+  if (ids.length) {
+    const docs = await db.getAll(...ids.map((id) => db.collection(collections.users).doc(id)));
+    docs.forEach((d) => {
+      if (d.exists) {
+        const u = d.data() as any;
+        users.set(d.id, {
+          name: u.name || "",
+          businessName: u.businessName || "",
+          photoUrl: u.photoUrl || null,
+        });
+      }
+    });
+  }
+
+  const oneToOnes = raw
+    .map((r) => {
+      const u = users.get(r.otherUserId);
+      return {
+        id: r.id,
+        direction: r.direction,
+        otherUserId: r.otherUserId,
+        otherName: u?.name || "",
+        otherBusinessName: u?.businessName || "",
+        otherPhotoUrl: u?.photoUrl || null,
+        proposedAt: r.data.proposedAt || "",
+        location: r.data.location || "",
+        note: r.data.note || "",
+        status: r.data.status || "pending",
+        createdAt: r.data.createdAt || null,
+      };
+    })
+    .sort((a, b) => (a.proposedAt || "").localeCompare(b.proposedAt || ""));
+
+  res.json({ oneToOnes });
+}
+
+export async function updateOneToOne(req: AuthedRequest, res: Response) {
+  const uid = req.uid;
+  const { id } = req.params;
+  const status = String(req.body?.status || "").trim();
+
+  if (!["accepted", "declined", "cancelled"].includes(status)) {
+    throw new ApiError(400, "Invalid status.");
+  }
+
+  const ref = db.collection(ONE_TO_ONES).doc(id);
+  const snap = await ref.get();
+  if (!snap.exists) throw new ApiError(404, "1-2-1 not found.");
+  const m = snap.data() as any;
+
+  const isReceiver = m.toUserId === uid;
+  const isSender = m.fromUserId === uid;
+  if (!isReceiver && !isSender) throw new ApiError(403, "Not your 1-2-1.");
+  // Only the invited member accepts/declines; either party may cancel.
+  if ((status === "accepted" || status === "declined") && !isReceiver) {
+    throw new ApiError(403, "Only the invited member can respond.");
+  }
+
+  await ref.set({ status, updatedAt: new Date().toISOString() }, { merge: true });
+  res.json({ ok: true, status });
+}
+
 export async function register(req: AuthedRequest, res: Response) {
   const result = await registration.register(req.params.id, req.uid, req.body ?? {});
   res.json({
