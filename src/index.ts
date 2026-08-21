@@ -1,5 +1,6 @@
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
+import { startReminderScheduler } from "./services/reminder.service.js";
 
 /**
  * Local development entrypoint.
@@ -20,4 +21,7 @@ app.listen(env.port, () => {
   if (env.enableDevRoutes) {
     console.warn("*** ENABLE_DEV_ROUTES=true — destructive dev routes are exposed. ***");
   }
+
+  // In-process scheduler for 1-2-1 reminders. No external cron needed.
+  startReminderScheduler();
 });

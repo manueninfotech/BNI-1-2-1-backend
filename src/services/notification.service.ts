@@ -31,6 +31,33 @@ export async function notifyUser(
 }
 
 /**
+ * Data-only push to one member. No `notification` payload, so the app's
+ * background handler receives the data and builds the notification itself — used
+ * for the sticky, self-counting-down 1-2-1 reminder.
+ */
+export async function sendDataToUser(
+  uid: string,
+  data: Record<string, string>,
+): Promise<boolean> {
+  if (!uid) return false;
+  try {
+    await messaging.send({
+      topic: userTopic(uid),
+      data,
+      android: { priority: "high" },
+      apns: {
+        headers: { "apns-priority": "5", "apns-push-type": "background" },
+        payload: { aps: { "content-available": 1 } },
+      },
+    });
+    return true;
+  } catch (e) {
+    console.error(`FCM sendDataToUser failed for ${uid}:`, (e as Error).message);
+    return false;
+  }
+}
+
+/**
  * Push a notification to everyone in a conclave, via the FCM topic the app
  * subscribes to when it opens that conclave.
  *
