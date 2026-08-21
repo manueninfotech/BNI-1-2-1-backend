@@ -1,6 +1,34 @@
-import { messaging } from "../config/firebase.js";
+import { messaging, db, collections } from "../config/firebase.js";
 
 export const conclaveTopic = (conclaveId: string) => `conclave_${conclaveId}`;
+
+/**
+ * Writes a notification into the member's inbox (`users/{uid}/notifications`),
+ * so the in-app notification hub has a history and an unread count — separate
+ * from the transient FCM push. Best-effort.
+ */
+export async function recordUserNotification(
+  uid: string,
+  n: { title: string; body: string; type: string; data?: Record<string, string> },
+): Promise<void> {
+  if (!uid) return;
+  try {
+    await db
+      .collection(collections.users)
+      .doc(uid)
+      .collection("notifications")
+      .add({
+        title: n.title,
+        body: n.body,
+        type: n.type,
+        data: n.data ?? {},
+        read: false,
+        createdAt: new Date().toISOString(),
+      });
+  } catch (e) {
+    console.error(`Record notification failed for ${uid}:`, (e as Error).message);
+  }
+}
 export const userTopic = (uid: string) => `user_${uid}`;
 
 /**

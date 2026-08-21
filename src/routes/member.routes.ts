@@ -26,6 +26,8 @@ router.patch("/conclaves/:cid/referrals/:rid/outcome", asyncHandler(c.updateRefe
 router.get("/me/one-to-ones", asyncHandler(c.listOneToOnes));
 router.post("/me/one-to-ones", asyncHandler(c.createOneToOne));
 router.patch("/me/one-to-ones/:id", asyncHandler(c.updateOneToOne));
+router.get("/me/notifications", asyncHandler(c.listNotifications));
+router.post("/me/notifications/read", asyncHandler(c.markNotificationsRead));
 router.get("/conclaves", asyncHandler(c.listConclaves));
 router.get("/conclaves/:id/referrals", asyncHandler(c.getReferrals));
 router.post("/conclaves/:id/payment/order", paymentOrderLimiter, asyncHandler(c.createPaymentOrder));

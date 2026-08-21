@@ -4,7 +4,7 @@ import { ApiError } from "../middleware/errors.js";
 import { ScheduleIndex } from "../domain/scheduleIndex.js";
 import { getConclaveOrThrow, conclaveRef } from "./conclave.service.js";
 import { fetchUsers } from "./user.service.js";
-import { notifyUser } from "./notification.service.js";
+import { notifyUser, recordUserNotification } from "./notification.service.js";
 import { getAllDocs, toIso } from "../utils/firestore.js";
 
 /** A row as the phone's sqflite stores it. Everything here is UNTRUSTED. */
@@ -250,15 +250,16 @@ export async function syncConclave(
     const givers = await fetchUsers(giverIds);
     for (const p of newReferralPings) {
       const giverName = (givers.get(p.fromUserId) as any)?.name || "A member";
-      void notifyUser(
-        p.toUserId,
-        {
-          title: "New referral 🎉",
-          body: `${giverName} just passed you a referral.`,
-          data: { type: "referral_received", conclaveId, id: p.id },
-        },
-        "referrals",
-      );
+      const msg = {
+        title: "New referral 🎉",
+        body: `${giverName} just passed you a referral.`,
+        data: { type: "referral_received", conclaveId, id: p.id },
+      };
+      void notifyUser(p.toUserId, msg, "referrals");
+      void recordUserNotification(p.toUserId, {
+        ...msg,
+        type: "referral_received",
+      });
     }
   }
 

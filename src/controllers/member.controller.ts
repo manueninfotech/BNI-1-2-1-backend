@@ -5,8 +5,38 @@ import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
 import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
-import { notifyUser, sendDataToUser } from "../services/notification.service.js";
+import {
+  notifyUser,
+  sendDataToUser,
+  recordUserNotification,
+} from "../services/notification.service.js";
 import { ApiError } from "../middleware/errors.js";
+
+export async function listNotifications(req: AuthedRequest, res: Response) {
+  const snap = await db
+    .collection(collections.users)
+    .doc(req.uid)
+    .collection("notifications")
+    .orderBy("createdAt", "desc")
+    .limit(50)
+    .get();
+  const notifications = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+  const unreadCount = notifications.filter((n: any) => !n.read).length;
+  res.json({ notifications, unreadCount });
+}
+
+export async function markNotificationsRead(req: AuthedRequest, res: Response) {
+  const snap = await db
+    .collection(collections.users)
+    .doc(req.uid)
+    .collection("notifications")
+    .where("read", "==", false)
+    .get();
+  const batch = db.batch();
+  snap.forEach((d) => batch.set(d.ref, { read: true }, { merge: true }));
+  await batch.commit();
+  res.json({ ok: true, marked: snap.size });
+}
 
 /** A member's display name, for notification copy. */
 async function displayName(uid: string): Promise<string> {
@@ -593,6 +623,12 @@ export async function createOneToOne(req: AuthedRequest, res: Response) {
     id: ref.id,
     fromName,
   });
+  void recordUserNotification(toUserId, {
+    title: "New 1-2-1 request",
+    body: `${fromName} wants a one-to-one with you.`,
+    type: "one_to_one_request",
+    data: { id: ref.id },
+  });
 
   res.json({ id: ref.id });
 }
@@ -683,25 +719,22 @@ export async function updateOneToOne(req: AuthedRequest, res: Response) {
   // Notify the OTHER party of the change.
   const actorName = await displayName(uid);
   if (status === "accepted" || status === "declined") {
-    void notifyUser(
-      m.fromUserId,
-      {
-        title: `1-2-1 ${status}`,
-        body: `${actorName} ${status} your 1-2-1 request.`,
-        data: { type: "one_to_one", id },
-      },
-      "one_to_ones",
-    );
+    const msg = {
+      title: `1-2-1 ${status}`,
+      body: `${actorName} ${status} your 1-2-1 request.`,
+      data: { type: "one_to_one", id },
+    };
+    void notifyUser(m.fromUserId, msg, "one_to_ones");
+    void recordUserNotification(m.fromUserId, { ...msg, type: "one_to_one" });
   } else if (status === "cancelled") {
-    void notifyUser(
-      isSender ? m.toUserId : m.fromUserId,
-      {
-        title: "1-2-1 cancelled",
-        body: `${actorName} cancelled a 1-2-1.`,
-        data: { type: "one_to_one", id },
-      },
-      "one_to_ones",
-    );
+    const target = isSender ? m.toUserId : m.fromUserId;
+    const msg = {
+      title: "1-2-1 cancelled",
+      body: `${actorName} cancelled a 1-2-1.`,
+      data: { type: "one_to_one", id },
+    };
+    void notifyUser(target, msg, "one_to_ones");
+    void recordUserNotification(target, { ...msg, type: "one_to_one" });
   }
 
   res.json({ ok: true, status });
