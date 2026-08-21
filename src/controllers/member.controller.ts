@@ -41,6 +41,8 @@ export async function listMembers(_req: AuthedRequest, res: Response) {
         businessCategory: (d.businessCategory || "").trim(),
         location: (d.location || "").trim(),
         chapter: d.chapter || null,
+        region: d.region || null,
+        membership: (d.membership || "").trim(),
       };
     })
     // Skip half-built docs (e.g. an interrupted registration that only wrote a
