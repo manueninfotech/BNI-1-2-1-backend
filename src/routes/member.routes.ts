@@ -22,6 +22,7 @@ router.put("/me", asyncHandler(c.updateMe));
 router.patch("/me", asyncHandler(c.updateMe));
 router.get("/members", asyncHandler(c.listMembers));
 router.get("/me/referrals", asyncHandler(c.myReferrals));
+router.patch("/conclaves/:cid/referrals/:rid/outcome", asyncHandler(c.updateReferralOutcome));
 router.get("/conclaves", asyncHandler(c.listConclaves));
 router.get("/conclaves/:id/referrals", asyncHandler(c.getReferrals));
 router.post("/conclaves/:id/payment/order", paymentOrderLimiter, asyncHandler(c.createPaymentOrder));

@@ -388,8 +388,20 @@ export async function myReferrals(req: AuthedRequest, res: Response) {
     otherBusinessName: string;
     notes: string;
     status: string;
+    // Business-outcome lifecycle, driven by the RECEIVER of the referral.
+    outcome: string; // 'open' | 'accepted' | 'closed' | 'not_closed'
+    closedAmount: number; // TYFCB value in rupees, when closed
+    outcomeNote: string;
+    outcomeAt: string | null;
     createdAt: string;
   };
+
+  const outcomeFields = (r: any) => ({
+    outcome: (r.outcome as string) || "open",
+    closedAmount: Number(r.closedAmount ?? 0),
+    outcomeNote: (r.outcomeNote as string) || "",
+    outcomeAt: r.outcomeAt ? toISO(r.outcomeAt) : null,
+  });
 
   const given: Row[] = [];
   const received: Row[] = [];
@@ -416,6 +428,7 @@ export async function myReferrals(req: AuthedRequest, res: Response) {
           otherBusinessName: "",
           notes: r.notes ?? "",
           status: r.status || "Pending",
+          ...outcomeFields(r),
           createdAt: toISO(r.createdAt || r.syncedAt),
         });
       });
@@ -432,6 +445,7 @@ export async function myReferrals(req: AuthedRequest, res: Response) {
           otherBusinessName: "",
           notes: r.notes ?? "",
           status: r.status || "Pending",
+          ...outcomeFields(r),
           createdAt: toISO(r.createdAt || r.syncedAt),
         });
       });
@@ -471,6 +485,54 @@ export async function myReferrals(req: AuthedRequest, res: Response) {
   received.sort(byNewest);
 
   res.json({ given, received });
+}
+
+/**
+ * Records the business outcome of a referral: the lifecycle a RECEIVER drives —
+ * accepted, closed (with a TYFCB amount), or didn't work out.
+ *
+ * Only the person who RECEIVED the referral may update it — the outcome is their
+ * report of what happened, and it credits the giver. The uid comes from the
+ * token, so a caller can never touch a referral that wasn't theirs to close.
+ */
+const OUTCOMES = new Set(["open", "accepted", "closed", "not_closed"]);
+
+export async function updateReferralOutcome(req: AuthedRequest, res: Response) {
+  const { cid, rid } = req.params;
+  const outcome = String(req.body?.outcome || "").trim();
+  const amount = Number(req.body?.amount ?? 0);
+  const note = String(req.body?.note ?? "").trim();
+
+  if (!OUTCOMES.has(outcome)) {
+    throw new ApiError(400, "Invalid outcome.");
+  }
+  if (outcome === "closed" && (!Number.isFinite(amount) || amount < 0)) {
+    throw new ApiError(400, "A closed referral needs a valid amount.");
+  }
+
+  const ref = db
+    .collection(collections.conclaves)
+    .doc(cid)
+    .collection(collections.referrals)
+    .doc(rid);
+
+  const snap = await ref.get();
+  if (!snap.exists) throw new ApiError(404, "Referral not found.");
+  if ((snap.data() as any).toUserId !== req.uid) {
+    throw new ApiError(403, "Only the member who received a referral can update it.");
+  }
+
+  await ref.set(
+    {
+      outcome,
+      closedAmount: outcome === "closed" ? amount : 0,
+      outcomeNote: note,
+      outcomeAt: new Date().toISOString(),
+    },
+    { merge: true },
+  );
+
+  res.json({ ok: true, outcome, closedAmount: outcome === "closed" ? amount : 0 });
 }
 
 export async function register(req: AuthedRequest, res: Response) {
