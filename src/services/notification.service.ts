@@ -13,6 +13,7 @@ export const userTopic = (uid: string) => `user_${uid}`;
 export async function notifyUser(
   uid: string,
   msg: { title: string; body: string; data?: Record<string, string> },
+  channelId = "general",
 ): Promise<boolean> {
   if (!uid) return false;
   try {
@@ -20,7 +21,7 @@ export async function notifyUser(
       topic: userTopic(uid),
       notification: { title: msg.title, body: msg.body },
       data: msg.data ?? {},
-      android: { priority: "high", notification: { channelId: "one_to_ones" } },
+      android: { priority: "high", notification: { channelId } },
       apns: { payload: { aps: { sound: "default" } } },
     });
     return true;

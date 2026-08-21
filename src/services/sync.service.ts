@@ -4,6 +4,7 @@ import { ApiError } from "../middleware/errors.js";
 import { ScheduleIndex } from "../domain/scheduleIndex.js";
 import { getConclaveOrThrow, conclaveRef } from "./conclave.service.js";
 import { fetchUsers } from "./user.service.js";
+import { notifyUser } from "./notification.service.js";
 import { getAllDocs, toIso } from "../utils/firestore.js";
 
 /** A row as the phone's sqflite stores it. Everything here is UNTRUSTED. */
@@ -102,6 +103,8 @@ export async function syncConclave(
   const errors: string[] = [];
   const acceptedAttendance: string[] = [];
   const acceptedReferrals: string[] = [];
+  // Candidate referral-received pings; deduped to newly-created ones before send.
+  const referralPings: { id: string; toUserId: string; fromUserId: string }[] = [];
 
   const index =
     conclave.schedule && Array.isArray(conclave.participants)
@@ -218,9 +221,46 @@ export async function syncConclave(
       { merge: true },
     );
     acceptedReferrals.push(String(id));
+    if (String(r.toUserId) !== String(r.fromUserId)) {
+      referralPings.push({
+        id: String(id),
+        toUserId: String(r.toUserId),
+        fromUserId: String(r.fromUserId),
+      });
+    }
+  }
+
+  // Which of those referrals are NEW? Read pre-commit state so a re-sync of the
+  // same referral doesn't ping the recipient twice.
+  let newReferralPings: typeof referralPings = [];
+  if (referralPings.length) {
+    const snaps = await db.getAll(
+      ...referralPings.map((p) =>
+        ref.collection(collections.referrals).doc(p.id),
+      ),
+    );
+    newReferralPings = referralPings.filter((_, i) => !snaps[i].exists);
   }
 
   await batch.commit();
+
+  // Tell each recipient a referral just landed. Best-effort; never fails a sync.
+  if (newReferralPings.length) {
+    const giverIds = [...new Set(newReferralPings.map((p) => p.fromUserId))];
+    const givers = await fetchUsers(giverIds);
+    for (const p of newReferralPings) {
+      const giverName = (givers.get(p.fromUserId) as any)?.name || "A member";
+      void notifyUser(
+        p.toUserId,
+        {
+          title: "New referral 🎉",
+          body: `${giverName} just passed you a referral.`,
+          data: { type: "referral_received", conclaveId, id: p.id },
+        },
+        "referrals",
+      );
+    }
+  }
 
   const participants = Array.isArray(conclave.participants) ? conclave.participants : [];
   const schedule = conclave.schedule;

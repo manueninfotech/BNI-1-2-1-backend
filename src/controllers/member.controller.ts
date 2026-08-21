@@ -683,17 +683,25 @@ export async function updateOneToOne(req: AuthedRequest, res: Response) {
   // Notify the OTHER party of the change.
   const actorName = await displayName(uid);
   if (status === "accepted" || status === "declined") {
-    void notifyUser(m.fromUserId, {
-      title: `1-2-1 ${status}`,
-      body: `${actorName} ${status} your 1-2-1 request.`,
-      data: { type: "one_to_one", id },
-    });
+    void notifyUser(
+      m.fromUserId,
+      {
+        title: `1-2-1 ${status}`,
+        body: `${actorName} ${status} your 1-2-1 request.`,
+        data: { type: "one_to_one", id },
+      },
+      "one_to_ones",
+    );
   } else if (status === "cancelled") {
-    void notifyUser(isSender ? m.toUserId : m.fromUserId, {
-      title: "1-2-1 cancelled",
-      body: `${actorName} cancelled a 1-2-1.`,
-      data: { type: "one_to_one", id },
-    });
+    void notifyUser(
+      isSender ? m.toUserId : m.fromUserId,
+      {
+        title: "1-2-1 cancelled",
+        body: `${actorName} cancelled a 1-2-1.`,
+        data: { type: "one_to_one", id },
+      },
+      "one_to_ones",
+    );
   }
 
   res.json({ ok: true, status });
