@@ -20,7 +20,7 @@ export async function notifyUser(
       topic: userTopic(uid),
       notification: { title: msg.title, body: msg.body },
       data: msg.data ?? {},
-      android: { priority: "high" },
+      android: { priority: "high", notification: { channelId: "one_to_ones" } },
       apns: { payload: { aps: { sound: "default" } } },
     });
     return true;
@@ -75,7 +75,7 @@ export async function notifyConclave(
       topic: conclaveTopic(conclaveId),
       notification: { title: msg.title, body: msg.body },
       data: msg.data ?? {},
-      android: { priority: "high" },
+      android: { priority: "high", notification: { channelId: "round_alerts" } },
       apns: { payload: { aps: { sound: "default" } } },
     });
     return true;

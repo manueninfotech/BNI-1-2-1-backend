@@ -5,7 +5,7 @@ import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
 import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
-import { notifyUser } from "../services/notification.service.js";
+import { notifyUser, sendDataToUser } from "../services/notification.service.js";
 import { ApiError } from "../middleware/errors.js";
 
 /** A member's display name, for notification copy. */
@@ -585,12 +585,13 @@ export async function createOneToOne(req: AuthedRequest, res: Response) {
     updatedAt: now,
   });
 
-  // Direct FCM to the invited member — no scheduler.
+  // Data-only push so the app raises a notification with Accept / Decline
+  // actions the invited member can tap from the tray.
   const fromName = await displayName(uid);
-  void notifyUser(toUserId, {
-    title: "New 1-2-1 request",
-    body: `${fromName} wants a one-to-one with you.`,
-    data: { type: "one_to_one", id: ref.id },
+  void sendDataToUser(toUserId, {
+    type: "one_to_one_request",
+    id: ref.id,
+    fromName,
   });
 
   res.json({ id: ref.id });
