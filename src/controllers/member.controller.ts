@@ -603,6 +603,36 @@ export async function createOneToOne(req: AuthedRequest, res: Response) {
   const toDoc = await db.collection(collections.users).doc(toUserId).get();
   if (!toDoc.exists) throw new ApiError(404, "Member not found.");
 
+  // Guard against spamming the same member. Two equality filters need no
+  // composite index.
+  const priorSnap = await db
+    .collection(ONE_TO_ONES)
+    .where("fromUserId", "==", uid)
+    .where("toUserId", "==", toUserId)
+    .get();
+
+  const hasPending = priorSnap.docs.some(
+    (d) => (d.data() as any).status === "pending",
+  );
+  if (hasPending) {
+    throw new ApiError(
+      409,
+      "You already have a pending 1-2-1 request with this member.",
+    );
+  }
+
+  const monthAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const recent = priorSnap.docs.filter((d) => {
+    const t = Date.parse((d.data() as any).createdAt || "");
+    return !Number.isNaN(t) && t >= monthAgo;
+  }).length;
+  if (recent >= 2) {
+    throw new ApiError(
+      429,
+      "You can request a 1-2-1 with the same member at most twice a month.",
+    );
+  }
+
   const now = new Date().toISOString();
   const ref = await db.collection(ONE_TO_ONES).add({
     fromUserId: uid,
