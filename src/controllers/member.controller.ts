@@ -566,9 +566,12 @@ export async function updateReferralOutcome(req: AuthedRequest, res: Response) {
     throw new ApiError(403, "Only the member who received a referral can update it.");
   }
 
+  const newStatus = (outcome === "accepted" || outcome === "closed") ? "Completed" : ((snap.data() as any).status || "Pending");
+
   await ref.set(
     {
       outcome,
+      status: newStatus,
       closedAmount: outcome === "closed" ? amount : 0,
       outcomeNote: note,
       outcomeAt: new Date().toISOString(),
@@ -576,7 +579,7 @@ export async function updateReferralOutcome(req: AuthedRequest, res: Response) {
     { merge: true },
   );
 
-  res.json({ ok: true, outcome, closedAmount: outcome === "closed" ? amount : 0 });
+  res.json({ ok: true, outcome, status: newStatus, closedAmount: outcome === "closed" ? amount : 0 });
 }
 
 // ---------------------------------------------------------------------------
