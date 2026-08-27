@@ -6,14 +6,11 @@ import * as c from "../controllers/member.controller.js";
 
 const router = Router();
 
+router.post("/auth/resolve-identifier", asyncHandler(c.resolveIdentifier));
+
 /**
  * Member endpoints. Every one requires a verified Firebase token — the caller's
  * uid is taken from that token and NEVER from the request body.
- *
- * This was the single worst hole in the previous backend: /sync was completely
- * unauthenticated and took `userId` from the body, so anyone who knew a conclave
- * id could forge attendance and referrals for anybody, and read any member's
- * referrals by simply asking for them.
  */
 router.use(requireUser);
 

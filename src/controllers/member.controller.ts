@@ -835,3 +835,79 @@ export async function syncConclave(req: AuthedRequest, res: Response) {
 
   res.json(result);
 }
+
+export async function resolveIdentifier(req: any, res: Response) {
+  try {
+    const rawInput = String(req.body?.identifier || '').trim().toLowerCase();
+    if (!rawInput) {
+      return res.status(400).json({ error: "Identifier is required." });
+    }
+
+    const digitsOnly = rawInput.replace(/\D/g, '');
+    const isPhoneNumber = digitsOnly.length >= 10 && digitsOnly.length <= 12;
+    const tenDigit = isPhoneNumber ? digitsOnly.slice(-10) : '';
+
+    let foundUser: any = null;
+
+    // 1. Search users collection by email
+    const emailSnap = await db.collection(collections.users)
+      .where('email', '==', rawInput)
+      .limit(1)
+      .get();
+    if (!emailSnap.empty) {
+      foundUser = emailSnap.docs[0].data();
+    }
+
+    // 2. Search users collection by mobile / phone if not found yet
+    if (!foundUser && tenDigit) {
+      const mobileSnap = await db.collection(collections.users)
+        .where('mobile', '==', tenDigit)
+        .limit(1)
+        .get();
+      if (!mobileSnap.empty) {
+        foundUser = mobileSnap.docs[0].data();
+      } else {
+        const phoneSnap = await db.collection(collections.users)
+          .where('phone', '==', `+91${tenDigit}`)
+          .limit(1)
+          .get();
+        if (!phoneSnap.empty) {
+          foundUser = phoneSnap.docs[0].data();
+        }
+      }
+    }
+
+    // 3. Search users collection by identifier field
+    if (!foundUser && (rawInput || tenDigit)) {
+      const idSnap = await db.collection(collections.users)
+        .where('identifier', '==', rawInput)
+        .limit(1)
+        .get();
+      if (!idSnap.empty) {
+        foundUser = idSnap.docs[0].data();
+      }
+    }
+
+    // 4. Resolve exact auth email string for Firebase Auth login
+    let authEmail = rawInput;
+    if (foundUser) {
+      authEmail = foundUser.identifier || foundUser.email || (tenDigit ? `91${tenDigit}@bni121.conclave` : rawInput);
+    } else if (isPhoneNumber) {
+      authEmail = `91${tenDigit}@bni121.conclave`;
+    }
+
+    return res.json({
+      authEmail,
+      found: !!foundUser,
+      user: foundUser ? {
+        id: foundUser.id,
+        email: foundUser.email,
+        name: foundUser.name,
+        role: foundUser.role || 'member'
+      } : null
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || "Failed to resolve identifier." });
+  }
+}
+
