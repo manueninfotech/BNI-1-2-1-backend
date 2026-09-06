@@ -1,6 +1,6 @@
 import type { Response } from "express";
 import type { AuthedRequest } from "../middleware/auth.js";
-import { db, collections } from "../config/firebase.js";
+import { db, auth, collections } from "../config/firebase.js";
 import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
 import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
@@ -36,6 +36,39 @@ export async function markNotificationsRead(req: AuthedRequest, res: Response) {
   snap.forEach((d) => batch.set(d.ref, { read: true }, { merge: true }));
   await batch.commit();
   res.json({ ok: true, marked: snap.size });
+}
+
+/**
+ * Permanently deletes the caller's own account — required by App Store Guideline
+ * 5.1.1(v) for any app that lets users create an account.
+ *
+ * Removes their personal data (the profile document and its notifications
+ * subcollection) and then their Firebase Auth login. The uid is taken from the
+ * verified token, never the body, so a member can only ever delete themselves.
+ * Shared event records (referrals, attendance) are retained as event history but
+ * no longer resolve to a live account.
+ */
+export async function deleteAccount(req: AuthedRequest, res: Response) {
+  const uid = req.uid;
+  const userRef = db.collection(collections.users).doc(uid);
+
+  // Delete the notifications subcollection first (Firestore doesn't cascade),
+  // then the profile document itself.
+  const notifs = await userRef.collection("notifications").get();
+  const batch = db.batch();
+  notifs.forEach((d) => batch.delete(d.ref));
+  batch.delete(userRef);
+  await batch.commit();
+
+  // Remove the auth account last, so a failure above never orphans the login.
+  try {
+    await auth.deleteUser(uid);
+  } catch (e) {
+    // Already gone is fine; anything else is logged but the data is cleared.
+    console.error("deleteAccount: auth.deleteUser failed", e);
+  }
+
+  res.json({ ok: true });
 }
 
 /** A member's display name, for notification copy. */

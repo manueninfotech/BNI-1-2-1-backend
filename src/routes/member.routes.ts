@@ -17,6 +17,7 @@ router.use(requireUser);
 router.get("/me", asyncHandler(c.me));
 router.put("/me", asyncHandler(c.updateMe));
 router.patch("/me", asyncHandler(c.updateMe));
+router.delete("/me/account", asyncHandler(c.deleteAccount));
 router.get("/members", asyncHandler(c.listMembers));
 router.get("/me/referrals", asyncHandler(c.myReferrals));
 router.patch("/conclaves/:cid/referrals/:rid/outcome", asyncHandler(c.updateReferralOutcome));
