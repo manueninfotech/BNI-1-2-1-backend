@@ -158,6 +158,31 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
   }
 }
 
+export function normalizeTime(val: unknown): string | null {
+  if (!val) return null;
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    if (/^\d{1,2}:\d{2}/.test(trimmed)) {
+      return trimmed;
+    }
+    const d = toDate(trimmed);
+    if (d && !isNaN(d.getTime())) {
+      const hours = String(d.getHours()).padStart(2, "0");
+      const mins = String(d.getMinutes()).padStart(2, "0");
+      return `${hours}:${mins}`;
+    }
+    return trimmed;
+  }
+  const d = toDate(val);
+  if (d && !isNaN(d.getTime())) {
+    const hours = String(d.getHours()).padStart(2, "0");
+    const mins = String(d.getMinutes()).padStart(2, "0");
+    return `${hours}:${mins}`;
+  }
+  return null;
+}
+
 export async function createConclave(input: CreateInput) {
   if (!input.name || !input.venueLocation) {
     throw ApiError.badRequest("name and venueLocation are required.");
@@ -173,8 +198,6 @@ export async function createConclave(input: CreateInput) {
     date: input.date,
     startDate: input.startDate,
     endDate: input.endDate,
-    startTime: input.startTime,
-    endTime: input.endTime
   });
 
   const statusToSet = input.status || evalResult.status;
@@ -192,8 +215,8 @@ export async function createConclave(input: CreateInput) {
     endDate: input.endDate ? new Date(input.endDate) : null,
     regStartDate: input.regStartDate ? new Date(input.regStartDate) : null,
     regEndDate: input.regEndDate ? (() => { const d = new Date(input.regEndDate); d.setHours(23, 59, 59, 999); return d; })() : null,
-    startTime: input.startTime ? new Date(input.startTime) : null,
-    endTime: input.endTime ? new Date(input.endTime) : null,
+    startTime: normalizeTime(input.startTime),
+    endTime: normalizeTime(input.endTime),
     chiefGuests: Array.isArray(input.chiefGuests) ? input.chiefGuests : [],
     status: statusToSet,
     isRegistrationOpen: isRegOpen,
@@ -245,8 +268,8 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
       updates.regEndDate = null;
     }
   }
-  if (body.startTime !== undefined) updates.startTime = body.startTime ? new Date(body.startTime as string) : null;
-  if (body.endTime !== undefined) updates.endTime = body.endTime ? new Date(body.endTime as string) : null;
+  if (body.startTime !== undefined) updates.startTime = normalizeTime(body.startTime);
+  if (body.endTime !== undefined) updates.endTime = normalizeTime(body.endTime);
   if (body.status !== undefined) updates.status = body.status;
 
   const mergedData = { ...data, ...updates };
@@ -490,8 +513,8 @@ export async function listConclaves(region?: string) {
           endDate: toIso(d.endDate),
           regStartDate: toIso(d.regStartDate),
           regEndDate: toIso(d.regEndDate),
-          startTime: toIso(d.startTime),
-          endTime: toIso(d.endTime),
+          startTime: normalizeTime(d.startTime),
+          endTime: normalizeTime(d.endTime),
           createdAt: toIso(d.createdAt),
           updatedAt: toIso(d.updatedAt),
           registrationCount: actualCount,

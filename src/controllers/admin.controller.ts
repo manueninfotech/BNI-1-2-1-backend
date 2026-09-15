@@ -73,8 +73,8 @@ export async function getOne(req: AuthedRequest, res: Response) {
     endDate: toDate(d.endDate)?.toISOString() ?? null,
     regStartDate: toDate(d.regStartDate)?.toISOString() ?? null,
     regEndDate: toDate(d.regEndDate)?.toISOString() ?? null,
-    startTime: toDate(d.startTime)?.toISOString() ?? null,
-    endTime: toDate(d.endTime)?.toISOString() ?? null,
+    startTime: conclaves.normalizeTime(d.startTime),
+    endTime: conclaves.normalizeTime(d.endTime),
     currentRoundStartedAt: toDate(d.currentRoundStartedAt)?.toISOString() ?? null,
   });
 }

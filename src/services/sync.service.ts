@@ -51,6 +51,8 @@ export interface SyncResult {
     date: string | null;
     venue: string;
     region?: string;
+    startTime?: string | null;
+    endTime?: string | null;
   };
   tableNumber: number | null;
   captainName: string | null;
@@ -408,7 +410,9 @@ export async function syncConclave(
       title: conclave.name || conclave.title || "BNI Conclave",
       date: conclave.date || null,
       venue: conclave.venueLocation || conclave.venue || "TBD Venue",
-      region: conclave.region || "Vijayawada Region"
+      region: conclave.region || "Vijayawada Region",
+      startTime: conclave.startTime ? (typeof conclave.startTime === 'string' ? conclave.startTime : toIso(conclave.startTime)) : null,
+      endTime: conclave.endTime ? (typeof conclave.endTime === 'string' ? conclave.endTime : toIso(conclave.endTime)) : null
     },
     tableNumber,
     captainName,
