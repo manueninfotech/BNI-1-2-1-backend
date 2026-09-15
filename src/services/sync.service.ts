@@ -2,7 +2,7 @@ import { db, collections } from "../config/firebase.js";
 import { env } from "../config/env.js";
 import { ApiError } from "../middleware/errors.js";
 import { ScheduleIndex } from "../domain/scheduleIndex.js";
-import { getConclaveOrThrow, conclaveRef } from "./conclave.service.js";
+import { getConclaveOrThrow, conclaveRef, evaluateConclaveStatus } from "./conclave.service.js";
 import { fetchUsers } from "./user.service.js";
 import { notifyUser, recordUserNotification } from "./notification.service.js";
 import { getAllDocs, toIso } from "../utils/firestore.js";
@@ -403,7 +403,9 @@ export async function syncConclave(
     conclaveStatus: {
       id: conclaveId,
       name: conclave.name || conclave.title || "BNI Conclave",
-      status: conclave.status ?? "draft",
+      status: (conclave.status === 'completed' || conclave.status === 'cancelled')
+        ? conclave.status
+        : evaluateConclaveStatus(conclave).status,
       currentRound: conclave.currentRound ?? 0,
       currentRoundStartedAt: toIso(conclave.currentRoundStartedAt),
       serverSentAt: new Date().toISOString(),

@@ -92,45 +92,93 @@ export function validateConfig(personsPerTable: number, roundCount: number) {
 }
 
 /**
- * Evaluates conclave status dynamically based on current date/time vs reg dates and event start/end dates.
+/**
+ * Parses time string (e.g. "09:00", "09:00 AM", "17:30") into hours and minutes.
+ */
+function parseTimeComponents(val: unknown): { hours: number; minutes: number } | null {
+  if (!val) return null;
+  if (typeof val === 'string') {
+    const match = val.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+    if (match) {
+      let h = parseInt(match[1], 10);
+      const m = parseInt(match[2], 10);
+      const meridian = match[3]?.toUpperCase();
+      if (meridian === 'PM' && h < 12) h += 12;
+      if (meridian === 'AM' && h === 12) h = 0;
+      return { hours: h, minutes: m };
+    }
+  }
+  const d = toDate(val);
+  if (d && !isNaN(d.getTime())) {
+    return { hours: d.getHours(), minutes: d.getMinutes() };
+  }
+  return null;
+}
+
+/**
+ * Evaluates conclave status dynamically based on current date/time vs reg dates and event start/end dates & times.
+ * A conclave is shown as "running" ONLY if its start date & start time have already arrived!
  */
 export function evaluateConclaveStatus(data: any): { status: string; isRegistrationOpen: boolean } {
   try {
     const now = new Date();
 
+    // Preserve terminal cancelled status
+    if (data?.status === ConclaveStatus.cancelled) {
+      return { status: ConclaveStatus.cancelled, isRegistrationOpen: false };
+    }
+
     const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
     const regEnd = data?.regEndDate ? toDate(data.regEndDate) : null;
 
     const eventStart = data?.date ? toDate(data.date) : (data?.startDate ? toDate(data.startDate) : null);
-    const eventEnd = data?.endDate ? toDate(data.endDate) : (data?.endTime ? toDate(data.endTime) : null);
+    const eventEnd = data?.endDate ? toDate(data.endDate) : (data?.date ? toDate(data.date) : null);
 
-    const getLocalDateStr = (d: Date | null) => {
-      if (!d || !(d instanceof Date) || Number.isNaN(d.getTime())) return null;
-      const year = d.getFullYear();
-      const month = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
-    };
+    const startTimeComp = parseTimeComponents(data?.startTime);
+    const endTimeComp = parseTimeComponents(data?.endTime);
 
-    const todayStr = getLocalDateStr(now);
-
-    // 1. Completed if event end date has passed
-    if (eventEnd) {
-      const endStr = getLocalDateStr(eventEnd);
-      if (endStr && todayStr && todayStr > endStr) {
-        return { status: ConclaveStatus.completed, isRegistrationOpen: false };
+    // Build precise start Date + Time
+    let startDateTime: Date | null = null;
+    if (eventStart && !isNaN(eventStart.getTime())) {
+      startDateTime = new Date(eventStart);
+      if (startTimeComp) {
+        startDateTime.setHours(startTimeComp.hours, startTimeComp.minutes, 0, 0);
+      } else {
+        startDateTime.setHours(0, 0, 0, 0);
       }
     }
 
-    // 2. Running IF event start date is today or in the past (and event has not ended)
-    if (eventStart) {
-      const startStr = getLocalDateStr(eventStart);
-      if (startStr && todayStr && todayStr >= startStr) {
-        return { status: ConclaveStatus.running, isRegistrationOpen: false };
+    // Build precise end Date + Time
+    let endDateTime: Date | null = null;
+    if (eventEnd && !isNaN(eventEnd.getTime())) {
+      endDateTime = new Date(eventEnd);
+      if (endTimeComp) {
+        endDateTime.setHours(endTimeComp.hours, endTimeComp.minutes, 59, 999);
+      } else {
+        endDateTime.setHours(23, 59, 59, 999);
+      }
+    } else if (startDateTime) {
+      endDateTime = new Date(startDateTime);
+      if (endTimeComp) {
+        endDateTime.setHours(endTimeComp.hours, endTimeComp.minutes, 59, 999);
+      } else {
+        endDateTime.setHours(23, 59, 59, 999);
       }
     }
 
-    // 3. If registration close date has passed (and event hasn't started yet) -> Registration Closed
+    // 1. Completed if event end date & time has passed
+    if (endDateTime && now > endDateTime) {
+      return { status: ConclaveStatus.completed, isRegistrationOpen: false };
+    }
+
+    // 2. Running ONLY if event start date & time has already arrived!
+    // (Or if admin explicitly started live rounds: currentRound > 0)
+    const hasLiveRounds = Number(data?.currentRound) > 0;
+    if (startDateTime && (now >= startDateTime || hasLiveRounds)) {
+      return { status: ConclaveStatus.running, isRegistrationOpen: false };
+    }
+
+    // 3. If start time has NOT started yet, it CANNOT be running:
     if (regEnd) {
       const regEndDay = new Date(regEnd);
       regEndDay.setHours(23, 59, 59, 999);
@@ -139,7 +187,6 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
       }
     }
 
-    // 4. If registration start date is in the future -> Registration Not Open
     if (regStart) {
       const regStartDay = new Date(regStart);
       regStartDay.setHours(0, 0, 0, 0);
@@ -148,7 +195,7 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
       }
     }
 
-    // 5. Otherwise (during active registration window) -> Registration Open
+    // If event is today or soon and reg is closed, or open:
     return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
   } catch (err) {
     return {
