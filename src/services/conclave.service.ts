@@ -485,7 +485,8 @@ export async function listConclaves(region?: string) {
         const item = {
           id: doc.id,
           ...d,
-          date: toIso(d.date),
+          startDate: toIso(d.startDate || d.date),
+          date: toIso(d.date || d.startDate),
           endDate: toIso(d.endDate),
           regStartDate: toIso(d.regStartDate),
           regEndDate: toIso(d.regEndDate),
