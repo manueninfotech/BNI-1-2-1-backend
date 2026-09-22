@@ -3,7 +3,7 @@ import type { AuthedRequest } from "../middleware/auth.js";
 import { db, auth, collections } from "../config/firebase.js";
 import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
-import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
+import { listConclaves as listConclaveRecords, evaluateConclaveStatus } from "../services/conclave.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
 import {
   notifyUser,
@@ -224,47 +224,67 @@ export async function me(req: AuthedRequest, res: Response) {
 
     let isCaptainRole = false;
 
-    // Check if user is registered as a Captain in a currently RUNNING / ACTIVE conclave
-    if (req.email) {
-      try {
-        const conclavesSnap = await db.collection(collections.conclaves).get();
-        for (const cDoc of conclavesSnap.docs) {
-          const cData = cDoc.data();
-          const cStatus = (cData.status || '').toLowerCase();
-          
-          // Captain role only applies while a conclave is actively RUNNING or ACTIVE.
-          // Once a conclave ends/completes, captains revert to regular members!
-          const isConclaveRunning = cStatus === 'running' || cStatus === 'active' || cStatus === 'in_progress' || cStatus === 'ongoing';
-          
-          if (!isConclaveRunning) continue;
+    // Captain role only applies while a conclave is actively RUNNING or ACTIVE.
+    // Once a conclave ends/completes, captains revert to regular members!
+    // No user will register as captain.
+    try {
+      const conclavesSnap = await db.collection(collections.conclaves).get();
+      for (const cDoc of conclavesSnap.docs) {
+        const cData = cDoc.data();
+        const evalResult = evaluateConclaveStatus(cData);
+        const effectiveStatus = (evalResult?.status || cData.status || '').toLowerCase();
+        const isLiveConclave = effectiveStatus === 'active' || effectiveStatus === 'running';
 
+        // Captain role only applies while a conclave is actively RUNNING or ACTIVE.
+        if (!isLiveConclave) {
+          continue;
+        }
+
+        // 1. Check registrations by UID in this active conclave
+        if (req.uid) {
+          const regDoc = await db.collection(collections.conclaves).doc(cDoc.id).collection('registrations').doc(req.uid).get();
+          if (regDoc.exists) {
+            const reg = regDoc.data();
+            if (reg?.role === 'captain' || reg?.isCaptain === true || reg?.isTableCaptain === true) {
+              isCaptainRole = true;
+              break;
+            }
+          }
+        }
+
+        // 2. Check registrations by email in this active conclave
+        if (req.email) {
           const regSnap = await db.collection(collections.conclaves).doc(cDoc.id).collection('registrations')
             .where('email', '==', req.email)
             .limit(1)
             .get();
           if (!regSnap.empty) {
             const reg = regSnap.docs[0].data();
-            if (reg.role === 'captain' || reg.isCaptain === true || reg.isTableCaptain === true) {
+            if (reg?.role === 'captain' || reg?.isCaptain === true || reg?.isTableCaptain === true) {
               isCaptainRole = true;
               break;
             }
           }
         }
-      } catch (_) {}
-    }
 
-    // Fallback to static user profile flag if user doc explicitly has isCaptain: true AND a running conclave exists
-    if (!isCaptainRole && (data?.isCaptain === true || (data?.role || '').toLowerCase() === 'captain')) {
-      try {
-        const activeSnap = await db.collection(collections.conclaves)
-          .where('status', 'in', ['running', 'active', 'in_progress', 'ongoing'])
-          .limit(1)
-          .get();
-        if (!activeSnap.empty) {
+        // 3. Check participants in this active conclave document
+        const participants = Array.isArray(cData.participants) ? cData.participants : [];
+        const part = participants.find((p: any) =>
+          (req.email && p.email?.toLowerCase() === req.email.toLowerCase()) ||
+          (req.uid && (String(p.id) === String(req.uid) || p.uid === req.uid || p._originalUid === req.uid))
+        );
+        if (part && (part.role === 'captain' || part.isCaptain === true)) {
           isCaptainRole = true;
+          break;
         }
-      } catch (_) {}
-    }
+
+        // 4. Check if marked isCaptain while registered in this live conclave
+        if (data?.isCaptain === true && part) {
+          isCaptainRole = true;
+          break;
+        }
+      }
+    } catch (_) {}
 
     const dbRole = (data?.role || 'member').toLowerCase();
     const isSpecialRole = dbRole === 'superadmin' || dbRole === 'admin' || dbRole === 'regional_admin' || dbRole === 'coordinator';
