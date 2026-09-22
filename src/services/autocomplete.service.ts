@@ -59,7 +59,12 @@ export async function sweepFinishedConclaves(): Promise<number> {
     const anchor = toDate(d.currentRoundStartedAt);
     const roundCount = Number(d.roundCount) || 0;
     if (anchor && roundCount > 0) {
-      const endsAt = anchor.getTime() + roundCount * roundDurationMs(d);
+      // The anchor is the start of the last-started round (round 1 in the normal
+      // auto-advance flow); the rounds remaining from there are roundCount minus
+      // that base plus one, so completion doesn't assume the anchor is round 1.
+      const baseRound = Math.max(1, Number(d.currentRound) || 1);
+      const remaining = Math.max(1, roundCount - baseRound + 1);
+      const endsAt = anchor.getTime() + remaining * roundDurationMs(d);
       if (now > endsAt) done = true;
     }
 
