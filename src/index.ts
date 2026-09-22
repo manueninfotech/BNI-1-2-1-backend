@@ -1,6 +1,7 @@
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { startReminderScheduler } from "./services/reminder.service.js";
+import { startAutoCompleteSweep } from "./services/autocomplete.service.js";
 
 /**
  * Local development entrypoint.
@@ -24,4 +25,8 @@ app.listen(env.port, () => {
 
   // In-process scheduler for 1-2-1 reminders. No external cron needed.
   startReminderScheduler();
+
+  // In-process sweep that completes conclaves whose auto-advancing rounds have
+  // all elapsed (and clears any stale 'running'). No external cron needed.
+  startAutoCompleteSweep();
 });
