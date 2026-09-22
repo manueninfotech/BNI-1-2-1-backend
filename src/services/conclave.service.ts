@@ -123,9 +123,13 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
   try {
     const now = new Date();
 
-    // Preserve terminal cancelled status
-    if (data?.status === ConclaveStatus.cancelled) {
-      return { status: ConclaveStatus.cancelled, isRegistrationOpen: false };
+    // Preserve terminal statuses an admin has set explicitly (completed or
+    // cancelled). These are final decisions and must NOT be recomputed from the
+    // time window — otherwise a conclave ended early, before its scheduled
+    // endDateTime, or one whose rounds have run (currentRound > 0), flips back to
+    // "running" below and the app keeps showing it as a live conclave.
+    if (data?.status && TERMINAL_STATUSES.has(data.status)) {
+      return { status: data.status, isRegistrationOpen: false };
     }
 
     const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
