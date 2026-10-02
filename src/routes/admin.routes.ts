@@ -12,6 +12,12 @@ const router = Router();
  */
 router.use(requireAdmin);
 
+// Business categories (read live by the app from Firestore)
+router.get("/categories", asyncHandler(c.listCategories));
+router.put("/categories", asyncHandler(c.setCategories)); // replace whole list
+router.post("/categories", asyncHandler(c.addCategory)); // { name }
+router.post("/categories/remove", asyncHandler(c.removeCategory)); // { name }
+
 // Conclaves
 router.get("/conclaves", asyncHandler(c.list));
 router.get("/conclaves/:id", asyncHandler(c.getOne));

@@ -592,5 +592,9 @@ export async function deleteConclave(id: string) {
     throw ApiError.notFound(`Conclave with ID "${id}" does not exist.`);
   }
   await ref.delete();
+  // Without this the deleted conclave lingers in the cached list, so the admin
+  // dashboard summary and dropdowns keep showing it. Create/update/complete
+  // already clear the cache; delete was missed.
+  clearConclaveCache();
 }
 

@@ -11,6 +11,21 @@ import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
 import { fetchUsers } from "../services/user.service.js";
 import { uploadBufferToStorage } from "../services/storage.service.js";
+import * as categories from "../services/categories.service.js";
+
+// ---- Business categories (managed here, read live by the app) -------------
+export async function listCategories(_req: AuthedRequest, res: Response) {
+  res.json({ categories: await categories.listCategories() });
+}
+export async function setCategories(req: AuthedRequest, res: Response) {
+  res.json({ categories: await categories.setCategories(req.body?.categories) });
+}
+export async function addCategory(req: AuthedRequest, res: Response) {
+  res.json({ categories: await categories.addCategory(req.body?.name) });
+}
+export async function removeCategory(req: AuthedRequest, res: Response) {
+  res.json({ categories: await categories.removeCategory(req.body?.name) });
+}
 
 /** Fetch the admin doc for the caller — used to scope by region. */
 async function getAdminDoc(uid: string, email?: string) {
