@@ -8,6 +8,7 @@ import {
 } from "../domain/conclave.js";
 import { toDate, toIso } from "../utils/firestore.js";
 import { notifyConclave } from "./notification.service.js";
+import { resolveNotification, getConclaveDefaults } from "./settings.service.js";
 
 export const conclaveRef = (id: string) =>
   db.collection(collections.conclaves).doc(id);
@@ -239,8 +240,9 @@ export async function createConclave(input: CreateInput) {
     throw ApiError.badRequest("name and venueLocation are required.");
   }
 
-  const personsPerTable = input.personsPerTable ?? 7;
-  const roundCount = input.roundCount ?? 6;
+  const defaults = await getConclaveDefaults();
+  const personsPerTable = input.personsPerTable ?? defaults.personsPerTable;
+  const roundCount = input.roundCount ?? defaults.roundCount;
   validateConfig(personsPerTable, roundCount);
 
   const evalResult = evaluateConclaveStatus({
@@ -436,9 +438,10 @@ export async function completeConclave(id: string) {
     completedAt: new Date(),
   });
 
+  const endedMsg = await resolveNotification("conclaveEnded");
   await notifyConclave(id, {
-    title: "The conclave has ended",
-    body: "Open the app to see your summary, your referrals, and whether your data has synced.",
+    title: endedMsg.title,
+    body: endedMsg.body,
     data: { conclaveId: id, type: "conclave_completed" },
   });
 
@@ -496,9 +499,10 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
   });
 
   try {
+    const startedMsg = await resolveNotification("roundStarted", { round: roundNumber });
     await notifyConclave(id, {
-      title: `Round ${roundNumber} has started`,
-      body: "Go to your table — open the app to see who you're sitting with.",
+      title: startedMsg.title,
+      body: startedMsg.body,
       data: { conclaveId: id, roundNumber: String(roundNumber), type: "round_started" },
     });
   } catch {}

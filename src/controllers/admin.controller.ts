@@ -12,6 +12,33 @@ import * as passwordReset from "../services/passwordReset.service.js";
 import { fetchUsers } from "../services/user.service.js";
 import { uploadBufferToStorage } from "../services/storage.service.js";
 import * as categories from "../services/categories.service.js";
+import * as settings from "../services/settings.service.js";
+
+// ---- Admin-managed settings (round timing, defaults, regions, notifs) -----
+export async function getRoundTiming(_req: AuthedRequest, res: Response) {
+  res.json(await settings.getRoundTiming());
+}
+export async function setRoundTiming(req: AuthedRequest, res: Response) {
+  res.json(await settings.setRoundTiming(req.body || {}));
+}
+export async function getConclaveDefaults(_req: AuthedRequest, res: Response) {
+  res.json(await settings.getConclaveDefaults());
+}
+export async function setConclaveDefaults(req: AuthedRequest, res: Response) {
+  res.json(await settings.setConclaveDefaults(req.body || {}));
+}
+export async function getRegions(_req: AuthedRequest, res: Response) {
+  res.json({ regions: await settings.getRegions() });
+}
+export async function setRegions(req: AuthedRequest, res: Response) {
+  res.json({ regions: await settings.setRegions(req.body?.regions) });
+}
+export async function getNotificationTemplates(_req: AuthedRequest, res: Response) {
+  res.json(await settings.getNotificationTemplates());
+}
+export async function setNotificationTemplates(req: AuthedRequest, res: Response) {
+  res.json(await settings.setNotificationTemplates(req.body || {}));
+}
 
 // ---- Business categories (managed here, read live by the app) -------------
 export async function listCategories(_req: AuthedRequest, res: Response) {

@@ -5,6 +5,7 @@ import { ScheduleIndex } from "../domain/scheduleIndex.js";
 import { getConclaveOrThrow, conclaveRef, evaluateConclaveStatus, clearConclaveCache } from "./conclave.service.js";
 import { fetchUsers } from "./user.service.js";
 import { notifyUser, recordUserNotification } from "./notification.service.js";
+import { getNotificationTemplates, fillTemplate } from "./settings.service.js";
 import { getAllDocs, toIso } from "../utils/firestore.js";
 
 /** A row as the phone's sqflite stores it. Everything here is UNTRUSTED. */
@@ -308,11 +309,13 @@ export async function syncConclave(
   if (newReferralPings.length) {
     const giverIds = [...new Set(newReferralPings.map((p) => p.fromUserId))];
     const givers = await fetchUsers(giverIds);
+    // Admin-tuned template, fetched once for the whole batch.
+    const refTpl = (await getNotificationTemplates()).referralReceived;
     for (const p of newReferralPings) {
       const giverName = (givers.get(p.fromUserId) as any)?.name || "A member";
       const msg = {
-        title: "New referral 🎉",
-        body: `${giverName} just passed you a referral.`,
+        title: fillTemplate(refTpl.title, { giver: giverName }),
+        body: fillTemplate(refTpl.body, { giver: giverName }),
         data: { type: "referral_received", conclaveId, id: p.id },
       };
       void notifyUser(p.toUserId, msg, "referrals");

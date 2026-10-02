@@ -12,6 +12,16 @@ const router = Router();
  */
 router.use(requireAdmin);
 
+// Admin-managed settings
+router.get("/settings/round-timing", asyncHandler(c.getRoundTiming));
+router.put("/settings/round-timing", asyncHandler(c.setRoundTiming));
+router.get("/settings/conclave-defaults", asyncHandler(c.getConclaveDefaults));
+router.put("/settings/conclave-defaults", asyncHandler(c.setConclaveDefaults));
+router.get("/settings/regions", asyncHandler(c.getRegions));
+router.put("/settings/regions", asyncHandler(c.setRegions));
+router.get("/settings/notifications", asyncHandler(c.getNotificationTemplates));
+router.put("/settings/notifications", asyncHandler(c.setNotificationTemplates));
+
 // Business categories (read live by the app from Firestore)
 router.get("/categories", asyncHandler(c.listCategories));
 router.put("/categories", asyncHandler(c.setCategories)); // replace whole list

@@ -1,6 +1,7 @@
 import { db, collections } from "../config/firebase.js";
 import { ConclaveStatus } from "../domain/conclave.js";
 import { clearConclaveCache } from "./conclave.service.js";
+import { getRoundTiming, type RoundTiming } from "./settings.service.js";
 
 /**
  * Auto-completion sweep.
@@ -16,18 +17,15 @@ import { clearConclaveCache } from "./conclave.service.js";
  * No external cron — an in-process interval, like the 1-2-1 reminder scheduler.
  */
 
-const PER_PERSON_MS = 90 * 1000; // talking time per person (matches the app)
-const DEFAULT_BUFFER_MS = 2 * 60 * 1000; // move-to-next-table buffer
-
-/** Round length, mirroring the app's RoundTiming (auto-scaling, or a fixed override). */
-function roundDurationMs(data: any): number {
+/** Round length, mirroring the app's RoundTiming (admin-tuned, auto-scaling, or a fixed override). */
+function roundDurationMs(data: any, timing: RoundTiming): number {
   const p = Math.max(1, Number(data?.personsPerTable) || 1);
-  const active = PER_PERSON_MS * p;
+  const active = (timing.bioSeconds + timing.referralSeconds) * 1000 * p;
   const block = Number(data?.roundBlockMinutes);
   if (Number.isFinite(block) && block > 0) {
     return active + Math.max(0, block * 60 * 1000 - active);
   }
-  return active + DEFAULT_BUFFER_MS;
+  return active + timing.bufferSeconds * 1000;
 }
 
 function toDate(v: any): Date | null {
@@ -50,6 +48,7 @@ export async function sweepFinishedConclaves(): Promise<number> {
     .get();
 
   const now = Date.now();
+  const timing = await getRoundTiming(); // admin-tuned cadence; one read per sweep
   let completed = 0;
 
   for (const doc of snap.docs) {
@@ -64,7 +63,7 @@ export async function sweepFinishedConclaves(): Promise<number> {
       // that base plus one, so completion doesn't assume the anchor is round 1.
       const baseRound = Math.max(1, Number(d.currentRound) || 1);
       const remaining = Math.max(1, roundCount - baseRound + 1);
-      const endsAt = anchor.getTime() + remaining * roundDurationMs(d);
+      const endsAt = anchor.getTime() + remaining * roundDurationMs(d, timing);
       if (now > endsAt) done = true;
     }
 
