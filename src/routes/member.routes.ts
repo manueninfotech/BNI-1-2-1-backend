@@ -7,6 +7,7 @@ import * as c from "../controllers/member.controller.js";
 const router = Router();
 
 router.post("/auth/resolve-identifier", asyncHandler(c.resolveIdentifier));
+router.get("/categories", asyncHandler(c.listCategories));
 
 /**
  * Member endpoints. Every one requires a verified Firebase token — the caller's

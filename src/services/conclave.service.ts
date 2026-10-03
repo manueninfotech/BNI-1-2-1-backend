@@ -133,6 +133,15 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
       return { status: data.status, isRegistrationOpen: false };
     }
 
+    // Schedule locked check: If schedule is generated and locked, registration is strictly CLOSED
+    if (data?.isScheduleLocked === true || data?.status === "locked") {
+      const isLive = data?.status === ConclaveStatus.running;
+      return {
+        status: isLive ? ConclaveStatus.running : ConclaveStatus.registrationClosed,
+        isRegistrationOpen: false,
+      };
+    }
+
     const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
     const regEnd = data?.regEndDate ? toDate(data.regEndDate) : null;
 
@@ -183,7 +192,19 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
       return { status: ConclaveStatus.running, isRegistrationOpen: false };
     }
 
-    // 3. If start time has NOT started yet, it CANNOT be running:
+    // 3. Manual Registration Override (ON / OFF toggle)
+    // When ON ("open"), registrations stay open even after the registration close date passes until switched OFF ("closed").
+    const isOverrideOpen = data?.registrationOverride === "open" || data?.isRegistrationOpen === true;
+    const isOverrideClosed = data?.registrationOverride === "closed" || data?.isRegistrationOpen === false;
+
+    if (isOverrideOpen) {
+      return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
+    }
+    if (isOverrideClosed) {
+      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    }
+
+    // 4. Default: If start time has NOT started yet and no manual override, check reg dates:
     if (regEnd) {
       const regEndDay = new Date(regEnd);
       regEndDay.setHours(23, 59, 59, 999);
@@ -245,12 +266,15 @@ export async function createConclave(input: CreateInput) {
   const roundCount = input.roundCount ?? defaults.roundCount;
   validateConfig(personsPerTable, roundCount);
 
+  const regOverride = (input as any).registrationOverride ?? ((input as any).isRegistrationOpen !== undefined ? ((input as any).isRegistrationOpen ? "open" : "closed") : undefined);
   const evalResult = evaluateConclaveStatus({
     regStartDate: input.regStartDate,
     regEndDate: input.regEndDate,
     date: input.date,
     startDate: input.startDate,
     endDate: input.endDate,
+    registrationOverride: regOverride,
+    isRegistrationOpen: (input as any).isRegistrationOpen
   });
 
   const statusToSet = input.status || evalResult.status;
@@ -273,6 +297,8 @@ export async function createConclave(input: CreateInput) {
     chiefGuests: Array.isArray(input.chiefGuests) ? input.chiefGuests : [],
     status: statusToSet,
     isRegistrationOpen: isRegOpen,
+    registrationOverride: regOverride ?? (isRegOpen ? "open" : "closed"),
+    allowAdminAddMembers: Boolean((input as any).allowAdminAddMembers),
     personsPerTable,
     roundCount,
     memberLimit: Number(input.memberLimit) || 100,
@@ -324,6 +350,25 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
   if (body.startTime !== undefined) updates.startTime = normalizeTime(body.startTime);
   if (body.endTime !== undefined) updates.endTime = normalizeTime(body.endTime);
   if (body.status !== undefined) updates.status = body.status;
+  if (body.isRegistrationOpen !== undefined) {
+    const open = Boolean(body.isRegistrationOpen);
+    updates.isRegistrationOpen = open;
+    updates.registrationOverride = open ? "open" : "closed";
+  }
+  if (body.registrationOverride !== undefined) {
+    updates.registrationOverride = body.registrationOverride;
+    if (body.registrationOverride === "open") updates.isRegistrationOpen = true;
+    else if (body.registrationOverride === "closed") updates.isRegistrationOpen = false;
+  }
+  if (body.allowAdminAddMembers !== undefined) {
+    updates.allowAdminAddMembers = Boolean(body.allowAdminAddMembers);
+  }
+
+  if (data.isScheduleLocked || data.status === "locked") {
+    if (body.isRegistrationOpen === true || body.registrationOverride === "open") {
+      throw ApiError.conflict("Registration cannot be opened because the schedule is generated and locked.");
+    }
+  }
 
   const mergedData = { ...data, ...updates };
   const evalResult = evaluateConclaveStatus(mergedData);
@@ -362,16 +407,19 @@ export async function setRegistrationOpen(id: string, open: boolean) {
   const { ref, data } = await getConclaveOrThrow(id);
   const status = data.status ?? "";
 
-  if (TERMINAL_STATUSES.has(status) || status === ConclaveStatus.running) {
+  if (TERMINAL_STATUSES.has(status) || status === ConclaveStatus.running || data.isScheduleLocked || status === "locked") {
     throw ApiError.conflict(
-      `Cannot change registration on a conclave that is ${status}.`,
+      `Cannot change registration on a conclave whose schedule is locked or ${status}.`,
     );
   }
 
   await ref.update({
     isRegistrationOpen: open,
+    registrationOverride: open ? "open" : "closed",
     status: open ? ConclaveStatus.registrationOpen : ConclaveStatus.registrationClosed,
+    updatedAt: new Date(),
   });
+  clearConclaveCache();
 }
 
 /**
@@ -407,10 +455,13 @@ export async function cancelConclave(id: string) {
 /** Lock the schedule for a conclave without ending the conclave. */
 export async function lockConclaveSchedule(id: string) {
   const { ref, data } = await getConclaveOrThrow(id);
-  const evalResult = evaluateConclaveStatus(data);
   await ref.update({
     isScheduleLocked: true,
-    status: data.status === ConclaveStatus.completed ? ConclaveStatus.completed : evalResult.status,
+    isRegistrationOpen: false,
+    registrationOverride: "closed",
+    status: (data.status === ConclaveStatus.completed || data.status === ConclaveStatus.running)
+      ? data.status
+      : ConclaveStatus.registrationClosed,
     updatedAt: new Date()
   });
   clearConclaveCache();
@@ -592,16 +643,54 @@ export async function listConclaves(region?: string) {
     const list = await Promise.all(
       docs.map(async (doc: any) => {
         let regCount = 0;
+        let capCount = 0;
         try {
-          const count = await doc.ref.collection(collections.registrations).count().get();
-          regCount = count.data().count;
+          const [countSnap, capSnap] = await Promise.all([
+            doc.ref.collection(collections.registrations).count().get().catch(() => null),
+            doc.ref.collection(collections.registrations).where("role", "==", "captain").count().get().catch(() => null)
+          ]);
+          if (countSnap) regCount = countSnap.data().count;
+          if (capSnap) capCount = capSnap.data().count;
         } catch {
           // Ignore subcollection count error
         }
+
+        // Secondary check if role might be stored with different case or boolean
+        if (capCount === 0) {
+          try {
+            const [capSnapUpper, capSnapBool] = await Promise.all([
+              doc.ref.collection(collections.registrations).where("role", "==", "Captain").count().get().catch(() => null),
+              doc.ref.collection(collections.registrations).where("isTableCaptain", "==", true).count().get().catch(() => null),
+            ]);
+            if (capSnapUpper && capSnapUpper.data().count > 0) capCount = capSnapUpper.data().count;
+            else if (capSnapBool && capSnapBool.data().count > 0) capCount = capSnapBool.data().count;
+          } catch {}
+        }
+
         const d = doc.data();
         const countFromSubcoll = regCount;
         const countFromParticipants = Array.isArray(d.participants) ? d.participants.length : 0;
         const actualCount = countFromSubcoll > 0 ? countFromSubcoll : countFromParticipants;
+
+        const countFromParticipantsCaptains = Array.isArray(d.participants)
+          ? d.participants.filter((p: any) => p.role === "captain" || p.role === "Captain" || p.isCaptain || p.isTableCaptain).length
+          : 0;
+        const countFromCaptainsArray = Array.isArray(d.captains)
+          ? d.captains.length
+          : (typeof d.captains === "number" ? d.captains : 0);
+        const countFromSchedule = Array.isArray(d.schedule?.rounds?.[0]?.tables)
+          ? new Set(d.schedule.rounds[0].tables.map((t: any) => t.captainId).filter(Boolean)).size
+          : (typeof d.scheduleSummary?.tableCount === "number" ? d.scheduleSummary.tableCount : 0);
+
+        const actualCaptains = capCount > 0
+          ? capCount
+          : (Number(d.captainCount) > 0
+            ? Number(d.captainCount)
+            : (countFromParticipantsCaptains > 0
+              ? countFromParticipantsCaptains
+              : (countFromCaptainsArray > 0
+                ? countFromCaptainsArray
+                : countFromSchedule)));
 
         // Self-heal: If status was marked completed before any rounds were run, reset to dynamic status
         if (d.status === "completed" && (!d.currentRound || d.currentRound === 0)) {
@@ -628,6 +717,10 @@ export async function listConclaves(region?: string) {
           createdAt: toIso(d.createdAt),
           updatedAt: toIso(d.updatedAt),
           registrationCount: actualCount,
+          memberCount: actualCount,
+          membersCount: actualCount,
+          captainCount: actualCaptains,
+          captainsCount: actualCaptains,
         };
         conclaveDocCache.set(doc.id, { ref: doc.ref, data: d, doc });
         return item;

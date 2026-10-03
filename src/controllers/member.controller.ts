@@ -11,6 +11,7 @@ import {
   recordUserNotification,
 } from "../services/notification.service.js";
 import { ApiError } from "../middleware/errors.js";
+import * as categories from "../services/categories.service.js";
 
 export async function listNotifications(req: AuthedRequest, res: Response) {
   const snap = await db
@@ -964,6 +965,15 @@ export async function resolveIdentifier(req: any, res: Response) {
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message || "Failed to resolve identifier." });
+  }
+}
+
+export async function listCategories(_req: any, res: Response) {
+  try {
+    const list = await categories.listCategories();
+    res.json({ categories: list });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to list categories." });
   }
 }
 

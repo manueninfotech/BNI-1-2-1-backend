@@ -11,6 +11,8 @@ import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
 import { fetchUsers } from "../services/user.service.js";
 import { uploadBufferToStorage } from "../services/storage.service.js";
+import { FieldValue } from "firebase-admin/firestore";
+import { ApiError } from "../middleware/errors.js";
 import * as categories from "../services/categories.service.js";
 import * as settings from "../services/settings.service.js";
 
@@ -86,6 +88,13 @@ async function getAdminDoc(uid: string, email?: string) {
   }
 }
 
+function isSuperAdmin(admin: Record<string, any> | null, email?: string): boolean {
+  if (!admin && !email) return false;
+  if (admin?.role === "superadmin") return true;
+  const normalizedEmail = (email || admin?.email || "").toLowerCase().trim();
+  return normalizedEmail.includes("superadmin");
+}
+
 export async function list(req: AuthedRequest, res: Response) {
   try {
     const admin = await getAdminDoc(req.uid, req.email);
@@ -107,9 +116,45 @@ export async function list(req: AuthedRequest, res: Response) {
 export async function getOne(req: AuthedRequest, res: Response) {
   const { data, doc } = await conclaves.getConclaveOrThrow(req.params.id);
   const d = data as any;
+  let regCount = 0;
+  let capCount = 0;
+  try {
+    const [cSnap, capSnap] = await Promise.all([
+      doc.ref.collection(collections.registrations).count().get().catch(() => null),
+      doc.ref.collection(collections.registrations).where("role", "==", "captain").count().get().catch(() => null),
+    ]);
+    if (cSnap) regCount = cSnap.data().count;
+    if (capSnap) capCount = capSnap.data().count;
+  } catch {}
+
+  if (capCount === 0) {
+    try {
+      const [capSnapUpper, capSnapBool] = await Promise.all([
+        doc.ref.collection(collections.registrations).where("role", "==", "Captain").count().get().catch(() => null),
+        doc.ref.collection(collections.registrations).where("isTableCaptain", "==", true).count().get().catch(() => null),
+      ]);
+      if (capSnapUpper && capSnapUpper.data().count > 0) capCount = capSnapUpper.data().count;
+      else if (capSnapBool && capSnapBool.data().count > 0) capCount = capSnapBool.data().count;
+    } catch {}
+  }
+
+  const memberCount = regCount || (Array.isArray(d.participants) ? d.participants.length : 0);
+  const countFromParticipantsCaptains = Array.isArray(d.participants)
+    ? d.participants.filter((p: any) => p.role === "captain" || p.role === "Captain" || p.isCaptain || p.isTableCaptain).length
+    : 0;
+  const countFromSchedule = Array.isArray(d.schedule?.rounds?.[0]?.tables)
+    ? new Set(d.schedule.rounds[0].tables.map((t: any) => t.captainId).filter(Boolean)).size
+    : 0;
+  const captainCount = capCount > 0 ? capCount : (Number(d.captainCount) > 0 ? Number(d.captainCount) : (countFromParticipantsCaptains > 0 ? countFromParticipantsCaptains : countFromSchedule));
+
   res.json({
     id: doc.id,
     ...d,
+    memberCount,
+    membersCount: memberCount,
+    registrationCount: memberCount,
+    captainCount,
+    captainsCount: captainCount,
     date: toDate(d.date)?.toISOString() ?? null,
     startDate: toDate(d.startDate || d.date)?.toISOString() ?? null,
     endDate: toDate(d.endDate)?.toISOString() ?? null,
@@ -270,6 +315,305 @@ export async function setRole(req: AuthedRequest, res: Response) {
   const role = req.body?.role as roles.Role;
   await roles.setRole(id, uid, role);
   res.json({ message: `Role set to ${role}.`, uid, role });
+}
+
+export async function getConclavePermissions(req: AuthedRequest, res: Response) {
+  const { data } = await conclaves.getConclaveOrThrow(req.params.id);
+  const admin = await getAdminDoc(req.uid, req.email);
+  const isSuper = isSuperAdmin(admin, req.email);
+  const isLocked = Boolean(data.isScheduleLocked || data.status === "locked");
+  const evalResult = conclaves.evaluateConclaveStatus(data);
+  res.json({
+    conclaveId: req.params.id,
+    allowAdminAddMembers: Boolean(data.allowAdminAddMembers),
+    isSuperAdmin: isSuper,
+    isScheduleLocked: isLocked,
+    isRegistrationOpen: !isLocked && evalResult.isRegistrationOpen,
+    canAddMembers: !isLocked && (isSuper || Boolean(data.allowAdminAddMembers)),
+  });
+}
+
+export async function setConclavePermissions(req: AuthedRequest, res: Response) {
+  const admin = await getAdminDoc(req.uid, req.email);
+  const isSuper = isSuperAdmin(admin, req.email);
+  if (!isSuper) {
+    throw ApiError.forbidden("Only superadmin can configure member addition permissions for conclaves.");
+  }
+  const { allowAdminAddMembers } = req.body ?? {};
+  if (typeof allowAdminAddMembers !== "boolean") {
+    throw ApiError.badRequest("Body must be { allowAdminAddMembers: boolean }.");
+  }
+  const { ref, data } = await conclaves.getConclaveOrThrow(req.params.id);
+  if (data.isScheduleLocked || data.status === "locked") {
+    throw ApiError.conflict("Cannot modify member permissions because this conclave schedule is generated and locked.");
+  }
+  await ref.update({
+    allowAdminAddMembers,
+    updatedAt: new Date(),
+  });
+  conclaves.clearConclaveCache();
+  res.json({
+    message: allowAdminAddMembers
+      ? "Permission granted: Admins can now add members to this conclave."
+      : "Permission revoked: Admins can no longer add members to this conclave.",
+    conclaveId: req.params.id,
+    allowAdminAddMembers,
+  });
+}
+
+export async function addMemberToConclave(req: AuthedRequest, res: Response) {
+  const conclaveId = req.params.id;
+  const admin = await getAdminDoc(req.uid, req.email);
+  const isSuper = isSuperAdmin(admin, req.email);
+  const { data: conclave, ref: conclaveDocRef } = await conclaves.getConclaveOrThrow(conclaveId);
+
+  // If schedule is generated and locked, even admin cannot add members to that conclave
+  if (conclave.isScheduleLocked || conclave.status === "locked") {
+    throw ApiError.conflict("Cannot add members to this conclave because the schedule is generated and locked.");
+  }
+
+  if (conclave.status === "completed" || conclave.status === "cancelled" || conclave.status === "running") {
+    throw ApiError.conflict(`Cannot add members to a conclave that is ${conclave.status}.`);
+  }
+
+  // Superadmin has full permission. Regular admin requires allowAdminAddMembers to be true.
+  if (!isSuper && !conclave.allowAdminAddMembers) {
+    throw ApiError.forbidden(
+      "Admins do not have permission to add members to this conclave. Permission must be granted by Superadmin."
+    );
+  }
+
+  const body = req.body || {};
+  let targetUid = String(body.userId || body.uid || "").trim();
+  let userData: Record<string, any> = {};
+
+  if (targetUid) {
+    const uDoc = await db.collection(collections.users).doc(targetUid).get();
+    if (uDoc.exists) {
+      userData = uDoc.data() || {};
+    }
+  } else {
+    const email = String(body.email || "").toLowerCase().trim();
+    const phone = String(body.phone || body.mobile || "").trim();
+
+    if (!email && !phone && !body.name) {
+      throw ApiError.badRequest("Please provide either userId or member details (name, email, or phone).");
+    }
+
+    if (email) {
+      const snap = await db.collection(collections.users).where("email", "==", email).limit(1).get();
+      if (!snap.empty) {
+        targetUid = snap.docs[0].id;
+        userData = snap.docs[0].data();
+      }
+    }
+
+    if (!targetUid && phone) {
+      const snap = await db.collection(collections.users).where("phone", "==", phone).limit(1).get();
+      if (!snap.empty) {
+        targetUid = snap.docs[0].id;
+        userData = snap.docs[0].data();
+      }
+    }
+
+    // If member not found in users collection, create a user record
+    if (!targetUid) {
+      targetUid = `usr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const newUserDoc = {
+        name: body.name || "BNI Member",
+        email: email || "",
+        phone: phone || "",
+        company: body.company || body.businessName || "",
+        category: body.category || body.businessCategory || "",
+        chapter: body.chapter || "",
+        region: body.region || conclave.region || "Global",
+        state: body.state || "",
+        country: body.country || "",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      await db.collection(collections.users).doc(targetUid).set(newUserDoc);
+      userData = newUserDoc;
+    }
+  }
+
+  // Capacity check
+  try {
+    const regCountSnap = await conclaveDocRef.collection(collections.registrations).count().get();
+    const currentCount = regCountSnap.data().count;
+    if (conclave.memberLimit && currentCount >= conclave.memberLimit && !isSuper) {
+      throw ApiError.conflict(`Conclave capacity limit reached (${conclave.memberLimit} members).`);
+    }
+  } catch (err: any) {
+    if (err instanceof ApiError) throw err;
+  }
+
+  const regRef = conclaveDocRef.collection(collections.registrations).doc(targetUid);
+  const existingReg = await regRef.get();
+  if (existingReg.exists) {
+    throw ApiError.conflict("This member is already registered for this conclave.");
+  }
+
+  const role = body.role === "captain" ? "captain" : "member";
+  const name = body.name || userData.name || "BNI Member";
+  const email = (body.email || userData.email || "").toLowerCase().trim();
+  const phone = body.phone || body.mobile || userData.phone || userData.mobile || "";
+  const company = body.company || body.businessName || userData.company || userData.businessName || "";
+  const category = body.category || body.businessCategory || userData.category || userData.businessCategory || "";
+  const chapter = body.chapter || userData.chapter || "";
+  const region = body.region || userData.region || conclave.region || "";
+  const state = body.state || userData.state || conclave.state || "";
+  const country = body.country || userData.country || conclave.country || "";
+
+  const regData: Record<string, any> = {
+    userId: targetUid,
+    name,
+    email,
+    phone,
+    company,
+    category,
+    chapter,
+    region,
+    state,
+    country,
+    role,
+    status: "confirmed",
+    registeredAt: new Date(),
+    addedBy: {
+      uid: req.uid,
+      email: req.email || admin?.email || "",
+      role: isSuper ? "superadmin" : "admin",
+      addedAt: new Date(),
+    },
+    payment: {
+      method: body.paymentMethod || "admin_direct",
+      status: "paid",
+      amount: conclave.registrationFee || 0,
+      currency: "INR",
+      paidAt: new Date(),
+    },
+  };
+
+  await regRef.set(regData);
+
+  // Sync to user profile conclaveIds
+  await db.collection(collections.users).doc(targetUid).set({
+    conclaveIds: FieldValue.arrayUnion(conclaveId),
+    updatedAt: new Date(),
+  }, { merge: true }).catch(() => {});
+
+  conclaves.clearConclaveCache();
+
+  res.status(201).json({
+    message: `Member ${name} added successfully to ${conclave.name}.`,
+    registration: regData,
+  });
+}
+
+export async function updateMemberInConclave(req: AuthedRequest, res: Response) {
+  const conclaveId = req.params.id;
+  const memberUid = req.params.uid;
+  const admin = await getAdminDoc(req.uid, req.email);
+  const isSuper = isSuperAdmin(admin, req.email);
+  const { data: conclave, ref: conclaveDocRef } = await conclaves.getConclaveOrThrow(conclaveId);
+
+  // Superadmin has full permission. Regular admin requires allowAdminAddMembers to be true.
+  if (!isSuper && !conclave.allowAdminAddMembers) {
+    throw ApiError.forbidden(
+      "Admins do not have permission to edit members in this conclave. Permission must be granted by Superadmin."
+    );
+  }
+
+  const regRef = conclaveDocRef.collection(collections.registrations).doc(memberUid);
+  const regSnap = await regRef.get();
+  if (!regSnap.exists) {
+    throw ApiError.notFound("Registration not found for this member in this conclave.");
+  }
+
+  const body = req.body || {};
+
+  if ((conclave.isScheduleLocked || conclave.status === "locked") && body.role !== undefined && body.role !== regSnap.data()?.role) {
+    throw ApiError.conflict("Cannot change member role because the schedule is generated and locked.");
+  }
+  const updates: Record<string, any> = {
+    updatedAt: new Date(),
+  };
+
+  if (body.name !== undefined) updates.name = String(body.name).trim();
+  if (body.email !== undefined) updates.email = String(body.email).toLowerCase().trim();
+  if (body.phone !== undefined || body.mobile !== undefined) updates.phone = String(body.phone || body.mobile).trim();
+  if (body.company !== undefined || body.businessName !== undefined) updates.company = String(body.company || body.businessName).trim();
+  if (body.category !== undefined || body.businessCategory !== undefined) updates.category = String(body.category || body.businessCategory).trim();
+  if (body.chapter !== undefined) updates.chapter = String(body.chapter).trim();
+  if (body.region !== undefined) updates.region = String(body.region).trim();
+  if (body.state !== undefined) updates.state = String(body.state).trim();
+  if (body.country !== undefined) updates.country = String(body.country).trim();
+  if (body.role !== undefined) updates.role = body.role === "captain" ? "captain" : "member";
+  if (body.status !== undefined) updates.status = body.status;
+
+  await regRef.set(updates, { merge: true });
+
+  // Sync to users collection doc
+  const userUpdates: Record<string, any> = {
+    updatedAt: new Date(),
+  };
+  if (updates.name) userUpdates.name = updates.name;
+  if (updates.email) userUpdates.email = updates.email;
+  if (updates.phone) userUpdates.phone = updates.phone;
+  if (updates.company) userUpdates.company = updates.company;
+  if (updates.category) userUpdates.category = updates.category;
+  if (updates.chapter) userUpdates.chapter = updates.chapter;
+  if (updates.region) userUpdates.region = updates.region;
+  if (updates.state) userUpdates.state = updates.state;
+  if (updates.country) userUpdates.country = updates.country;
+
+  await db.collection(collections.users).doc(memberUid).set(userUpdates, { merge: true }).catch(() => {});
+
+  conclaves.clearConclaveCache();
+
+  res.json({
+    message: "Member registration updated successfully.",
+    member: {
+      userId: memberUid,
+      ...regSnap.data(),
+      ...updates,
+    },
+  });
+}
+
+export async function removeMemberFromConclave(req: AuthedRequest, res: Response) {
+  const conclaveId = req.params.id;
+  const memberUid = req.params.uid;
+  const admin = await getAdminDoc(req.uid, req.email);
+  const isSuper = isSuperAdmin(admin, req.email);
+  const { data: conclave, ref: conclaveDocRef } = await conclaves.getConclaveOrThrow(conclaveId);
+
+  if (!isSuper && !conclave.allowAdminAddMembers) {
+    throw ApiError.forbidden(
+      "Admins do not have permission to manage members for this conclave. Permission must be granted by Superadmin."
+    );
+  }
+
+  if (conclave.isScheduleLocked || conclave.status === "locked") {
+    throw ApiError.conflict("Cannot remove members from this conclave because the schedule is generated and locked.");
+  }
+
+  const regRef = conclaveDocRef.collection(collections.registrations).doc(memberUid);
+  const regSnap = await regRef.get();
+  if (!regSnap.exists) {
+    throw ApiError.notFound("Registration not found for this member in this conclave.");
+  }
+
+  await regRef.delete();
+
+  await db.collection(collections.users).doc(memberUid).set({
+    conclaveIds: FieldValue.arrayRemove(conclaveId),
+    updatedAt: new Date(),
+  }, { merge: true }).catch(() => {});
+
+  conclaves.clearConclaveCache();
+
+  res.json({ message: "Member removed from conclave successfully." });
 }
 
 export async function statistics(req: AuthedRequest, res: Response) {
@@ -471,29 +815,36 @@ export async function listRegions(_req: AuthedRequest, res: Response) {
     db.collection(collections.users).get()
   ]);
 
-  // Map of region name -> conclaves count
+  // Normalize helper
+  const normKey = (str: string) => String(str || "").toLowerCase().replace(/\s+region$/, "").trim();
+
+  // Map of normalized region name -> conclaves count
   const conclaveCounts: Record<string, number> = {};
   conclavesSnap.docs.forEach(doc => {
     const data = doc.data();
-    const reg = data.region || "Global";
+    const reg = normKey(data.region || "Global");
     conclaveCounts[reg] = (conclaveCounts[reg] || 0) + 1;
   });
 
-  // Map of region name -> members count
+  // Map of normalized region name -> members count
   const memberCounts: Record<string, number> = {};
   usersSnap.docs.forEach(doc => {
     const data = doc.data();
     const loc = data.location;
-    const reg = data.region || (loc ? (typeof loc === "object" ? loc.place : loc) : undefined) || "Global";
+    const reg = normKey(data.region || (loc ? (typeof loc === "object" ? loc.place : loc) : undefined) || "Global");
     memberCounts[reg] = (memberCounts[reg] || 0) + 1;
   });
 
-  // Attach counts to regions list
-  const list = regionsList.map(r => ({
-    ...r,
-    conclavesCount: conclaveCounts[r.name] || 0,
-    membersCount: memberCounts[r.name] || 0
-  }));
+  // Attach counts to regions list (matching with normalization)
+  const list = regionsList.map(r => {
+    const k = normKey(r.name);
+    return {
+      ...r,
+      name: r.name ? r.name.trim() : r.name,
+      conclavesCount: conclaveCounts[k] || 0,
+      membersCount: memberCounts[k] || 0
+    };
+  });
 
   res.json(list);
 }

@@ -25,11 +25,13 @@ export async function assertRegisterable(conclaveId: string, uid: string) {
 
   if (
     conclave.isRegistrationOpen === false ||
+    conclave.isScheduleLocked === true ||
+    conclave.status === "locked" ||
     conclave.status === "completed" ||
     conclave.status === "ended" ||
     conclave.status === "cancelled"
   ) {
-    throw ApiError.conflict("Registration is not open for this conclave.");
+    throw ApiError.conflict("Registration is closed for this conclave.");
   }
 
   const myReg = conclaveRef(conclaveId).collection(collections.registrations).doc(uid);

@@ -47,9 +47,16 @@ router.post("/conclaves/:id/start-round", asyncHandler(c.startRound));
 // Scheduling
 router.post("/conclaves/:id/generate-schedule", asyncHandler(c.generate));
 
-// People
+// People & Member Management
 router.get("/conclaves/:id/registrations", asyncHandler(c.registrations));
 router.post("/conclaves/:id/registrations/:uid/role", asyncHandler(c.setRole));
+router.get("/conclaves/:id/permissions", asyncHandler(c.getConclavePermissions));
+router.put("/conclaves/:id/permissions", asyncHandler(c.setConclavePermissions));
+router.post("/conclaves/:id/permissions", asyncHandler(c.setConclavePermissions));
+router.post("/conclaves/:id/members", asyncHandler(c.addMemberToConclave));
+router.put("/conclaves/:id/members/:uid", asyncHandler(c.updateMemberInConclave));
+router.patch("/conclaves/:id/members/:uid", asyncHandler(c.updateMemberInConclave));
+router.delete("/conclaves/:id/members/:uid", asyncHandler(c.removeMemberFromConclave));
 
 // Dashboard
 router.get("/conclaves/:id/stats", asyncHandler(c.statistics));
