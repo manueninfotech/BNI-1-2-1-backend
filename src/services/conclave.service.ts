@@ -7,7 +7,7 @@ import {
   TERMINAL_STATUSES,
 } from "../domain/conclave.js";
 import { toDate, toIso } from "../utils/firestore.js";
-import { notifyConclave } from "./notification.service.js";
+import { notifyConclave, notifyUser } from "./notification.service.js";
 import { resolveNotification, getConclaveDefaults } from "./settings.service.js";
 
 export const conclaveRef = (id: string) =>
@@ -414,6 +414,53 @@ export async function lockConclaveSchedule(id: string) {
     updatedAt: new Date()
   });
   clearConclaveCache();
+  // Publishing the schedule is when everyone should be told: members that their
+  // schedule is ready, captains which table they're anchoring. Best-effort.
+  try { await notifyScheduleReady(id); } catch {}
+}
+
+/**
+ * Tells every registered member their schedule is ready, and every captain the
+ * table they're anchoring. Sent to each person's PERSONAL topic (subscribed on
+ * sign-in), so it reaches them wherever they are in the app. Per-user
+ * best-effort — one failure never blocks the rest.
+ */
+export async function notifyScheduleReady(id: string): Promise<{ captains: number; members: number }> {
+  const { ref } = await getConclaveOrThrow(id);
+  const regs = await ref.collection(collections.registrations).get();
+  let captains = 0;
+  let members = 0;
+  for (const reg of regs.docs) {
+    const r: any = reg.data();
+    try {
+      if (r.role === "captain") {
+        await notifyUser(
+          reg.id,
+          {
+            title: "You're a Table Captain ⭐",
+            body: `You're the captain for Table ${r.tableNumber ?? "your table"}. Please take your table and get ready to scan.`,
+            data: { conclaveId: id, type: "captain_assignment", tableNumber: String(r.tableNumber ?? "") },
+          },
+          "round_alerts",
+        );
+        captains++;
+      } else {
+        await notifyUser(
+          reg.id,
+          {
+            title: "Your conclave schedule is ready 📋",
+            body: "Tap to view your table and who you'll be meeting.",
+            data: { conclaveId: id, type: "schedule_ready" },
+          },
+          "general",
+        );
+        members++;
+      }
+    } catch {
+      // keep going; a single bad token must not stop the broadcast
+    }
+  }
+  return { captains, members };
 }
 
 /**
@@ -500,11 +547,19 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
 
   try {
     const startedMsg = await resolveNotification("roundStarted", { round: roundNumber });
-    await notifyConclave(id, {
-      title: startedMsg.title,
-      body: startedMsg.body,
-      data: { conclaveId: id, roundNumber: String(roundNumber), type: "round_started" },
-    });
+    const roundData = {
+      conclaveId: id,
+      roundNumber: String(roundNumber),
+      type: "round_started",
+    };
+    await notifyConclave(id, { title: startedMsg.title, body: startedMsg.body, data: roundData });
+    // Also hit each registered member's PERSONAL topic. They subscribe to that
+    // on sign-in, whereas the conclave topic is only subscribed on the active-
+    // round screen — so a topic-only push reaches almost no one before rounds.
+    const roundRegs = await ref.collection(collections.registrations).get();
+    for (const reg of roundRegs.docs) {
+      void notifyUser(reg.id, { title: startedMsg.title, body: startedMsg.body, data: roundData }, "round_alerts").catch(() => {});
+    }
   } catch {}
 
   return roundStartedAt;
