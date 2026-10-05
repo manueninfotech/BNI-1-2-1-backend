@@ -21,6 +21,7 @@ export interface UserDoc {
   region?: string;
   state?: string;
   country?: string;
+  membership?: string;
   createdAt?: unknown;
   lastLoginAt?: unknown;
 }
@@ -113,6 +114,8 @@ export async function listRegistrants(conclaveId: string): Promise<Registrant[]>
       createdAt: toIso(u?.createdAt) || toIso(reg?.registeredAt) || new Date().toISOString(),
       isActive: isActiveUser(u, autoLogoutHours, now),
       lastLoginAt: toIso(u?.lastLoginAt),
+      payment: reg?.payment || null,
+      membership: u?.membership ?? reg?.membership ?? "BNI",
     };
   });
 

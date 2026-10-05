@@ -203,22 +203,27 @@ export async function me(req: AuthedRequest, res: Response) {
     const userDoc = await db.collection(collections.users).doc(req.uid).get();
     let data = (userDoc.exists ? userDoc.data() : null) as any;
 
-    if (!data && req.email) {
+    // If profile is missing or only contains login timestamps without member details, find by email
+    const hasProfileDetails = data && (data.name && data.name !== "Member" && data.name.trim() !== "");
+    if (!hasProfileDetails && req.email) {
       const emailSnap = await db.collection(collections.users)
-        .where('email', '==', req.email)
+        .where('email', '==', req.email.toLowerCase().trim())
         .limit(1)
         .get();
       if (!emailSnap.empty) {
-        data = emailSnap.docs[0].data() as any;
-      }
-
-      if (!data) {
+        const found = emailSnap.docs[0].data();
+        data = { ...found, ...(data || {}) };
+        // Sync full profile into this UID doc so future queries are instant
+        await db.collection(collections.users).doc(req.uid).set(found, { merge: true }).catch(() => {});
+      } else {
         const identSnap = await db.collection(collections.users)
-          .where('identifier', '==', req.email)
+          .where('identifier', '==', req.email.toLowerCase().trim())
           .limit(1)
           .get();
         if (!identSnap.empty) {
-          data = identSnap.docs[0].data() as any;
+          const found = identSnap.docs[0].data();
+          data = { ...found, ...(data || {}) };
+          await db.collection(collections.users).doc(req.uid).set(found, { merge: true }).catch(() => {});
         }
       }
     }
@@ -296,10 +301,11 @@ export async function me(req: AuthedRequest, res: Response) {
       name: data?.name || "Member",
       email: data?.email || req.email || "",
       phone: data?.phone || "",
-      company: data?.businessName || "",
-      category: data?.businessCategory || "",
+      company: data?.company || data?.businessName || "",
+      category: data?.category || data?.businessCategory || "",
       chapter: data?.chapter || "",
       location: data?.location || "",
+      membership: data?.membership || "BNI",
       createdAt: toISO(data?.createdAt || data?.registeredAt),
       role: finalRole,
       isCaptain: isCaptainRole,
@@ -312,6 +318,7 @@ export async function me(req: AuthedRequest, res: Response) {
       id: req.uid,
       name: isErrSuper ? "Superadmin" : isErrAdmin ? "Admin" : "Member",
       email: req.email || "",
+      membership: "BNI",
       role: isErrSuper ? "superadmin" : isErrAdmin ? "admin" : "member"
     });
   }
@@ -319,7 +326,7 @@ export async function me(req: AuthedRequest, res: Response) {
 
 export async function updateMe(req: AuthedRequest, res: Response) {
   try {
-    const { name, email, phone, mobile, company, businessName, category, businessCategory, chapter, region, designation, organization } = req.body ?? {};
+    const { name, email, phone, mobile, company, businessName, category, businessCategory, chapter, region, designation, organization, membership } = req.body ?? {};
 
     const updates: any = { id: req.uid };
     if (name !== undefined) updates.name = name;
@@ -347,6 +354,7 @@ export async function updateMe(req: AuthedRequest, res: Response) {
       updates.region = region;
       updates.location = String(region).toLowerCase();
     }
+    if (membership !== undefined) updates.membership = String(membership).trim();
     if (designation !== undefined) updates.designation = designation;
     if (organization !== undefined) updates.organization = organization;
     updates.country = updates.country ?? "India";
@@ -976,4 +984,41 @@ export async function listCategories(_req: any, res: Response) {
     res.status(500).json({ error: err.message || "Failed to list categories." });
   }
 }
+
+export async function checkEmail(req: any, res: Response) {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ exists: false, error: "Please provide a valid email address." });
+    }
+
+    // 1. Check Firebase Auth
+    let authUser = null;
+    try {
+      authUser = await auth.getUserByEmail(email);
+    } catch (_) {}
+
+    if (authUser) {
+      return res.json({ exists: true, email: authUser.email, uid: authUser.uid });
+    }
+
+    // 2. Check Firestore users collection
+    const snap = await db.collection(collections.users)
+      .where("email", "==", email)
+      .limit(1)
+      .get();
+
+    if (!snap.empty) {
+      return res.json({ exists: true, email, uid: snap.docs[0].id });
+    }
+
+    return res.json({
+      exists: false,
+      error: "No account found with this email address. Please make sure you are registered or create an account."
+    });
+  } catch (err: any) {
+    return res.status(500).json({ exists: false, error: err.message || "Failed to verify email." });
+  }
+}
+
 

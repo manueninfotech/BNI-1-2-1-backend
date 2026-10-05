@@ -7,6 +7,7 @@ import * as c from "../controllers/member.controller.js";
 const router = Router();
 
 router.post("/auth/resolve-identifier", asyncHandler(c.resolveIdentifier));
+router.post("/auth/check-email", asyncHandler(c.checkEmail));
 router.get("/categories", asyncHandler(c.listCategories));
 
 /**

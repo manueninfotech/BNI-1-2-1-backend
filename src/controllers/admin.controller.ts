@@ -386,6 +386,7 @@ export async function addMemberToConclave(req: AuthedRequest, res: Response) {
   const body = req.body || {};
   let targetUid = String(body.userId || body.uid || "").trim();
   let userData: Record<string, any> = {};
+  let defaultPasswordAssigned: string | undefined = undefined;
 
   if (targetUid) {
     const uDoc = await db.collection(collections.users).doc(targetUid).get();
@@ -416,12 +417,45 @@ export async function addMemberToConclave(req: AuthedRequest, res: Response) {
       }
     }
 
-    // If member not found in users collection, create a user record
+    // If member not found in users collection, create a user record and Firebase Auth account
+    const cleanPhone = phone.replace(/\D/g, "");
     if (!targetUid) {
-      targetUid = `usr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const defaultPassword = cleanPhone.length >= 6
+        ? (cleanPhone.length >= 10 ? cleanPhone.slice(-10) : cleanPhone)
+        : "Bni@1234";
+      const authEmail = email
+        ? email
+        : (cleanPhone.length >= 10
+            ? `${cleanPhone.slice(-10)}@bni121.conclave`
+            : `usr_${Date.now()}@bni121.conclave`);
+
+      let authUserRecord: any = null;
+      try {
+        authUserRecord = await auth.createUser({
+          email: authEmail,
+          password: defaultPassword,
+          displayName: body.name || "BNI Member",
+        });
+        targetUid = authUserRecord.uid;
+        defaultPasswordAssigned = defaultPassword;
+      } catch (authErr: any) {
+        if (authErr?.code === "auth/email-already-exists") {
+          try {
+            const existingAuthUser = await auth.getUserByEmail(authEmail);
+            targetUid = existingAuthUser.uid;
+          } catch (_) {
+            targetUid = `usr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+          }
+        } else {
+          console.warn("[addMemberToConclave] auth.createUser error:", authErr?.message);
+          targetUid = `usr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        }
+      }
+
       const newUserDoc = {
         name: body.name || "BNI Member",
         email: email || "",
+        authEmail: authEmail,
         phone: phone || "",
         company: body.company || body.businessName || "",
         category: body.category || body.businessCategory || "",
@@ -429,10 +463,11 @@ export async function addMemberToConclave(req: AuthedRequest, res: Response) {
         region: body.region || conclave.region || "Global",
         state: body.state || "",
         country: body.country || "",
+        defaultPasswordAssigned: defaultPasswordAssigned || null,
         createdAt: new Date(),
         updatedAt: new Date(),
       };
-      await db.collection(collections.users).doc(targetUid).set(newUserDoc);
+      await db.collection(collections.users).doc(targetUid).set(newUserDoc, { merge: true });
       userData = newUserDoc;
     }
   }
@@ -487,9 +522,10 @@ export async function addMemberToConclave(req: AuthedRequest, res: Response) {
     },
     payment: {
       method: body.paymentMethod || "admin_direct",
-      status: "paid",
-      amount: conclave.registrationFee || 0,
+      status: body.paymentStatus || "paid",
+      amount: body.paymentAmount !== undefined && body.paymentAmount !== "" ? Number(body.paymentAmount) : (conclave.registrationFee || 0),
       currency: "INR",
+      transactionId: body.transactionId ? String(body.transactionId).trim() : "",
       paidAt: new Date(),
     },
   };
@@ -507,6 +543,8 @@ export async function addMemberToConclave(req: AuthedRequest, res: Response) {
   res.status(201).json({
     message: `Member ${name} added successfully to ${conclave.name}.`,
     registration: regData,
+    defaultPassword: defaultPasswordAssigned,
+    loginIdentifier: email || (phone ? phone.replace(/\D/g, "").slice(-10) : undefined),
   });
 }
 
@@ -548,8 +586,21 @@ export async function updateMemberInConclave(req: AuthedRequest, res: Response) 
   if (body.region !== undefined) updates.region = String(body.region).trim();
   if (body.state !== undefined) updates.state = String(body.state).trim();
   if (body.country !== undefined) updates.country = String(body.country).trim();
+  if (body.membership !== undefined) updates.membership = String(body.membership).trim();
   if (body.role !== undefined) updates.role = body.role === "captain" ? "captain" : "member";
   if (body.status !== undefined) updates.status = body.status;
+
+  if (body.paymentStatus !== undefined || body.paymentMethod !== undefined || body.paymentAmount !== undefined || body.transactionId !== undefined) {
+    const existingPayment = regSnap.data()?.payment || {};
+    updates.payment = {
+      ...existingPayment,
+      ...(body.paymentStatus !== undefined ? { status: body.paymentStatus } : {}),
+      ...(body.paymentMethod !== undefined ? { method: body.paymentMethod } : {}),
+      ...(body.paymentAmount !== undefined && body.paymentAmount !== "" ? { amount: Number(body.paymentAmount) } : {}),
+      ...(body.transactionId !== undefined ? { transactionId: String(body.transactionId).trim() } : {}),
+      updatedAt: new Date(),
+    };
+  }
 
   await regRef.set(updates, { merge: true });
 
@@ -566,6 +617,7 @@ export async function updateMemberInConclave(req: AuthedRequest, res: Response) 
   if (updates.region) userUpdates.region = updates.region;
   if (updates.state) userUpdates.state = updates.state;
   if (updates.country) userUpdates.country = updates.country;
+  if (updates.membership) userUpdates.membership = updates.membership;
 
   await db.collection(collections.users).doc(memberUid).set(userUpdates, { merge: true }).catch(() => {});
 
@@ -1012,6 +1064,8 @@ export async function listAllUsers(_req: AuthedRequest, res: Response) {
         company: data.businessName || data.company || "",
         category: data.businessCategory || data.category || "",
         region: regionStr,
+        state: data.state || (loc && typeof loc === "object" ? loc.state : "") || "",
+        country: data.country || (loc && typeof loc === "object" ? loc.country : "") || "India",
         chapter: data.chapter || "",
         status: data.lastLoginAt ? "Active" : "Inactive",
         email: data.email || "",
