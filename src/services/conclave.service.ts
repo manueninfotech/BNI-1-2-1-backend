@@ -8,7 +8,7 @@ import {
 } from "../domain/conclave.js";
 import { toDate, toIso } from "../utils/firestore.js";
 import { notifyConclave, notifyUser } from "./notification.service.js";
-import { resolveNotification, getConclaveDefaults } from "./settings.service.js";
+import { resolveNotification, getConclaveDefaults, getRoundTiming } from "./settings.service.js";
 
 export const conclaveRef = (id: string) =>
   db.collection(collections.conclaves).doc(id);
@@ -511,6 +511,34 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
     throw ApiError.badRequest(
       `This conclave has only ${data.roundCount} rounds.`,
     );
+  }
+
+  // Rounds auto-advance on the clock. If the admin tries to start a round that
+  // has already begun or elapsed, block it — re-starting (e.g. round 2 when the
+  // clock is already on round 3) would reset the anchor and yank everyone back.
+  if (roundNumber > 1 && data.status === ConclaveStatus.running) {
+    const anchor = toDate(data.currentRoundStartedAt);
+    const prevRound = Number(data.currentRound) || 0;
+    if (anchor && prevRound >= 1) {
+      const timing = await getRoundTiming();
+      const p = Math.max(1, Number(data.personsPerTable) || 1);
+      const active = (timing.bioSeconds + timing.referralSeconds) * 1000 * p;
+      const blockMin = Number(data.roundBlockMinutes);
+      const roundMs =
+        Number.isFinite(blockMin) && blockMin > 0
+          ? active + Math.max(0, blockMin * 60 * 1000 - active)
+          : active + timing.bufferSeconds * 1000;
+      const liveRound =
+        prevRound + Math.floor((Date.now() - anchor.getTime()) / roundMs);
+      if (roundNumber <= liveRound) {
+        const shown = Math.min(liveRound, Number(data.roundCount) || liveRound);
+        throw ApiError.conflict(
+          `Round ${roundNumber} has already run — the conclave is on round ${shown}. ` +
+            `Rounds advance automatically, so you don't need to start them by hand.`,
+          { liveRound: shown },
+        );
+      }
+    }
   }
 
   if (roundNumber === 1) {
