@@ -13,6 +13,11 @@ import { fetchUsers } from "../services/user.service.js";
 import { uploadBufferToStorage } from "../services/storage.service.js";
 import * as categories from "../services/categories.service.js";
 import * as settings from "../services/settings.service.js";
+import * as feedback from "../services/feedback.service.js";
+
+export async function listConclaveFeedback(req: AuthedRequest, res: Response) {
+  res.json(await feedback.listFeedback(req.params.id));
+}
 
 // ---- Admin-managed settings (round timing, defaults, regions, notifs) -----
 export async function getRoundTiming(_req: AuthedRequest, res: Response) {

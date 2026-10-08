@@ -30,6 +30,7 @@ router.get("/conclaves", asyncHandler(c.listConclaves));
 router.get("/conclaves/:id/referrals", asyncHandler(c.getReferrals));
 router.post("/conclaves/:id/payment/order", paymentOrderLimiter, asyncHandler(c.createPaymentOrder));
 router.post("/conclaves/:id/register", asyncHandler(c.register));
+router.post("/conclaves/:id/feedback", asyncHandler(c.submitFeedback));
 router.delete("/conclaves/:id/register", asyncHandler(c.deregister));
 router.post("/conclaves/:id/sync", syncLimiter, asyncHandler(c.syncConclave));
 

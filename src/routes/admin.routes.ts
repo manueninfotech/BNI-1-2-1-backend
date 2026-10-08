@@ -55,6 +55,7 @@ router.post("/conclaves/:id/registrations/:uid/role", asyncHandler(c.setRole));
 router.get("/conclaves/:id/stats", asyncHandler(c.statistics));
 router.get("/conclaves/:id/referrals", asyncHandler(c.referrals));
 router.get("/conclaves/:id/attendance", asyncHandler(c.attendance));
+router.get("/conclaves/:id/feedback", asyncHandler(c.listConclaveFeedback));
 
 // Members
 router.get("/users/search", asyncHandler(c.findUser));

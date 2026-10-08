@@ -5,6 +5,7 @@ import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
 import { listConclaves as listConclaveRecords, evaluateConclaveStatus } from "../services/conclave.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
+import * as feedback from "../services/feedback.service.js";
 import {
   notifyUser,
   sendDataToUser,
@@ -832,6 +833,10 @@ export async function register(req: AuthedRequest, res: Response) {
     message: result.alreadyRegistered ? "You are already registered." : "Registered.",
     ...result,
   });
+}
+
+export async function submitFeedback(req: AuthedRequest, res: Response) {
+  res.json(await feedback.submitFeedback(req.params.id, req.uid, req.body ?? {}));
 }
 
 /**
