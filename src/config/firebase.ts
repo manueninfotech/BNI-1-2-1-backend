@@ -44,6 +44,10 @@ export const collections = {
   admins: "admins",
   settings: "settings",
   regions: "regions",
+  // Top-level ledger of Razorpay payment events (captured / failed / refunded),
+  // written by the webhook. One doc per Razorpay payment id so revenue can be
+  // aggregated without walking every conclave's registrations.
+  payments: "payments",
   // subcollections of a conclave
   registrations: "registrations",
   attendance: "attendance",

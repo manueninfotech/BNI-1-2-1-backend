@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAdmin } from "../middleware/auth.js";
+import { requireAdmin, requireSuperadmin } from "../middleware/auth.js";
 import { asyncHandler } from "../middleware/errors.js";
 import * as c from "../controllers/admin.controller.js";
 
@@ -56,6 +56,13 @@ router.get("/conclaves/:id/stats", asyncHandler(c.statistics));
 router.get("/conclaves/:id/referrals", asyncHandler(c.referrals));
 router.get("/conclaves/:id/attendance", asyncHandler(c.attendance));
 router.get("/conclaves/:id/feedback", asyncHandler(c.listConclaveFeedback));
+
+// Payments — per-conclave member payment status (any conclave admin).
+router.get("/conclaves/:id/payments", asyncHandler(c.getConclavePayments));
+
+// Revenue — platform-wide, SUPERADMIN only.
+router.get("/revenue", requireSuperadmin, asyncHandler(c.getRevenue));
+router.get("/revenue/transactions", requireSuperadmin, asyncHandler(c.listTransactions));
 
 // Members
 router.get("/users/search", asyncHandler(c.findUser));

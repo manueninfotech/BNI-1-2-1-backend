@@ -197,3 +197,41 @@ export async function requireAdmin(req: Request, _res: Response, next: NextFunct
   (req as AuthedRequest).email = email;
   next();
 }
+
+/**
+ * Resolves whether the already-authenticated admin is a SUPERADMIN. Checks the
+ * admin's stored role (by uid, then email), with the same email-pattern fallback
+ * the rest of the auth layer uses. Open in insecure-dev mode.
+ */
+async function isSuperadmin(uid: string, email?: string): Promise<boolean> {
+  if (env.allowInsecureAdmin) return true;
+  try {
+    const byUid = await db.collection(collections.admins).doc(uid).get();
+    if (byUid.exists && (byUid.data()?.role ?? "").toLowerCase() === "superadmin") return true;
+    if (email) {
+      const normalized = email.toLowerCase().trim();
+      const byEmail = await db
+        .collection(collections.admins)
+        .where("email", "==", normalized)
+        .limit(1)
+        .get();
+      if (!byEmail.empty && (byEmail.docs[0].data()?.role ?? "").toLowerCase() === "superadmin") return true;
+      if (normalized.includes("superadmin")) return true;
+    }
+  } catch (err: any) {
+    console.warn("isSuperadmin check failed:", err?.message || err);
+  }
+  return false;
+}
+
+/**
+ * Gates a route to superadmins only. Mounted AFTER requireAdmin, so it can trust
+ * req.uid / req.email are set. Used for the platform-wide revenue endpoints.
+ */
+export async function requireSuperadmin(req: Request, _res: Response, next: NextFunction) {
+  const { uid, email } = req as AuthedRequest;
+  if (!(await isSuperadmin(uid, email))) {
+    throw ApiError.forbidden("This area is restricted to the platform superadmin.");
+  }
+  next();
+}

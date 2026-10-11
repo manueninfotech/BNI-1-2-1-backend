@@ -87,6 +87,24 @@ export async function createOrder(params: {
 }
 
 /**
+ * Reads an order's `notes` ({ uid, conclaveId }) — the only reliable way to
+ * attribute a webhook payment to a member + conclave, since the payment entity
+ * Razorpay sends does not carry the order's notes. Returns {} on any failure, so
+ * a payment with an unresolvable order is still recorded (just unattributed).
+ */
+export async function fetchOrderNotes(
+  orderId: string,
+): Promise<Record<string, string>> {
+  if (!orderId || !razorpayConfigured()) return {};
+  try {
+    const order = (await client().orders.fetch(orderId)) as { notes?: Record<string, string> };
+    return order.notes ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Confirm that `expectedRupees` was actually captured for this order.
  *
  * @throws ApiError(400) if the signature is wrong, the order is not paid, or the

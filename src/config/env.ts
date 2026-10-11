@@ -50,6 +50,14 @@ export const env = {
    */
   razorpayKeyId: process.env.RAZORPAY_KEY_ID ?? "",
   razorpayKeySecret: process.env.RAZORPAY_KEY_SECRET ?? "",
+
+  /**
+   * Razorpay webhook secret — a DIFFERENT secret from the API key, set when the
+   * webhook is created in the Razorpay dashboard. Used only to verify the
+   * `X-Razorpay-Signature` on incoming webhook calls. When unset the webhook
+   * endpoint rejects everything (fails closed), so no unverified event is stored.
+   */
+  razorpayWebhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET ?? "",
 } as const;
 
 export const isProduction = env.nodeEnv === "production";

@@ -5,6 +5,7 @@ import { errorHandler, notFoundHandler } from "./middleware/errors.js";
 import { generalLimiter } from "./middleware/rateLimit.js";
 import adminRoutes from "./routes/admin.routes.js";
 import memberRoutes from "./routes/member.routes.js";
+import webhookRoutes from "./routes/webhook.routes.js";
 
 import path from "path";
 import fs from "fs";
@@ -28,7 +29,17 @@ export function createApp() {
       origin: env.corsOrigins.includes("*") ? true : env.corsOrigins,
     }),
   );
-  app.use(express.json({ limit: "50mb" }));
+  // Keep the raw request bytes alongside the parsed JSON: a Razorpay webhook's
+  // signature is an HMAC over the EXACT body it sent, so verifying it against a
+  // re-serialised object would fail on any key-ordering or spacing difference.
+  app.use(
+    express.json({
+      limit: "50mb",
+      verify: (req, _res, buf) => {
+        (req as any).rawBody = buf;
+      },
+    }),
+  );
   app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
   // Ensure uploads/agendas folder exists
@@ -43,6 +54,11 @@ export function createApp() {
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
+
+  // Razorpay webhooks: public (Razorpay has no bearer token — it proves itself
+  // with the signature) and mounted BEFORE the general rate limiter, so a burst
+  // of payment events is never dropped.
+  app.use("/api/webhooks", webhookRoutes);
 
   app.use(generalLimiter);
 

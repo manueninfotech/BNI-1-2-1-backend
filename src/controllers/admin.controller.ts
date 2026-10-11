@@ -14,6 +14,25 @@ import { uploadBufferToStorage } from "../services/storage.service.js";
 import * as categories from "../services/categories.service.js";
 import * as settings from "../services/settings.service.js";
 import * as feedback from "../services/feedback.service.js";
+import * as payments from "../services/payments.service.js";
+
+// --- Payments / revenue ------------------------------------------------------
+
+/** Superadmin: platform-wide revenue — totals, per-conclave, time series. */
+export async function getRevenue(_req: AuthedRequest, res: Response) {
+  res.json(await payments.getRevenue());
+}
+
+/** Superadmin: the most recent payments across all conclaves. */
+export async function listTransactions(req: AuthedRequest, res: Response) {
+  const limit = Math.min(200, Math.max(1, Number((req as any).query?.limit) || 50));
+  res.json(await payments.listTransactions(limit));
+}
+
+/** Conclave admin: each member's payment status + failed attempts, for one conclave. */
+export async function getConclavePayments(req: AuthedRequest, res: Response) {
+  res.json(await payments.getConclavePayments(req.params.id));
+}
 
 export async function listConclaveFeedback(req: AuthedRequest, res: Response) {
   res.json(await feedback.listFeedback(req.params.id));
