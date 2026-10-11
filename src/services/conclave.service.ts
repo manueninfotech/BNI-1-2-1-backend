@@ -48,6 +48,10 @@ interface CreateInput {
   endDate?: string;
   regStartDate?: string;
   regEndDate?: string;
+  regStartTime?: string;
+  regEndTime?: string;
+  registrationOverride?: string;
+  isRegistrationOpen?: boolean;
   dateRange?: string;
   startTime?: string;
   endTime?: string;
@@ -117,6 +121,61 @@ function parseTimeComponents(val: unknown): { hours: number; minutes: number } |
 }
 
 /**
+ * Combines a date with an "HH:mm" time, defaulting to the start (00:00:00.000)
+ * or end (23:59:59.999) of the day when no time is given. null for a missing or
+ * invalid date.
+ */
+function combineDateTime(base: Date | null, time: unknown, edge: "start" | "end"): Date | null {
+  if (!base || isNaN(base.getTime())) return null;
+  const comp = parseTimeComponents(time);
+  const d = new Date(base);
+  if (comp) d.setHours(comp.hours, comp.minutes, edge === "end" ? 59 : 0, edge === "end" ? 999 : 0);
+  else d.setHours(edge === "end" ? 23 : 0, edge === "end" ? 59 : 0, edge === "end" ? 59 : 0, edge === "end" ? 999 : 0);
+  return d;
+}
+
+/**
+ * Enforces the conclave's timing rules at create and edit — the whole point is
+ * that a nonsensical window (an event that ends before it starts, or
+ * registration that stays open after the conclave has begun) can never be saved.
+ * Throws ApiError.badRequest with a human message on the first violation. Each
+ * field is only checked when present, so a partial edit that doesn't touch dates
+ * passes untouched.
+ */
+export function validateConclaveDates(
+  d: {
+    date?: unknown; startDate?: unknown; endDate?: unknown; startTime?: unknown; endTime?: unknown;
+    regStartDate?: unknown; regEndDate?: unknown; regStartTime?: unknown; regEndTime?: unknown;
+  },
+  opts: { isNew: boolean },
+) {
+  const now = new Date();
+  const eventStart = combineDateTime(
+    d.date ? toDate(d.date) : (d.startDate ? toDate(d.startDate) : null), d.startTime, "start",
+  );
+  const eventEnd = combineDateTime(
+    d.endDate ? toDate(d.endDate) : (d.date ? toDate(d.date) : null), d.endTime, "end",
+  );
+  const regStart = combineDateTime(d.regStartDate ? toDate(d.regStartDate) : null, d.regStartTime, "start");
+  const regEnd = combineDateTime(d.regEndDate ? toDate(d.regEndDate) : null, d.regEndTime, "end");
+
+  if (eventStart && eventEnd && eventEnd < eventStart) {
+    throw ApiError.badRequest("The conclave can't end before it starts — check the event date and time.");
+  }
+  if (regStart && regEnd && regEnd <= regStart) {
+    throw ApiError.badRequest("Registration must open before it closes.");
+  }
+  if (regEnd && eventStart && regEnd > eventStart) {
+    throw ApiError.badRequest(
+      "Registration must close before the conclave starts — it can't stay open after the event has begun.",
+    );
+  }
+  if (opts.isNew && eventStart && eventStart < now) {
+    throw ApiError.badRequest("The conclave can't start in the past.");
+  }
+}
+
+/**
  * Evaluates conclave status dynamically based on current date/time vs reg dates and event start/end dates & times.
  * A conclave is shown as "running" ONLY if its start date & start time have already arrived!
  */
@@ -133,74 +192,43 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
       return { status: data.status, isRegistrationOpen: false };
     }
 
+    const eventStart = data?.date ? toDate(data.date) : (data?.startDate ? toDate(data.startDate) : null);
+    const eventEnd = data?.endDate ? toDate(data.endDate) : (data?.date ? toDate(data.date) : null);
     const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
     const regEnd = data?.regEndDate ? toDate(data.regEndDate) : null;
 
-    const eventStart = data?.date ? toDate(data.date) : (data?.startDate ? toDate(data.startDate) : null);
-    const eventEnd = data?.endDate ? toDate(data.endDate) : (data?.date ? toDate(data.date) : null);
+    const startDateTime = combineDateTime(eventStart, data?.startTime, "start");
+    const endDateTime = combineDateTime(eventEnd ?? eventStart, data?.endTime, "end");
+    const regStartDateTime = combineDateTime(regStart, data?.regStartTime, "start");
+    const regEndDateTime = combineDateTime(regEnd, data?.regEndTime, "end");
 
-    const startTimeComp = parseTimeComponents(data?.startTime);
-    const endTimeComp = parseTimeComponents(data?.endTime);
-
-    // Build precise start Date + Time
-    let startDateTime: Date | null = null;
-    if (eventStart && !isNaN(eventStart.getTime())) {
-      startDateTime = new Date(eventStart);
-      if (startTimeComp) {
-        startDateTime.setHours(startTimeComp.hours, startTimeComp.minutes, 0, 0);
-      } else {
-        startDateTime.setHours(0, 0, 0, 0);
-      }
-    }
-
-    // Build precise end Date + Time
-    let endDateTime: Date | null = null;
-    if (eventEnd && !isNaN(eventEnd.getTime())) {
-      endDateTime = new Date(eventEnd);
-      if (endTimeComp) {
-        endDateTime.setHours(endTimeComp.hours, endTimeComp.minutes, 59, 999);
-      } else {
-        endDateTime.setHours(23, 59, 59, 999);
-      }
-    } else if (startDateTime) {
-      endDateTime = new Date(startDateTime);
-      if (endTimeComp) {
-        endDateTime.setHours(endTimeComp.hours, endTimeComp.minutes, 59, 999);
-      } else {
-        endDateTime.setHours(23, 59, 59, 999);
-      }
-    }
-
-    // 1. Completed if event end date & time has passed
+    // 1. Completed once the event's end has passed.
     if (endDateTime && now > endDateTime) {
       return { status: ConclaveStatus.completed, isRegistrationOpen: false };
     }
 
-    // 2. Running ONLY if event start date & time has already arrived!
-    // (Or if admin explicitly started live rounds: currentRound > 0)
+    // 2. Running once the event's start has arrived (or rounds have run).
     const hasLiveRounds = Number(data?.currentRound) > 0;
     if (startDateTime && (now >= startDateTime || hasLiveRounds)) {
       return { status: ConclaveStatus.running, isRegistrationOpen: false };
     }
 
-    // 3. If start time has NOT started yet, it CANNOT be running:
-    if (regEnd) {
-      const regEndDay = new Date(regEnd);
-      regEndDay.setHours(23, 59, 59, 999);
-      if (now > regEndDay) {
-        return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
-      }
+    // Before the event starts, the registration WINDOW governs.
+    // 3. Not open yet.
+    if (regStartDateTime && now < regStartDateTime) {
+      return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
     }
-
-    if (regStart) {
-      const regStartDay = new Date(regStart);
-      regStartDay.setHours(0, 0, 0, 0);
-      if (now < regStartDay) {
-        return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
-      }
+    // 4. Past the registration close time.
+    if (regEndDateTime && now > regEndDateTime) {
+      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
     }
-
-    // If event is today or soon and reg is closed, or open:
+    // 5. Within the window → the admin's manual toggle is authoritative. An admin
+    //    who turned registration OFF keeps it closed even inside the window;
+    //    otherwise it's open. (The toggle only ever applies before the event
+    //    starts, which is already guaranteed by reaching this point.)
+    if (String(data?.registrationOverride ?? "").toLowerCase() === "closed") {
+      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    }
     return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
   } catch (err) {
     return {
@@ -245,12 +273,21 @@ export async function createConclave(input: CreateInput) {
   const roundCount = input.roundCount ?? defaults.roundCount;
   validateConfig(personsPerTable, roundCount);
 
+  // Reject a nonsensical window before anything is written.
+  validateConclaveDates(input, { isNew: true });
+
+  const override = input.isRegistrationOpen === false ? "closed" : (input.registrationOverride || "open");
   const evalResult = evaluateConclaveStatus({
     regStartDate: input.regStartDate,
     regEndDate: input.regEndDate,
+    regStartTime: input.regStartTime,
+    regEndTime: input.regEndTime,
     date: input.date,
     startDate: input.startDate,
     endDate: input.endDate,
+    startTime: input.startTime,
+    endTime: input.endTime,
+    registrationOverride: override,
   });
 
   const statusToSet = input.status || evalResult.status;
@@ -267,7 +304,10 @@ export async function createConclave(input: CreateInput) {
     date: input.date ? new Date(input.date) : new Date(),
     endDate: input.endDate ? new Date(input.endDate) : null,
     regStartDate: input.regStartDate ? new Date(input.regStartDate) : null,
-    regEndDate: input.regEndDate ? (() => { const d = new Date(input.regEndDate); d.setHours(23, 59, 59, 999); return d; })() : null,
+    regEndDate: input.regEndDate ? new Date(input.regEndDate) : null,
+    regStartTime: normalizeTime(input.regStartTime),
+    regEndTime: normalizeTime(input.regEndTime),
+    registrationOverride: override,
     startTime: normalizeTime(input.startTime),
     endTime: normalizeTime(input.endTime),
     chiefGuests: Array.isArray(input.chiefGuests) ? input.chiefGuests : [],
@@ -312,20 +352,26 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
   if (body.startDate !== undefined) updates.startDate = body.startDate ? new Date(body.startDate as string) : null;
   if (body.endDate !== undefined) updates.endDate = body.endDate ? new Date(body.endDate as string) : null;
   if (body.regStartDate !== undefined) updates.regStartDate = body.regStartDate ? new Date(body.regStartDate as string) : null;
-  if (body.regEndDate !== undefined) {
-    if (body.regEndDate) {
-      const d = new Date(body.regEndDate as string);
-      d.setHours(23, 59, 59, 999);
-      updates.regEndDate = d;
-    } else {
-      updates.regEndDate = null;
-    }
-  }
+  if (body.regEndDate !== undefined) updates.regEndDate = body.regEndDate ? new Date(body.regEndDate as string) : null;
+  if (body.regStartTime !== undefined) updates.regStartTime = normalizeTime(body.regStartTime);
+  if (body.regEndTime !== undefined) updates.regEndTime = normalizeTime(body.regEndTime);
   if (body.startTime !== undefined) updates.startTime = normalizeTime(body.startTime);
   if (body.endTime !== undefined) updates.endTime = normalizeTime(body.endTime);
   if (body.status !== undefined) updates.status = body.status;
+  // The admin's open/closed intent. isRegistrationOpen=false (the form toggle) is
+  // the same signal.
+  if (body.registrationOverride !== undefined) {
+    updates.registrationOverride = String(body.registrationOverride);
+  } else if (body.isRegistrationOpen !== undefined) {
+    updates.registrationOverride = body.isRegistrationOpen ? "open" : "closed";
+  }
 
   const mergedData = { ...data, ...updates };
+
+  // Validate the RESULT of the edit (merged), so a partial change that creates a
+  // bad window — e.g. moving registration past the event start — is rejected.
+  validateConclaveDates(mergedData, { isNew: false });
+
   const evalResult = evaluateConclaveStatus(mergedData);
   if (body.status === undefined) {
     updates.status = evalResult.status;
@@ -368,9 +414,17 @@ export async function setRegistrationOpen(id: string, open: boolean) {
     );
   }
 
+  // Record the admin's intent as the override and recompute. The override is only
+  // authoritative WITHIN the registration window and before the event starts
+  // (evaluateConclaveStatus enforces that), so turning registration back "on"
+  // after its close time has passed correctly leaves it closed.
+  const override = open ? "open" : "closed";
+  const evalResult = evaluateConclaveStatus({ ...data, registrationOverride: override });
   await ref.update({
-    isRegistrationOpen: open,
-    status: open ? ConclaveStatus.registrationOpen : ConclaveStatus.registrationClosed,
+    registrationOverride: override,
+    isRegistrationOpen: evalResult.isRegistrationOpen,
+    status: evalResult.status,
+    updatedAt: new Date(),
   });
 }
 

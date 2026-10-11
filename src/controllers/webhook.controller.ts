@@ -13,9 +13,18 @@ export async function razorpayWebhook(req: Request, res: Response) {
   const signature = req.header("x-razorpay-signature");
   const rawBody = (req as any).rawBody as Buffer | undefined;
 
+  // Lightweight arrival log so a misconfigured webhook (wrong mode, wrong secret)
+  // is diagnosable from the container logs instead of failing silently.
+  const eventType = (req.body && req.body.event) || "unknown";
+  console.log(
+    `[webhook] razorpay hit: event=${eventType} hasSig=${Boolean(signature)} rawLen=${rawBody?.length ?? 0}`,
+  );
+
   if (!verifyWebhookSignature(rawBody, signature)) {
+    console.warn(`[webhook] REJECTED — signature invalid or missing (event=${eventType}).`);
     return res.status(400).json({ error: "Invalid or missing signature." });
   }
+  console.log(`[webhook] signature OK — recording event=${eventType}.`);
 
   try {
     await recordPaymentEvent(req.body);
