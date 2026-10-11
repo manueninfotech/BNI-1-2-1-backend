@@ -631,12 +631,20 @@ export async function listConclaves(region?: string) {
         const countFromParticipants = Array.isArray(d.participants) ? d.participants.length : 0;
         const actualCount = countFromSubcoll > 0 ? countFromSubcoll : countFromParticipants;
 
-        // Self-heal: If status was marked completed before any rounds were run, reset to dynamic status
-        if (d.status === "completed" && (!d.currentRound || d.currentRound === 0)) {
-          const evalResult = evaluateConclaveStatus(d);
-          d.status = evalResult.status;
-          d.isRegistrationOpen = evalResult.isRegistrationOpen;
-          doc.ref.update({ status: evalResult.status, isRegistrationOpen: evalResult.isRegistrationOpen }).catch(() => {});
+        // Self-heal: a conclave marked completed before any rounds ran (currentRound==0)
+        // AND without an explicit admin completion (no completedAt) is almost always a
+        // stale/bogus status — recompute it from the time window. Two guards keep this
+        // from ever re-opening a genuinely-finished conclave (the reported bug where a
+        // deliberately-completed conclave kept coming back):
+        //   1. completedAt present  → an admin ended it on purpose; always trusted.
+        //   2. the recomputed status is itself "completed" (event day has passed) → leave it.
+        if (d.status === "completed" && (!d.currentRound || d.currentRound === 0) && !d.completedAt) {
+          const evalResult = evaluateConclaveStatus({ ...d, status: undefined });
+          if (evalResult.status !== ConclaveStatus.completed) {
+            d.status = evalResult.status;
+            d.isRegistrationOpen = evalResult.isRegistrationOpen;
+            doc.ref.update({ status: evalResult.status, isRegistrationOpen: evalResult.isRegistrationOpen }).catch(() => {});
+          }
         } else if (d.status !== ConclaveStatus.completed && d.status !== ConclaveStatus.cancelled) {
           const evalResult = evaluateConclaveStatus(d);
           d.status = evalResult.status;
