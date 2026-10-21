@@ -142,6 +142,7 @@ export async function getOne(req: AuthedRequest, res: Response) {
     startTime: conclaves.normalizeTime(d.startTime),
     endTime: conclaves.normalizeTime(d.endTime),
     currentRoundStartedAt: toDate(d.currentRoundStartedAt)?.toISOString() ?? null,
+    roundPausedAt: toDate(d.roundPausedAt)?.toISOString() ?? null,
   });
 }
 
@@ -272,6 +273,30 @@ export async function startRound(req: AuthedRequest, res: Response) {
   res.json({
     message: `Round ${roundNumber} started.`,
     roundStartedAt: startedAt.toISOString(),
+  });
+}
+
+export async function pauseRound(req: AuthedRequest, res: Response) {
+  const result = await conclaves.pauseRound(req.params.id);
+  res.json({
+    message: "Round timer paused.",
+    ...result,
+  });
+}
+
+export async function resumeRound(req: AuthedRequest, res: Response) {
+  const result = await conclaves.resumeRound(req.params.id);
+  res.json({
+    message: "Round timer resumed.",
+    ...result,
+  });
+}
+
+export async function closeRound(req: AuthedRequest, res: Response) {
+  const result = await conclaves.closeRound(req.params.id);
+  res.json({
+    message: "Round concluded.",
+    ...result,
   });
 }
 
@@ -426,7 +451,7 @@ export async function referrals(req: AuthedRequest, res: Response) {
       toCategory: toUser.businessCategory,
       roundNumber: data.roundNumber || 1,
       notes: data.notes || data.description || "",
-      status: data.status || "Connected",
+      status: data.status || "Pending",
       createdAt: data.createdAt ? toDate(data.createdAt)?.toISOString() : null
     };
   });

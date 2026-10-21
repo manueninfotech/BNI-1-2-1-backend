@@ -48,6 +48,8 @@ export interface SyncResult {
     status: string;
     currentRound: number;
     currentRoundStartedAt: string | null;
+    isRoundPaused?: boolean;
+    roundPausedAt?: string | null;
     title: string;
     date: string | null;
     venue: string;
@@ -543,6 +545,8 @@ export async function syncConclave(
         : evaluateConclaveStatus(conclave).status,
       currentRound: conclave.currentRound ?? 0,
       currentRoundStartedAt: toIso(conclave.currentRoundStartedAt),
+      isRoundPaused: Boolean(conclave.isRoundPaused),
+      roundPausedAt: toIso(conclave.roundPausedAt),
       serverSentAt: new Date().toISOString(),
       title: conclave.name || conclave.title || "BNI Conclave",
       date: conclave.date ? (typeof conclave.date === 'string' ? conclave.date : toIso(conclave.date)) : null,

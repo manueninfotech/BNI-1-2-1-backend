@@ -537,6 +537,8 @@ export async function completeConclave(id: string) {
     status: ConclaveStatus.completed,
     isRegistrationOpen: false,
     completedAt: new Date(),
+    isRoundPaused: false,
+    roundPausedAt: null,
   });
 
   const endedMsg = await resolveNotification("conclaveEnded");
@@ -624,8 +626,13 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
     isRegistrationOpen: false,
     currentRound: roundNumber,
     currentRoundStartedAt: roundStartedAt,
+    isRoundPaused: false,
+    roundPausedAt: null,
+    roundElapsedMsBeforePause: null,
     ...(roundNumber === 1 ? { startedBy: adminUid } : {}),
   });
+  conclaveDocCache.delete(id);
+  conclavesListCache = [];
 
   try {
     const startedMsg = await resolveNotification("roundStarted", { round: roundNumber });
@@ -645,6 +652,116 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
   } catch {}
 
   return roundStartedAt;
+}
+
+/**
+ * Pause the active round timer.
+ */
+export async function pauseRound(id: string) {
+  const { ref, data } = await getConclaveOrThrow(id);
+  if (data.status !== ConclaveStatus.running) {
+    throw ApiError.badRequest("Only a running conclave round can be paused.");
+  }
+  if (data.isRoundPaused) {
+    return { isRoundPaused: true, pausedAt: data.roundPausedAt };
+  }
+
+  const anchor = toDate(data.currentRoundStartedAt);
+  const elapsedMs = anchor ? Math.max(0, Date.now() - anchor.getTime()) : 0;
+  const pausedAt = new Date();
+
+  await ref.update({
+    isRoundPaused: true,
+    roundPausedAt: pausedAt,
+    roundElapsedMsBeforePause: elapsedMs,
+  });
+  conclaveDocCache.delete(id);
+  conclavesListCache = [];
+
+  try {
+    await notifyConclave(id, {
+      title: "Round Paused",
+      body: `Round ${data.currentRound || 1} has been paused by the admin.`,
+      data: { conclaveId: id, type: "round_paused" },
+    });
+  } catch {}
+
+  return { isRoundPaused: true, pausedAt, elapsedMs };
+}
+
+/**
+ * Resume the paused round timer.
+ */
+export async function resumeRound(id: string) {
+  const { ref, data } = await getConclaveOrThrow(id);
+  if (data.status !== ConclaveStatus.running) {
+    throw ApiError.badRequest("Only a running conclave round can be resumed.");
+  }
+  if (!data.isRoundPaused) {
+    return { isRoundPaused: false, startedAt: data.currentRoundStartedAt };
+  }
+
+  // Calculate new anchor: current time minus elapsed time already spent before pause
+  const elapsedMs = Number(data.roundElapsedMsBeforePause) || 0;
+  const newStartedAt = new Date(Date.now() - elapsedMs);
+
+  await ref.update({
+    isRoundPaused: false,
+    roundPausedAt: null,
+    roundElapsedMsBeforePause: null,
+    currentRoundStartedAt: newStartedAt,
+  });
+  conclaveDocCache.delete(id);
+  conclavesListCache = [];
+
+  try {
+    await notifyConclave(id, {
+      title: "Round Resumed",
+      body: `Round ${data.currentRound || 1} has resumed!`,
+      data: { conclaveId: id, type: "round_resumed" },
+    });
+  } catch {}
+
+  return { isRoundPaused: false, currentRoundStartedAt: newStartedAt };
+}
+
+/**
+ * Force-close the current round.
+ */
+export async function closeRound(id: string) {
+  const { ref, data } = await getConclaveOrThrow(id);
+  if (data.status !== ConclaveStatus.running) {
+    throw ApiError.badRequest("Only a running conclave round can be closed.");
+  }
+
+  const curRound = Number(data.currentRound) || 1;
+  const totalRounds = Number(data.roundCount) || 4;
+
+  // If on final round, complete the conclave
+  if (curRound >= totalRounds) {
+    return await completeConclave(id);
+  }
+
+  // Otherwise, fast-forward anchor to 16 minutes in past so current round is marked ended
+  const endedAnchor = new Date(Date.now() - 16 * 60 * 1000);
+  await ref.update({
+    isRoundPaused: false,
+    roundPausedAt: null,
+    roundElapsedMsBeforePause: null,
+    currentRoundStartedAt: endedAnchor,
+  });
+  conclaveDocCache.delete(id);
+  conclavesListCache = [];
+
+  try {
+    await notifyConclave(id, {
+      title: `Round ${curRound} Closed`,
+      body: `Round ${curRound} has concluded.`,
+      data: { conclaveId: id, type: "round_ended", roundNumber: String(curRound) },
+    });
+  } catch {}
+
+  return { closedRound: curRound, isEnded: true };
 }
 
 export async function listConclaves(region?: string) {
