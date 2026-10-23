@@ -213,7 +213,17 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
       return { status: ConclaveStatus.running, isRegistrationOpen: false };
     }
 
-    // Before the event starts, the registration WINDOW governs.
+    // An explicit admin override wins over registration dates, but never over
+    // the event lifecycle checks above.
+    const registrationOverride = String(data?.registrationOverride ?? "").toLowerCase();
+    if (registrationOverride === "open") {
+      return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
+    }
+    if (registrationOverride === "closed") {
+      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    }
+
+    // Without an override, the registration WINDOW governs.
     // 3. Not open yet.
     if (regStartDateTime && now < regStartDateTime) {
       return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
@@ -222,13 +232,7 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
     if (regEndDateTime && now > regEndDateTime) {
       return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
     }
-    // 5. Within the window → the admin's manual toggle is authoritative. An admin
-    //    who turned registration OFF keeps it closed even inside the window;
-    //    otherwise it's open. (The toggle only ever applies before the event
-    //    starts, which is already guaranteed by reaching this point.)
-    if (String(data?.registrationOverride ?? "").toLowerCase() === "closed") {
-      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
-    }
+    // 5. Within the window and no override → registration is open.
     return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
   } catch (err) {
     return {
@@ -414,10 +418,8 @@ export async function setRegistrationOpen(id: string, open: boolean) {
     );
   }
 
-  // Record the admin's intent as the override and recompute. The override is only
-  // authoritative WITHIN the registration window and before the event starts
-  // (evaluateConclaveStatus enforces that), so turning registration back "on"
-  // after its close time has passed correctly leaves it closed.
+  // Record the admin's intent as the override and recompute. The override can
+  // bypass registration dates, but not event lifecycle or terminal status.
   const override = open ? "open" : "closed";
   const evalResult = evaluateConclaveStatus({ ...data, registrationOverride: override });
   await ref.update({
@@ -426,6 +428,7 @@ export async function setRegistrationOpen(id: string, open: boolean) {
     status: evalResult.status,
     updatedAt: new Date(),
   });
+  clearConclaveCache();
 }
 
 /**
