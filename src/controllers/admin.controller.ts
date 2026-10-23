@@ -15,6 +15,7 @@ import * as categories from "../services/categories.service.js";
 import * as settings from "../services/settings.service.js";
 import * as feedback from "../services/feedback.service.js";
 import * as payments from "../services/payments.service.js";
+import { ApiError } from "../middleware/errors.js";
 
 // --- Payments / revenue ------------------------------------------------------
 
@@ -148,13 +149,21 @@ export async function getOne(req: AuthedRequest, res: Response) {
 
 
 export async function create(req: AuthedRequest, res: Response) {
-  const admin = await getAdminDoc(req.uid);
-  // Auto-assign the creating admin's region to the conclave.
-  // Superadmin/Global can override by passing region explicitly in the body.
+  const admin = await getAdminDoc(req.uid, req.email);
+  const isSuperadmin = admin?.role === "superadmin" || admin?.region === "Global" || (req.email || "").toLowerCase().includes("superadmin");
   const body = req.body ?? {};
-  if (!body.region && admin?.region && admin.region !== "Global") {
-    body.region = admin.region;
+
+  if (!isSuperadmin) {
+    const adminRegion = admin?.region || admin?.scope;
+    if (!adminRegion) {
+      throw ApiError.forbidden("You must be assigned to an official region to create a conclave.");
+    }
+    if (body.region && body.region.trim().toLowerCase() !== adminRegion.trim().toLowerCase()) {
+      throw ApiError.forbidden(`You are only authorized to create conclaves within your assigned region: "${adminRegion}".`);
+    }
+    body.region = adminRegion;
   }
+
   const conclaveId = await conclaves.createConclave(body);
   res.status(201).json({
     message: "Conclave created. Registration is closed until you open it.",
@@ -163,7 +172,25 @@ export async function create(req: AuthedRequest, res: Response) {
 }
 
 export async function update(req: AuthedRequest, res: Response) {
-  const updated = await conclaves.updateConclave(req.params.id, req.body ?? {});
+  const admin = await getAdminDoc(req.uid, req.email);
+  const isSuperadmin = admin?.role === "superadmin" || admin?.region === "Global" || (req.email || "").toLowerCase().includes("superadmin");
+  const body = req.body ?? {};
+
+  if (!isSuperadmin) {
+    const { data: existingConclave } = await conclaves.getConclaveOrThrow(req.params.id);
+    const adminRegion = admin?.region || admin?.scope;
+    if (adminRegion && existingConclave.region && existingConclave.region.trim().toLowerCase() !== adminRegion.trim().toLowerCase()) {
+      throw ApiError.forbidden(`You are only authorized to manage conclaves in your assigned region: "${adminRegion}".`);
+    }
+    if (body.region && adminRegion && body.region.trim().toLowerCase() !== adminRegion.trim().toLowerCase()) {
+      throw ApiError.forbidden(`You cannot change the conclave's region away from your assigned region: "${adminRegion}".`);
+    }
+    if (adminRegion) {
+      body.region = adminRegion;
+    }
+  }
+
+  const updated = await conclaves.updateConclave(req.params.id, body);
   res.json({ message: "Conclave updated.", updated });
 }
 
