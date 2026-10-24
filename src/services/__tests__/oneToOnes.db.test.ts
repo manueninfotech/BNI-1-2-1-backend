@@ -94,4 +94,21 @@ describe("member conclave list", () => {
     const [forB] = await listForMember("b");
     expect(forB.isRegistered).toBe(false);
   });
+
+  it("keeps phones only for people the member shared a table with; returns my role and table", async () => {
+    const participants = [
+      { id: 1, name: "A", phone: "+911111111111", _originalUid: "a" },
+      { id: 2, name: "B", phone: "+912222222222", _originalUid: "b" },
+      { id: 3, name: "C", phone: "+913333333333", _originalUid: "c" },
+    ];
+    // a sits with b in round 1; c is never at a's table.
+    const schedule = { rounds: [{ roundNumber: 1, tables: [{ tableNumber: 1, captainId: 1, memberIds: [2] }, { tableNumber: 2, captainId: 3, memberIds: [] }] }] };
+    const [c] = await pgdb.insert(conclaves).values({ name: "S", startDate: new Date(), participants, schedule }).returning();
+    await pgdb.insert(registrations).values({ conclaveId: c.id, userId: "a", role: "captain", tableNumber: 1 });
+
+    const [forA] = await listForMember("a");
+    const phones = (forA.participants as any[]).map((p) => p.phone ?? null);
+    expect(phones).toEqual(["+911111111111", "+912222222222", null]);
+    expect(forA).toMatchObject({ isRegistered: true, myRole: "captain", myTableNumber: 1 });
+  });
 });

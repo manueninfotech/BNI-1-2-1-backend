@@ -193,6 +193,7 @@ export interface UpdateMeInput {
   canOffer?: unknown;
   state?: unknown;
   country?: unknown;
+  location?: unknown;
 }
 
 const str = (v: unknown, max = 200) => String(v ?? "").trim().slice(0, max);
@@ -202,7 +203,7 @@ const str = (v: unknown, max = 200) => String(v ?? "").trim().slice(0, max);
  * fields (name, phone, designation, organization) are editable — `region` drives
  * regional authorization, so it changes only through the coordinator screen.
  */
-export async function updateMe(uid: string, input: UpdateMeInput) {
+export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: string) {
   const [admin] = await pgdb.select().from(admins).where(eq(admins.uid, uid));
   if (admin) {
     const patch: Partial<typeof admins.$inferInsert> = {};
@@ -242,8 +243,10 @@ export async function updateMe(uid: string, input: UpdateMeInput) {
   if (input.chapter !== undefined) patch.chapter = str(input.chapter) || null;
   if (input.region !== undefined) {
     patch.region = str(input.region) || null;
-    patch.location = patch.region ? patch.region.toLowerCase() : null;
+    if (input.location === undefined) patch.location = patch.region ? patch.region.toLowerCase() : null;
   }
+  // Same normalisation as registration: "Guntur", " guntur " group as one place.
+  if (input.location !== undefined) patch.location = str(input.location).toLowerCase() || null;
   if (input.designation !== undefined) patch.designation = str(input.designation);
   if (input.membership !== undefined) patch.membership = str(input.membership);
   if (input.lookingFor !== undefined) patch.lookingFor = str(input.lookingFor, 1000);
@@ -255,7 +258,12 @@ export async function updateMe(uid: string, input: UpdateMeInput) {
     const [before] = await tx.select().from(users).where(eq(users.uid, uid)).for("update");
     const [after] = before
       ? await tx.update(users).set({ ...patch, updatedAt: new Date() }).where(eq(users.uid, uid)).returning()
-      : await tx.insert(users).values({ uid, country: "India", ...patch }).returning();
+      : await tx
+          .insert(users)
+          // First save after sign-up: the sign-in address comes from the
+          // VERIFIED token (synthetic for phone accounts), never the request.
+          .values({ uid, country: "India", identifier: signInEmail?.toLowerCase() ?? patch.identifier ?? null, ...patch })
+          .returning();
     await audit.change({ action: before ? "user.update" : "user.create", entityType: "user", entityId: uid, before: before ?? null, after }, tx);
     return {
       id: uid,
@@ -372,6 +380,8 @@ export async function findUsers(query: string) {
   return rows.map((u) => ({
     uid: u.uid,
     name: u.name,
+    /** Their own sign-in address (synthetic for phone accounts). */
+    identifier: u.identifier ?? "",
     email: u.email ?? "",
     phone: u.phone ?? "",
     businessName: u.company ?? "",

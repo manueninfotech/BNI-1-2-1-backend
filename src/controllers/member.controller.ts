@@ -48,7 +48,7 @@ export async function me(req: AuthedRequest, res: Response) {
 }
 
 export async function updateMe(req: AuthedRequest, res: Response) {
-  const profile = await users.updateMe(req.uid, req.body ?? {});
+  const profile = await users.updateMe(req.uid, req.body ?? {}, req.email);
   res.json({ success: true, message: "Profile updated successfully.", profile });
 }
 

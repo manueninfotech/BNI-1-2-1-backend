@@ -761,9 +761,30 @@ export async function listRunning() {
 export { mutate as mutateConclave };
 
 /**
- * The member-facing conclave list: every conclave, flagged with whether THIS
- * member is registered, with other attendees' contact details removed (the
- * seating list carries names/businesses for the schedule, never phone numbers).
+ * uids of everyone who shares a table with `uid` in any round of `schedule`
+ * (the people a member actually met — whose contact details they may see).
+ */
+function tablemateUids(schedule: any, participants: Record<string, unknown>[], uid: string): Set<string> {
+  const me = participants.find((p) => p._originalUid === uid)?.id;
+  const out = new Set<string>();
+  if (me === undefined || !Array.isArray(schedule?.rounds)) return out;
+  const uidOf = new Map(participants.map((p) => [p.id, String(p._originalUid ?? "")]));
+  for (const round of schedule.rounds) {
+    for (const t of round?.tables ?? []) {
+      const seats = [t.captainId, ...(t.memberIds ?? [])];
+      if (!seats.includes(me)) continue;
+      for (const pid of seats) if (pid !== me) out.add(uidOf.get(pid) ?? "");
+    }
+  }
+  out.delete("");
+  return out;
+}
+
+/**
+ * The member-facing conclave list: every conclave, flagged with THIS member's
+ * registration (role, table). In the seating list, phone numbers are kept only
+ * for people the member shared a table with ("People I met" → save contact);
+ * everyone else's are removed.
  */
 export async function listForMember(uid: string, email?: string) {
   const [all, mine] = await Promise.all([
@@ -774,17 +795,27 @@ export async function listForMember(uid: string, email?: string) {
       const conditions = [eq(registrations.userId, uid)];
       if (e) conditions.push(sql`lower(${registrations.email}) = ${e}`);
       if (u?.phone) conditions.push(eq(registrations.phone, u.phone));
-      return pgdb.selectDistinct({ id: registrations.conclaveId }).from(registrations).where(or(...conditions));
+      return pgdb
+        .select({ id: registrations.conclaveId, role: registrations.role, tableNumber: registrations.tableNumber })
+        .from(registrations)
+        .where(or(...conditions));
     })(),
   ]);
-  const registered = new Set(mine.map((r) => r.id));
-  return all.map((c) => ({
-    ...c,
-    participants: Array.isArray(c.participants)
-      ? (c.participants as Record<string, unknown>[]).map(({ phone: _phone, ...p }) => p)
-      : c.participants,
-    isRegistered: registered.has(c.id),
-  }));
+  const regBy = new Map(mine.map((r) => [r.id, r]));
+  return all.map((c) => {
+    const parts = Array.isArray(c.participants) ? (c.participants as Record<string, unknown>[]) : null;
+    const met = parts ? tablemateUids(c.schedule, parts, uid) : new Set<string>();
+    const reg = regBy.get(c.id);
+    return {
+      ...c,
+      participants: parts
+        ? parts.map(({ phone, ...p }) => (met.has(String(p._originalUid)) || p._originalUid === uid ? { ...p, phone } : p))
+        : c.participants,
+      isRegistered: !!reg,
+      myRole: reg?.role ?? null,
+      myTableNumber: reg?.tableNumber ?? null,
+    };
+  });
 }
 
 /**
