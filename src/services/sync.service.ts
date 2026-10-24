@@ -17,9 +17,10 @@ import { getNotificationTemplates, fillTemplate, getRoundTiming, type RoundTimin
  * Design rules (see OFFLINE_ATTENDANCE_AND_SYNC.md — "must not be lost"):
  * - Everything from the phone is UNTRUSTED and validated against the schedule.
  * - A captain's mark beats a member's self-mark, whatever order they sync in.
- * - Referrals are judged by WHEN THEY WERE MADE (the phone's timestamp), not
- *   when they arrive — a late sync after the venue's network recovers must not
- *   lose a referral. Referrals are immutable once given.
+ * - Referrals for the round in progress are judged by WHEN THEY WERE MADE
+ *   (the phone's timestamp) against that round's exact window; referrals for
+ *   earlier rounds that sync late (venue network back) are accepted, never
+ *   lost; future rounds are refused. Referrals are immutable once given.
  * - Each batch is one transaction, audited as a summary; each new referral is
  *   audited individually.
  */
@@ -200,17 +201,26 @@ export async function syncConclave(conclaveId: string, callerUid: string, payloa
           acceptedReferrals.push(id);
           continue;
         }
-        // Judge the window by when the referral was MADE (phone time), so a late sync isn't lost.
+        // Only the round in progress has an EXACT window (its anchor is known);
+        // judge it by when the referral was MADE (phone time). Earlier rounds'
+        // windows can only be estimated (rounds may have been closed early), so
+        // a late sync for a past round is accepted rather than risk losing it.
         const madeAt = r.timestamp ? Date.parse(r.timestamp) : NaN;
-        const size = tableSizeOf(schedule, participants, round, String(r.fromUserId), conclave.personsPerTable ?? 6);
-        const w = referralWindow(conclave, timing, round, size);
-        if (!insecure && w && Number.isFinite(madeAt)) {
-          if (madeAt < w.opens - CLOCK_SLACK_MS) {
+        const liveRound = conclave.currentRound || 0;
+        if (!insecure && liveRound && round > liveRound) {
+          errors.push(`Rejected referral ${id}: round ${round} hasn't started yet.`);
+          acceptedReferrals.push(id);
+          continue;
+        }
+        if (!insecure && round === liveRound && Number.isFinite(madeAt)) {
+          const size = tableSizeOf(schedule, participants, round, String(r.fromUserId), conclave.personsPerTable ?? 6);
+          const w = referralWindow(conclave, timing, round, size);
+          if (w && madeAt < w.opens - CLOCK_SLACK_MS) {
             errors.push(`Rejected referral ${id}: it was made during talking time in round ${round}. Referrals open in the referral window.`);
             acceptedReferrals.push(id);
             continue;
           }
-          if (madeAt > w.closes + CLOCK_SLACK_MS) {
+          if (w && madeAt > w.closes + CLOCK_SLACK_MS) {
             errors.push(`Rejected referral ${id}: it was made after round ${round}'s referral window closed.`);
             acceptedReferrals.push(id);
             continue;

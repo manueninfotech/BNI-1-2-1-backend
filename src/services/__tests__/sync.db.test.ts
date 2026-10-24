@@ -104,19 +104,24 @@ describe("referrals", () => {
     expect(await pgdb.select().from(referrals)).toHaveLength(0);
   });
 
-  it("judges the window by when it was made: talking time refused, a late sync accepted", async () => {
-    const early = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r4", mate, cap, new Date(roundStart + 60_000))] }));
+  it("current round: judged by when it was made; past rounds synced late are kept; future refused", async () => {
+    // 10s into the round is talking time at any table size.
+    const early = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r4", mate, cap, new Date(roundStart + 10_000))] }));
     expect(early.errors.join(" ")).toMatch(/talking time/);
 
-    // Made inside round 1's window, synced "now" — and even if the clock moves on, it's kept.
-    await pgdb.update(conclaves).set({ currentRound: 3, currentRoundStartedAt: new Date(roundStart + 2 * 7 * 60_000) }).where(eq(conclaves.id, conclaveId));
+    // The conclave moves on to round 3; a round-1 referral arrives late → kept.
+    await pgdb.update(conclaves).set({ currentRound: 3, currentRoundStartedAt: new Date() }).where(eq(conclaves.id, conclaveId));
     try {
-      const late = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r5", mate, cap, new Date(roundStart + 5 * 60_000))] }));
+      const late = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r5", mate, cap, new Date(roundStart + 10_000))] }));
       expect(late.errors).toEqual([]);
       expect(await pgdb.select().from(referrals).where(eq(referrals.id, "r5"))).toHaveLength(1);
     } finally {
       await pgdb.update(conclaves).set({ currentRound: 1, currentRoundStartedAt: new Date(roundStart) }).where(eq(conclaves.id, conclaveId));
     }
+
+    // A referral for a round that hasn't started is refused.
+    const future = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [{ ...ref("r9", mate, cap), roundNumber: 2 }] }));
+    expect(future.errors.join(" ")).toMatch(/hasn't started|share a table/);
 
     // An old app build that sends no timestamp is never lost.
     const noTs = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [{ ...ref("r6", mate, cap), timestamp: undefined }] }));
