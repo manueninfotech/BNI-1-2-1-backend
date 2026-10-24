@@ -1,7 +1,7 @@
-import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { db, collections } from "../config/firebase.js";
 import { pgdb } from "../db/client.js";
-import { conclaves, registrations } from "../db/schema.js";
+import { conclaves, registrations, users } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import {
@@ -770,3 +770,30 @@ export async function listRunning() {
   return pgdb.select().from(conclaves).where(inArray(conclaves.status, [ConclaveStatus.running]));
 }
 export { mutate as mutateConclave };
+
+/**
+ * The member-facing conclave list: every conclave, flagged with whether THIS
+ * member is registered, with other attendees' contact details removed (the
+ * seating list carries names/businesses for the schedule, never phone numbers).
+ */
+export async function listForMember(uid: string, email?: string) {
+  const [all, mine] = await Promise.all([
+    listConclaves(),
+    (async () => {
+      const [u] = await pgdb.select({ email: users.email, phone: users.phone }).from(users).where(eq(users.uid, uid));
+      const e = (u?.email || email || "").toLowerCase().trim();
+      const conditions = [eq(registrations.userId, uid)];
+      if (e) conditions.push(sql`lower(${registrations.email}) = ${e}`);
+      if (u?.phone) conditions.push(eq(registrations.phone, u.phone));
+      return pgdb.selectDistinct({ id: registrations.conclaveId }).from(registrations).where(or(...conditions));
+    })(),
+  ]);
+  const registered = new Set(mine.map((r) => r.id));
+  return all.map((c) => ({
+    ...c,
+    participants: Array.isArray(c.participants)
+      ? (c.participants as Record<string, unknown>[]).map(({ phone: _phone, ...p }) => p)
+      : c.participants,
+    isRegistered: registered.has(c.id),
+  }));
+}
