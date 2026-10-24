@@ -162,3 +162,16 @@ describe("requireSuperadmin / requireRole", () => {
     expect((await run(requireSuperadmin, await withAdmin("admin-uid"))).status).toBe(403);
   });
 });
+
+describe("canManage (admin account permission matrix)", () => {
+  it("superadmin → anyone; admin → coordinators only; coordinator → nobody", async () => {
+    const { canManage } = await import("../../services/admins.service.js");
+    expect(canManage("superadmin", "superadmin")).toBe(true);
+    expect(canManage("superadmin", "admin")).toBe(true);
+    expect(canManage("admin", "coordinator")).toBe(true);
+    expect(canManage("admin", "admin")).toBe(false);
+    expect(canManage("admin", "superadmin")).toBe(false);
+    expect(canManage("coordinator", "coordinator")).toBe(false);
+    expect(canManage(null, "coordinator")).toBe(false);
+  });
+});
