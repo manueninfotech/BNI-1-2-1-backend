@@ -5,6 +5,12 @@
 # LTS matches package.json engines (>=20).
 FROM node:20-slim
 
+# Install tzdata package so the container has accurate timezone database
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
+
+# Set timezone to Indian Standard Time (IST)
+ENV TZ="Asia/Kolkata"
+
 WORKDIR /app
 
 # Install production dependencies first for better layer caching. tsx and

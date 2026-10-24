@@ -1,3 +1,5 @@
+process.env.TZ = process.env.TZ || "Asia/Kolkata";
+
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { startReminderScheduler } from "./services/reminder.service.js";

@@ -44,7 +44,7 @@ export function conclaveWindow(c: {
 
   if (start && end) return { start, end };
 
-  const date = asDate(c.date) ?? start ?? asDate(c.regEndDate) ?? asDate(c.regStartDate) ?? new Date();
+  const date = asDate(c.date) ?? start ?? asDate(c.regEndDate) ?? asDate(c.regStartDate);
   if (!date) return null;
 
   const dayEnd = new Date(date);

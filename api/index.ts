@@ -12,6 +12,7 @@
  * There is no filesystem to read a key file from in a serverless deploy, which is
  * why credentials must come from the environment.
  */
+process.env.TZ = process.env.TZ || "Asia/Kolkata";
 import { createApp } from "../src/app.js";
 
 export default createApp();
