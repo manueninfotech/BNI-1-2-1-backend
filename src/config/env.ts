@@ -19,6 +19,9 @@ export const env = {
    */
   firebaseServiceAccount: process.env.FIREBASE_SERVICE_ACCOUNT ?? "",
 
+  /** Postgres connection string (replaces Firestore). */
+  databaseUrl: process.env.DATABASE_URL ?? "postgres://localhost:5432/conclave_dev",
+
   /**
    * Cloud Storage bucket for uploaded files (agenda PDFs). Defaults to this
    * project's bucket; override per environment if needed.
