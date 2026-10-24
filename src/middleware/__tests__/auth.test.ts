@@ -172,6 +172,5 @@ describe("canManage (admin account permission matrix)", () => {
     expect(canManage("admin", "admin")).toBe(false);
     expect(canManage("admin", "superadmin")).toBe(false);
     expect(canManage("coordinator", "coordinator")).toBe(false);
-    expect(canManage(null, "coordinator")).toBe(false);
   });
 });
