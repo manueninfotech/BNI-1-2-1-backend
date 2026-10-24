@@ -13,6 +13,7 @@ import {
 } from "../services/notification.service.js";
 import { ApiError } from "../middleware/errors.js";
 import * as users from "../services/user.service.js";
+import * as referralsSvc from "../services/referrals.service.js";
 import * as notificationsSvc from "../services/notifications.service.js";
 
 export async function listNotifications(req: AuthedRequest, res: Response) {
@@ -36,17 +37,6 @@ export async function deleteAccount(req: AuthedRequest, res: Response) {
 
 const displayName = users.displayName;
 
-function toISO(val: any): string {
-  if (!val) return new Date().toISOString();
-  if (typeof val === 'string') return val;
-  if (typeof val === 'number') return new Date(val).toISOString();
-  if (typeof val === 'object') {
-    if (typeof val.toDate === 'function') return val.toDate().toISOString();
-    if (val._seconds) return new Date(val._seconds * 1000).toISOString();
-    if (val.seconds) return new Date(val.seconds * 1000).toISOString();
-  }
-  return new Date().toISOString();
-}
 
 /**
  * The member directory — ONLY fields safe to show to other members (no email,
@@ -144,188 +134,19 @@ export async function listConclaves(req: AuthedRequest, res: Response) {
 }
 
 
+/** Referrals in this conclave that the caller gave or received — never anyone else's. */
 export async function getReferrals(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  try {
-    const snap = await db.collection(collections.conclaves).doc(id).collection(collections.referrals).get();
-    const list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.json(list);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || "Failed to fetch referrals." });
-  }
+  res.json(await referralsSvc.listMineInConclave(req.params.id, req.uid));
 }
 
-/**
- * This member's referrals across EVERY conclave — the ones they gave, and the
- * ones they received. Self-scoped: the uid comes from the verified token, so a
- * caller can only ever read their own network, never someone else's.
- *
- * Iterates conclaves and queries each `referrals` subcollection (equality on a
- * single field, which the automatic index covers) rather than a collectionGroup
- * query, so it needs no extra index deployed to work.
- */
+/** The caller's referral network across every conclave (self-scoped by the token). */
 export async function myReferrals(req: AuthedRequest, res: Response) {
-  const uid = req.uid;
-  const conclavesSnap = await db.collection(collections.conclaves).get();
-
-  type Row = {
-    id: string;
-    conclaveId: string;
-    conclaveName: string;
-    roundNumber: number;
-    otherUserId: string;
-    otherName: string;
-    otherBusinessName: string;
-    notes: string;
-    status: string;
-    // Business-outcome lifecycle, driven by the RECEIVER of the referral.
-    outcome: string; // 'open' | 'accepted' | 'closed' | 'not_closed'
-    closedAmount: number; // TYFCB value in rupees, when closed
-    outcomeNote: string;
-    outcomeAt: string | null;
-    createdAt: string;
-  };
-
-  const outcomeFields = (r: any) => ({
-    outcome: (r.outcome as string) || "open",
-    closedAmount: Number(r.closedAmount ?? 0),
-    outcomeNote: (r.outcomeNote as string) || "",
-    outcomeAt: r.outcomeAt ? toISO(r.outcomeAt) : null,
-  });
-
-  const given: Row[] = [];
-  const received: Row[] = [];
-
-  await Promise.all(
-    conclavesSnap.docs.map(async (c) => {
-      const conclaveName = (c.data() as any).name || "Conclave";
-      const refs = c.ref.collection(collections.referrals);
-
-      const [givenSnap, recvSnap] = await Promise.all([
-        refs.where("fromUserId", "==", uid).get(),
-        refs.where("toUserId", "==", uid).get(),
-      ]);
-
-      givenSnap.forEach((d) => {
-        const r = d.data() as any;
-        given.push({
-          id: d.id,
-          conclaveId: c.id,
-          conclaveName,
-          roundNumber: Number(r.roundNumber ?? 0),
-          otherUserId: String(r.toUserId ?? ""),
-          otherName: r.toName ?? "",
-          otherBusinessName: "",
-          notes: r.notes ?? "",
-          status: r.status || "Pending",
-          ...outcomeFields(r),
-          createdAt: toISO(r.createdAt || r.syncedAt),
-        });
-      });
-
-      recvSnap.forEach((d) => {
-        const r = d.data() as any;
-        received.push({
-          id: d.id,
-          conclaveId: c.id,
-          conclaveName,
-          roundNumber: Number(r.roundNumber ?? 0),
-          otherUserId: String(r.fromUserId ?? ""),
-          otherName: r.fromName ?? "",
-          otherBusinessName: "",
-          notes: r.notes ?? "",
-          status: r.status || "Pending",
-          ...outcomeFields(r),
-          createdAt: toISO(r.createdAt || r.syncedAt),
-        });
-      });
-    }),
-  );
-
-  // Resolve counterpart name + business from the users collection, so the list
-  // is consistent even for older referrals that didn't store a name inline.
-  const ids = [
-    ...new Set([...given, ...received].map((r) => r.otherUserId).filter(Boolean)),
-  ];
-  if (ids.length) {
-    const docs = await db.getAll(
-      ...ids.map((id) => db.collection(collections.users).doc(id)),
-    );
-    const users = new Map<string, { name: string; businessName: string }>();
-    docs.forEach((d) => {
-      if (d.exists) {
-        const u = d.data() as any;
-        users.set(d.id, {
-          name: u.name || "",
-          businessName: u.businessName || "",
-        });
-      }
-    });
-    for (const r of [...given, ...received]) {
-      const u = users.get(r.otherUserId);
-      if (u) {
-        if (!r.otherName) r.otherName = u.name;
-        r.otherBusinessName = u.businessName;
-      }
-    }
-  }
-
-  const byNewest = (a: Row, b: Row) => b.createdAt.localeCompare(a.createdAt);
-  given.sort(byNewest);
-  received.sort(byNewest);
-
-  res.json({ given, received });
+  res.json(await referralsSvc.myReferrals(req.uid));
 }
 
-/**
- * Records the business outcome of a referral: the lifecycle a RECEIVER drives —
- * accepted, closed (with a TYFCB amount), or didn't work out.
- *
- * Only the person who RECEIVED the referral may update it — the outcome is their
- * report of what happened, and it credits the giver. The uid comes from the
- * token, so a caller can never touch a referral that wasn't theirs to close.
- */
-const OUTCOMES = new Set(["open", "accepted", "closed", "not_closed"]);
-
+/** The receiver records the business outcome (accepted / closed with amount / didn't work out). */
 export async function updateReferralOutcome(req: AuthedRequest, res: Response) {
-  const { cid, rid } = req.params;
-  const outcome = String(req.body?.outcome || "").trim();
-  const amount = Number(req.body?.amount ?? 0);
-  const note = String(req.body?.note ?? "").trim();
-
-  if (!OUTCOMES.has(outcome)) {
-    throw new ApiError(400, "Invalid outcome.");
-  }
-  if (outcome === "closed" && (!Number.isFinite(amount) || amount < 0)) {
-    throw new ApiError(400, "A closed referral needs a valid amount.");
-  }
-
-  const ref = db
-    .collection(collections.conclaves)
-    .doc(cid)
-    .collection(collections.referrals)
-    .doc(rid);
-
-  const snap = await ref.get();
-  if (!snap.exists) throw new ApiError(404, "Referral not found.");
-  if ((snap.data() as any).toUserId !== req.uid) {
-    throw new ApiError(403, "Only the member who received a referral can update it.");
-  }
-
-  const newStatus = (outcome === "accepted" || outcome === "closed") ? "Completed" : ((snap.data() as any).status || "Pending");
-
-  await ref.set(
-    {
-      outcome,
-      status: newStatus,
-      closedAmount: outcome === "closed" ? amount : 0,
-      outcomeNote: note,
-      outcomeAt: new Date().toISOString(),
-    },
-    { merge: true },
-  );
-
-  res.json({ ok: true, outcome, status: newStatus, closedAmount: outcome === "closed" ? amount : 0 });
+  res.json(await referralsSvc.updateOutcome(req.params.cid, req.params.rid, req.uid, req.body ?? {}));
 }
 
 // ---------------------------------------------------------------------------
