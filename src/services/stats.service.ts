@@ -1,141 +1,106 @@
-import { collections } from "../config/firebase.js";
+import { eq, sql } from "drizzle-orm";
+import { pgdb } from "../db/client.js";
+import { attendance, referrals, registrations } from "../db/schema.js";
 import { tableCountFor } from "../engine/index.js";
-import { roundTiming, ConclaveStatus } from "../domain/conclave.js";
-import { conclaveRef, getConclaveOrThrow } from "./conclave.service.js";
+import { ConclaveStatus, ROLE_LOCKED_STATUSES } from "../domain/conclave.js";
+import { getConclaveOrThrow, roundDurationMs } from "./conclave.service.js";
 import { fetchUsers, isActiveUser, listRegistrants } from "./user.service.js";
-import { getAutoLogoutHours } from "./settings.service.js";
-import { toDate } from "../utils/firestore.js";
+import { getAutoLogoutHours, getRoundTiming } from "./settings.service.js";
 
 /**
- * The live dashboard for one conclave.
+ * The live dashboard for one conclave (polled by the admin panel).
  *
- * Every read here is independent, so they are issued together. Awaiting them one
- * at a time costs a full network round trip each — and the dashboard polls this.
+ * Round timing comes from the admin-tuned settings — the same numbers the app
+ * and the auto-complete sweep use, so the admin's countdown matches members'.
+ * Errors surface as errors (with a request id) rather than a fake all-zero
+ * dashboard that looks real.
  */
 export async function conclaveStats(id: string) {
   const serverReceivedAt = Date.now();
-  const ref = conclaveRef(id);
+  const { row: conclave } = await getConclaveOrThrow(id);
 
-  try {
-    const [conclaveDoc, autoLogoutHours, regsSnap, referralsCount, attendanceCount] =
-      await Promise.all([
-        ref.get(),
-        getAutoLogoutHours().catch(() => 24),
-        ref.collection(collections.registrations).get().catch(() => ({ docs: [], size: 0 })),
-        ref.collection(collections.referrals).count().get().catch(() => ({ data: () => ({ count: 0 }) })),
-        ref.collection(collections.attendance).count().get().catch(() => ({ data: () => ({ count: 0 }) })),
-      ]);
+  const [autoLogoutHours, timing, regs, [{ refCount }], [{ attCount }]] = await Promise.all([
+    getAutoLogoutHours(),
+    getRoundTiming(),
+    pgdb.select({ userId: registrations.userId, role: registrations.role }).from(registrations).where(eq(registrations.conclaveId, id)),
+    pgdb.select({ refCount: sql<number>`count(*)::int` }).from(referrals).where(eq(referrals.conclaveId, id)),
+    pgdb.select({ attCount: sql<number>`count(*)::int` }).from(attendance).where(eq(attendance.conclaveId, id)),
+  ]);
 
-    const conclave = conclaveDoc.exists ? conclaveDoc.data()! : {};
-    const docsList = (regsSnap as any).docs || [];
-    const users = await fetchUsers(docsList.map((d: any) => d.id)).catch(() => new Map());
-    const now = new Date();
+  const users = await fetchUsers(regs.map((r) => r.userId));
+  const now = new Date();
+  const captains = regs.filter((r) => r.role === "captain").length;
+  const active = regs.filter((r) => isActiveUser(users.get(r.userId), autoLogoutHours, now)).length;
 
-    let active = 0;
-    let captains = 0;
-    for (const doc of docsList) {
-      if (doc.data().role === "captain") captains++;
-      if (isActiveUser(users.get(doc.id), autoLogoutHours, now)) active++;
-    }
+  const personsPerTable = conclave.personsPerTable ?? 7;
+  const roundMs = roundDurationMs(personsPerTable, timing, conclave.legacy?.roundBlockMinutes);
+  const activeMs = (timing.bioSeconds + timing.referralSeconds) * 1000 * Math.max(1, personsPerTable);
+  const transitionMs = Math.max(0, roundMs - activeMs);
 
-    const total = (regsSnap as any).size || docsList.length;
-    const personsPerTable = conclave.personsPerTable ?? 7;
-    const { activeMs, transitionMs } = roundTiming(personsPerTable);
-
-    const startsAt = toDate(conclave.startTime) ?? toDate(conclave.date);
-    const roundStartedAt = toDate(conclave.currentRoundStartedAt);
-
-    let currentRoundEndsAt: string | null = null;
-    let currentRoundComplete: boolean | null = null;
-    if (conclave.status === ConclaveStatus.running && roundStartedAt) {
-      const endsAt = new Date(roundStartedAt.getTime() + activeMs);
-      currentRoundEndsAt = endsAt.toISOString();
-      currentRoundComplete = now >= endsAt;
-    }
-
-    return {
-      serverReceivedAt: new Date(serverReceivedAt).toISOString(),
-      serverSentAt: new Date().toISOString(),
-      conclaveId: id,
-      name: conclave.name ?? "",
-      status: conclave.status ?? "draft",
-      personsPerTable,
-      roundCount: conclave.roundCount ?? 0,
-      currentRound: conclave.currentRound ?? 0,
-      autoLogoutHours,
-      startsAt: startsAt?.toISOString() ?? null,
-      currentRoundStartedAt: roundStartedAt?.toISOString() ?? null,
-      currentRoundEndsAt,
-      currentRoundComplete,
-      roundActiveMs: activeMs,
-      roundTransitionMs: transitionMs,
-      counts: {
-        registered: total,
-        active,
-        captains,
-        members: total - captains,
-        referrals: (referralsCount as any)?.data()?.count || 0,
-        attendanceRecords: (attendanceCount as any)?.data()?.count || 0,
-      },
-    };
-  } catch (err: any) {
-    console.warn("conclaveStats failed (quota/network):", err?.message || err);
-    return {
-      serverReceivedAt: new Date(serverReceivedAt).toISOString(),
-      serverSentAt: new Date().toISOString(),
-      conclaveId: id,
-      name: "",
-      status: "draft",
-      personsPerTable: 7,
-      roundCount: 4,
-      currentRound: 0,
-      autoLogoutHours: 24,
-      startsAt: null,
-      currentRoundStartedAt: null,
-      currentRoundEndsAt: null,
-      currentRoundComplete: null,
-      roundActiveMs: 300000,
-      roundTransitionMs: 120000,
-      counts: {
-        registered: 0,
-        active: 0,
-        captains: 0,
-        members: 0,
-        referrals: 0,
-        attendanceRecords: 0,
-      },
-    };
+  let startsAt: Date | null = conclave.startDate;
+  const [hh, mm] = String(conclave.startTime ?? "").split(":");
+  if (startsAt && hh && mm) {
+    startsAt = new Date(startsAt);
+    startsAt.setHours(Number(hh) || 0, Number(mm) || 0, 0, 0);
   }
+
+  let currentRoundEndsAt: string | null = null;
+  let currentRoundComplete: boolean | null = null;
+  if (conclave.status === ConclaveStatus.running && conclave.currentRoundStartedAt) {
+    const endsAt = new Date(conclave.currentRoundStartedAt.getTime() + activeMs);
+    currentRoundEndsAt = endsAt.toISOString();
+    currentRoundComplete = now >= endsAt;
+  }
+
+  return {
+    serverReceivedAt: new Date(serverReceivedAt).toISOString(),
+    serverSentAt: new Date().toISOString(),
+    conclaveId: id,
+    name: conclave.name,
+    status: conclave.status,
+    personsPerTable,
+    roundCount: conclave.roundCount ?? 0,
+    currentRound: conclave.currentRound,
+    autoLogoutHours,
+    startsAt: startsAt?.toISOString() ?? null,
+    currentRoundStartedAt: conclave.currentRoundStartedAt?.toISOString() ?? null,
+    currentRoundEndsAt,
+    currentRoundComplete,
+    roundActiveMs: activeMs,
+    roundTransitionMs: transitionMs,
+    counts: {
+      registered: regs.length,
+      active,
+      captains,
+      members: regs.length - captains,
+      referrals: refCount,
+      attendanceRecords: attCount,
+    },
+  };
 }
 
 /** Registrants plus the captain arithmetic the admin needs to act on. */
 export async function registrationsWithCounts(id: string) {
-  const { data: conclave } = await getConclaveOrThrow(id);
-
-  const [registrations, autoLogoutHours] = await Promise.all([
-    listRegistrants(id),
-    getAutoLogoutHours(),
-  ]);
-
-  const captainsDesignated = registrations.filter((r) => r.role === "captain").length;
-  const activeCount = registrations.filter((r) => r.isActive).length;
+  const { row: conclave } = await getConclaveOrThrow(id);
+  const [list, autoLogoutHours] = await Promise.all([listRegistrants(id), getAutoLogoutHours()]);
+  const captainsDesignated = list.filter((r) => r.role === "captain").length;
+  const activeCount = list.filter((r) => r.isActive).length;
   const personsPerTable = conclave.personsPerTable ?? 7;
 
   return {
     conclaveId: id,
-    status: conclave.status ?? "draft",
-    rolesLocked: ["running", "completed", "cancelled"].includes(conclave.status ?? ""),
+    status: conclave.status,
+    rolesLocked: ROLE_LOCKED_STATUSES.has(conclave.status),
     personsPerTable,
     autoLogoutHours,
-    registrations,
+    registrations: list,
     counts: {
-      total: registrations.length,
+      total: list.length,
       active: activeCount,
       captainsDesignated,
-      members: registrations.length - captainsDesignated,
-      // T = ceil(A / P): one captain per table. If the admin intends to snapshot
-      // only active users, the captain requirement shrinks with them.
-      captainsRequired: tableCountFor(registrations.length, personsPerTable),
+      members: list.length - captainsDesignated,
+      // T = ceil(A / P): one captain per table; shrinks if only active users are seated.
+      captainsRequired: tableCountFor(list.length, personsPerTable),
       captainsRequiredIfActiveOnly: tableCountFor(activeCount, personsPerTable),
     },
   };
