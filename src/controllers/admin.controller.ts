@@ -1,9 +1,11 @@
 import fs from "fs";
+import * as adminsService from "../services/admins.service.js";
+import * as usersService from "../services/user.service.js";
 import * as regionsService from "../services/regions.service.js";
 import path from "path";
 import type { Response } from "express";
 import type { AuthedRequest } from "../middleware/auth.js";
-import { db, auth, collections } from "../config/firebase.js";
+import { db, collections } from "../config/firebase.js";
 import * as conclaves from "../services/conclave.service.js";
 import { toDate } from "../utils/firestore.js";
 import * as schedule from "../services/schedule.service.js";
@@ -505,7 +507,7 @@ export async function attendance(req: AuthedRequest, res: Response) {
       id: doc.id,
       userId: data.userId,
       userName: user?.name || data.name || "Member",
-      userCategory: user?.businessCategory || "BNI Member",
+      userCategory: user?.category || "BNI Member",
       roundNumber: data.roundNumber || 1,
       tableNumber: data.tableNumber || null,
       isPresent: !!data.isPresent,
@@ -541,144 +543,32 @@ export async function deleteRegion(req: AuthedRequest, res: Response) {
 
 // ---- Superadmin Coordinators CRUD -----------------------------------------
 
-export async function listCoordinators(_req: AuthedRequest, res: Response) {
-  const snap = await db.collection(collections.admins).get();
-  const list = snap.docs
-    .map(doc => {
-      const data = doc.data() as any;
-      return {
-        uid: doc.id,
-        ...data,
-        grantedAt: data.grantedAt ? toDate(data.grantedAt)?.toISOString() : null
-      };
-    })
-    .filter(admin => admin.role !== "superadmin" && admin.email !== "superadmin@bni.com");
-  res.json(list);
+export async function listCoordinators(req: AuthedRequest, res: Response) {
+  res.json(await adminsService.listAdmins(req.admin!));
 }
 
 export async function createCoordinator(req: AuthedRequest, res: Response) {
-  const { email, password, name, mobile, region, status, role } = req.body ?? {};
-  if (!email || !password || !name) {
-    return res.status(400).json({ error: "Email, password, and name are required." });
-  }
-
-  let formattedPhone = mobile ? mobile.trim() : "";
-  if (formattedPhone) {
-    if (!formattedPhone.startsWith("+")) {
-      if (formattedPhone.length === 10 && /^\d+$/.test(formattedPhone)) {
-        formattedPhone = `+91${formattedPhone}`;
-      }
-    }
-  }
-
-  let uid: string;
-  try {
-    const user = await auth.createUser({
-      email,
-      password,
-      displayName: name,
-      emailVerified: true,
-      ...(formattedPhone ? { phoneNumber: formattedPhone } : {})
-    });
-    uid = user.uid;
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message || "Failed to create Auth user." });
-  }
-
-  await db.collection(collections.admins).doc(uid).set({
-    email,
-    name,
-    mobile: mobile || "",
-    region: region || "Guntur Region",
-    status: status || "Active",
-    role: role || "coordinator",
-    grantedAt: new Date()
-  });
+  const { uid } = await adminsService.createAdmin(req.admin!, req.body ?? {});
   res.status(201).json({ uid, message: "Coordinator created successfully." });
 }
 
 export async function updateCoordinator(req: AuthedRequest, res: Response) {
-  const { uid } = req.params;
-  const { name, mobile, region, status, role } = req.body ?? {};
-  const updateData: any = {};
-  if (name !== undefined) updateData.name = name;
-  if (mobile !== undefined) updateData.mobile = mobile;
-  if (region !== undefined) updateData.region = region;
-  if (status !== undefined) updateData.status = status;
-  if (role !== undefined) updateData.role = role;
-
-  await db.collection(collections.admins).doc(uid).update(updateData);
-  
-  const authUpdates: any = {};
-  if (name) authUpdates.displayName = name;
-  
-  if (mobile !== undefined) {
-    let formattedPhone = mobile.trim();
-    if (formattedPhone) {
-      if (!formattedPhone.startsWith("+")) {
-        if (formattedPhone.length === 10 && /^\d+$/.test(formattedPhone)) {
-          formattedPhone = `+91${formattedPhone}`;
-        }
-      }
-      authUpdates.phoneNumber = formattedPhone;
-    } else {
-      authUpdates.phoneNumber = null;
-    }
-  }
-
-  if (Object.keys(authUpdates).length > 0) {
-    try {
-      await auth.updateUser(uid, authUpdates);
-    } catch (err: any) {
-      console.warn("Failed to update user profile in Firebase Auth:", err.message);
-    }
-  }
-  
+  await adminsService.updateAdmin(req.admin!, req.params.uid, req.body ?? {});
   res.json({ message: "Coordinator updated successfully." });
 }
 
 export async function resetCoordinatorPassword(req: AuthedRequest, res: Response) {
-  const { uid } = req.params;
-  const { password } = req.body ?? {};
-  if (!password) {
-    return res.status(400).json({ error: "Password is required." });
-  }
-  await auth.updateUser(uid, { password });
+  await adminsService.resetAdminPassword(req.admin!, req.params.uid, req.body?.password);
   res.json({ message: "Password reset successfully." });
 }
 
 export async function deleteCoordinator(req: AuthedRequest, res: Response) {
-  const { uid } = req.params;
-  await db.collection(collections.admins).doc(uid).delete();
-  try {
-    await auth.deleteUser(uid);
-  } catch (err) {
-    console.warn("Failed to delete Auth user:", err);
-  }
+  await adminsService.deleteAdmin(req.admin!, req.params.uid);
   res.json({ message: "Coordinator access revoked successfully." });
 }
 
 export async function listAllUsers(_req: AuthedRequest, res: Response) {
-  const snap = await db.collection(collections.users).get();
-  const list = snap.docs
-    .map(doc => {
-      const data = doc.data();
-      const loc = data.location;
-      const regionStr = data.region || (loc ? (typeof loc === "object" ? loc.place : loc) : undefined) || "Global";
-      return {
-        id: doc.id,
-        name: data.name || "Unknown Member",
-        company: data.businessName || data.company || "",
-        category: data.businessCategory || data.category || "",
-        region: regionStr,
-        chapter: data.chapter || "",
-        status: data.lastLoginAt ? "Active" : "Inactive",
-        email: data.email || "",
-        mobile: data.phone || data.mobile || ""
-      };
-    })
-    .filter(u => u.email !== "superadmin@bni.com");
-  res.json(list);
+  res.json(await usersService.listAllMembersForAdmin());
 }
 
 export async function deleteConclave(req: AuthedRequest, res: Response) {
@@ -687,14 +577,7 @@ export async function deleteConclave(req: AuthedRequest, res: Response) {
 }
 
 export async function setUserRole(req: AuthedRequest, res: Response) {
-  const { uid } = req.params;
-  const { role } = req.body ?? {};
-  if (!role) {
-    return res.status(400).json({ error: "Role is required." });
-  }
-  await db.collection(collections.users).doc(uid).set({ role }, { merge: true });
+  await usersService.setUserRole(req.params.uid, req.body?.role);
   res.json({ message: "User role updated successfully." });
 }
-
-
 

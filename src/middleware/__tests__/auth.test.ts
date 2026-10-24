@@ -1,68 +1,71 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { eq, sql } from "drizzle-orm";
 
 /**
- * Regression tests for the auth bypasses fixed on 2026-10-24: an unverifiable
- * token used to be accepted as the uid itself (members) or as the superadmin
- * (any token containing "admin"), and an admin lookup error granted access.
+ * Auth regression tests (bypasses fixed 2026-10-24): an unverifiable token used
+ * to be accepted as the uid itself, or as the superadmin if it contained
+ * "admin"; any email containing "admin" was an admin; a lookup error granted
+ * access. The allowlist is real Postgres rows; only Firebase token verification
+ * is faked.
  */
 
-// --- Firebase mocks ---------------------------------------------------------
 const verifyIdToken = vi.fn();
-const adminDocs = new Map<string, Record<string, unknown>>();
-let firestoreDown = false;
+vi.mock("../../config/firebase.js", () => ({
+  auth: { verifyIdToken: (t: string) => verifyIdToken(t) },
+}));
+vi.mock("../../config/env.js", async (orig) => {
+  const real: any = await orig();
+  return { ...real, env: { ...real.env, allowInsecureAdmin: false } };
+});
 
-vi.mock("../../config/firebase.js", () => {
-  const doc = (id: string) => ({
-    get: async () => {
-      if (firestoreDown) throw new Error("UNAVAILABLE");
-      return { exists: adminDocs.has(id), data: () => adminDocs.get(id) };
-    },
-    set: async () => {},
-  });
-  const where = (_f: string, _op: string, email: string) => ({
-    limit: () => ({
-      get: async () => {
-        if (firestoreDown) throw new Error("UNAVAILABLE");
-        const hits = [...adminDocs.values()].filter((d) => d.email === email);
-        return { empty: hits.length === 0, docs: hits.map((d) => ({ data: () => d })) };
-      },
-    }),
-  });
+let allowlistDown = false;
+vi.mock("../../services/admins.service.js", async (orig) => {
+  const real: any = await orig();
   return {
-    auth: { verifyIdToken: (t: string) => verifyIdToken(t) },
-    db: { collection: () => ({ doc, where }) },
-    collections: { admins: "admins" },
+    ...real,
+    findActiveAdmin: (...a: unknown[]) =>
+      allowlistDown ? Promise.reject(new Error("db down")) : real.findActiveAdmin(...a),
   };
 });
 
-vi.mock("../../config/env.js", () => ({ env: { allowInsecureAdmin: false } }));
+const { requireUser, requireAdmin, requireSuperadmin, requireRole, clearAdminCache } = await import("../auth.js");
+const { pgdb, pool } = await import("../../db/client.js");
+const { admins } = await import("../../db/schema.js");
+const { runWithContext } = await import("../../observability/context.js");
 
-const { requireUser, requireAdmin, requireSuperadmin } = await import("../auth.js");
-
-// --- helpers ----------------------------------------------------------------
 const reqWith = (token?: string): any => ({ headers: token ? { authorization: `Bearer ${token}` } : {} });
 async function run(mw: any, req: any) {
   const next = vi.fn();
   try {
-    await mw(req, {}, next);
+    await runWithContext({ requestId: "auth-test", source: "unknown", actor: { uid: null, role: "anonymous" }, changeCount: 0 }, () =>
+      mw(req, {}, next),
+    );
     return { ok: next.mock.calls.length === 1, status: 200, req };
   } catch (e: any) {
     return { ok: false, status: e.status as number, req };
   }
 }
-const valid = (uid: string, email?: string, email_verified = true) =>
+const tokenFor = (uid: string, email?: string, email_verified = true) =>
   verifyIdToken.mockImplementation(async (t: string) => {
     if (t === "good-token") return { uid, email, email_verified };
     throw new Error("invalid token");
   });
 
-beforeEach(() => {
+beforeEach(async () => {
   verifyIdToken.mockReset();
   verifyIdToken.mockRejectedValue(new Error("invalid token"));
-  adminDocs.clear();
-  firestoreDown = false;
-  adminDocs.set("admin-uid", { email: "boss@bni.com", role: "admin" });
-  adminDocs.set("super-uid", { email: "root@bni.com", role: "superadmin" });
+  allowlistDown = false;
+  clearAdminCache();
+  await pgdb.execute(sql`TRUNCATE admins`);
+  await pgdb.insert(admins).values([
+    { uid: "admin-uid", email: "boss@bni.com", role: "admin" },
+    { uid: "super-uid", email: "root@bni.com", role: "superadmin" },
+    { uid: "coord-uid", email: "coord@bni.com", role: "coordinator" },
+    { uid: "gone-uid", email: "gone@bni.com", role: "admin", status: "Inactive" },
+  ]);
+});
+afterAll(async () => {
+  await pool.end();
 });
 
 describe("requireUser", () => {
@@ -81,7 +84,7 @@ describe("requireUser", () => {
   );
 
   it("accepts a verified token and takes the uid from it", async () => {
-    valid("member-uid", "m@x.com");
+    tokenFor("member-uid", "m@x.com");
     const r = await run(requireUser, reqWith("good-token"));
     expect(r.ok).toBe(true);
     expect(r.req.uid).toBe("member-uid");
@@ -99,43 +102,63 @@ describe("requireAdmin", () => {
     },
   );
 
-  it("admits a verified uid on the allowlist", async () => {
-    valid("admin-uid", "boss@bni.com");
-    expect((await run(requireAdmin, reqWith("good-token"))).ok).toBe(true);
+  it("admits a verified uid on the allowlist and attaches its record", async () => {
+    tokenFor("admin-uid", "boss@bni.com");
+    const r = await run(requireAdmin, reqWith("good-token"));
+    expect(r.ok).toBe(true);
+    expect(r.req.admin).toMatchObject({ uid: "admin-uid", role: "admin" });
   });
 
   it("refuses a verified user who is not on the allowlist, whatever their email says", async () => {
-    valid("rando", "notanadmin+superadmin@gmail.com");
-    const r = await run(requireAdmin, reqWith("good-token"));
-    expect(r.ok).toBe(false);
-    expect(r.status).toBe(403);
+    tokenFor("rando", "notanadmin+superadmin@gmail.com");
+    expect((await run(requireAdmin, reqWith("good-token"))).status).toBe(403);
   });
 
-  it("matches by email only when Firebase verified that email", async () => {
-    valid("new-uid", "boss@bni.com", false);
+  it("refuses an Inactive admin", async () => {
+    tokenFor("gone-uid", "gone@bni.com");
     expect((await run(requireAdmin, reqWith("good-token"))).status).toBe(403);
-    valid("new-uid-2", "boss@bni.com", true);
+  });
+
+  it("matches by email only when verified, and re-keys the row instead of duplicating it", async () => {
+    tokenFor("new-uid", "boss@bni.com", false);
+    expect((await run(requireAdmin, reqWith("good-token"))).status).toBe(403);
+
+    tokenFor("new-uid", "boss@bni.com", true);
     expect((await run(requireAdmin, reqWith("good-token"))).ok).toBe(true);
+    const rows = await pgdb.select().from(admins).where(sql`lower(${admins.email}) = 'boss@bni.com'`);
+    expect(rows.map((r) => r.uid)).toEqual(["new-uid"]);
   });
 
   it("denies (503) when the allowlist lookup fails, instead of granting access", async () => {
-    valid("someone-new", "x@y.com");
-    firestoreDown = true;
+    tokenFor("someone-new", "x@y.com");
+    allowlistDown = true;
     const r = await run(requireAdmin, reqWith("good-token"));
     expect(r.ok).toBe(false);
     expect(r.status).toBe(503);
   });
 });
 
-describe("requireSuperadmin", () => {
-  it("allows a stored superadmin", async () => {
-    expect((await run(requireSuperadmin, { uid: "super-uid", email: "root@bni.com" })).ok).toBe(true);
+describe("requireSuperadmin / requireRole", () => {
+  const withAdmin = async (uid: string) => {
+    tokenFor(uid);
+    const r = await run(requireAdmin, reqWith("good-token"));
+    return r.req;
+  };
+
+  it("allows a stored superadmin only", async () => {
+    expect((await run(requireSuperadmin, await withAdmin("super-uid"))).ok).toBe(true);
+    expect((await run(requireSuperadmin, await withAdmin("admin-uid"))).status).toBe(403);
   });
 
-  it("refuses a regular admin even if their email contains 'superadmin'", async () => {
-    adminDocs.set("plain-uid", { email: "superadmin.fan@bni.com", role: "admin" });
-    const r = await run(requireSuperadmin, { uid: "plain-uid", email: "superadmin.fan@bni.com" });
-    expect(r.ok).toBe(false);
-    expect(r.status).toBe(403);
+  it("keeps coordinators out of admin-and-up areas", async () => {
+    const gate = requireRole("admin", "superadmin");
+    expect((await run(gate, await withAdmin("admin-uid"))).ok).toBe(true);
+    expect((await run(gate, await withAdmin("coord-uid"))).status).toBe(403);
+  });
+
+  it("does not trust a role that is not stored", async () => {
+    await pgdb.update(admins).set({ email: "superadmin.fan@bni.com" }).where(eq(admins.uid, "admin-uid"));
+    clearAdminCache();
+    expect((await run(requireSuperadmin, await withAdmin("admin-uid"))).status).toBe(403);
   });
 });

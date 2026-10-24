@@ -1,9 +1,9 @@
 import type { Response } from "express";
 import type { AuthedRequest } from "../middleware/auth.js";
-import { db, auth, collections } from "../config/firebase.js";
+import { db, collections } from "../config/firebase.js";
 import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
-import { listConclaves as listConclaveRecords, evaluateConclaveStatus } from "../services/conclave.service.js";
+import { listConclaves as listConclaveRecords } from "../services/conclave.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
 import * as feedback from "../services/feedback.service.js";
 import {
@@ -12,75 +12,29 @@ import {
   recordUserNotification,
 } from "../services/notification.service.js";
 import { ApiError } from "../middleware/errors.js";
+import * as users from "../services/user.service.js";
+import * as notificationsSvc from "../services/notifications.service.js";
 
 export async function listNotifications(req: AuthedRequest, res: Response) {
-  const snap = await db
-    .collection(collections.users)
-    .doc(req.uid)
-    .collection("notifications")
-    .orderBy("createdAt", "desc")
-    .limit(50)
-    .get();
-  const notifications = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
-  const unreadCount = notifications.filter((n: any) => !n.read).length;
-  res.json({ notifications, unreadCount });
+  res.json(await notificationsSvc.listForUser(req.uid));
 }
 
 export async function markNotificationsRead(req: AuthedRequest, res: Response) {
-  const snap = await db
-    .collection(collections.users)
-    .doc(req.uid)
-    .collection("notifications")
-    .where("read", "==", false)
-    .get();
-  const batch = db.batch();
-  snap.forEach((d) => batch.set(d.ref, { read: true }, { merge: true }));
-  await batch.commit();
-  res.json({ ok: true, marked: snap.size });
+  const marked = await notificationsSvc.markAllRead(req.uid);
+  res.json({ ok: true, marked });
 }
 
 /**
  * Permanently deletes the caller's own account — required by App Store Guideline
- * 5.1.1(v) for any app that lets users create an account.
- *
- * Removes their personal data (the profile document and its notifications
- * subcollection) and then their Firebase Auth login. The uid is taken from the
- * verified token, never the body, so a member can only ever delete themselves.
- * Shared event records (referrals, attendance) are retained as event history but
- * no longer resolve to a live account.
+ * 5.1.1(v). The uid comes from the verified token, so a member can only ever
+ * delete themselves.
  */
 export async function deleteAccount(req: AuthedRequest, res: Response) {
-  const uid = req.uid;
-  const userRef = db.collection(collections.users).doc(uid);
-
-  // Delete the notifications subcollection first (Firestore doesn't cascade),
-  // then the profile document itself.
-  const notifs = await userRef.collection("notifications").get();
-  const batch = db.batch();
-  notifs.forEach((d) => batch.delete(d.ref));
-  batch.delete(userRef);
-  await batch.commit();
-
-  // Remove the auth account last, so a failure above never orphans the login.
-  try {
-    await auth.deleteUser(uid);
-  } catch (e) {
-    // Already gone is fine; anything else is logged but the data is cleared.
-    console.error("deleteAccount: auth.deleteUser failed", e);
-  }
-
+  await users.deleteOwnAccount(req.uid);
   res.json({ ok: true });
 }
 
-/** A member's display name, for notification copy. */
-async function displayName(uid: string): Promise<string> {
-  try {
-    const d = await db.collection(collections.users).doc(uid).get();
-    return ((d.data() as any)?.name || "A member").toString();
-  } catch {
-    return "A member";
-  }
-}
+const displayName = users.displayName;
 
 function toISO(val: any): string {
   if (!val) return new Date().toISOString();
@@ -95,263 +49,20 @@ function toISO(val: any): string {
 }
 
 /**
- * The member directory: every registered member, with ONLY the fields that are
- * safe to show to other members.
- *
- * Contact details (email, phone, the synthetic sign-in identifier) are
- * deliberately never included — the app exposes this list to every signed-in
- * user, so projecting the safe fields HERE, on the server, is the only place the
- * privacy line can be enforced (Firestore rules cannot hide individual fields).
+ * The member directory — ONLY fields safe to show to other members (no email,
+ * phone or sign-in identifier). Enforced server-side in users.listMemberDirectory.
  */
 export async function listMembers(_req: AuthedRequest, res: Response) {
-  const snap = await db.collection(collections.users).get();
-  const members = snap.docs
-    .map((doc) => {
-      const d = doc.data() as any;
-      return {
-        uid: doc.id,
-        name: (d.name || "").trim(),
-        photoUrl: d.photoUrl || null,
-        businessName: (d.businessName || "").trim(),
-        businessCategory: (d.businessCategory || "").trim(),
-        location: (d.location || "").trim(),
-        chapter: d.chapter || null,
-        region: d.region || null,
-        membership: (d.membership || "").trim(),
-        // Matchmaking: what they want, and what they bring.
-        lookingFor: (d.lookingFor || "").trim(),
-        canOffer: (d.canOffer || "").trim(),
-      };
-    })
-    // Skip half-built docs (e.g. an interrupted registration that only wrote a
-    // login timestamp) — a nameless row is noise in a directory.
-    .filter((m) => m.name.length > 0)
-    .sort((a, b) => a.name.localeCompare(b.name));
-
-  res.json({ members });
+  res.json({ members: await users.listMemberDirectory() });
 }
 
 export async function me(req: AuthedRequest, res: Response) {
-  try {
-    const normalizedEmail = (req.email || '').toLowerCase().trim();
-    const nowIso = new Date().toISOString();
-
-    // Touch user activity timestamp in Firestore
-    if (req.uid) {
-      db.collection(collections.users).doc(req.uid).set({
-        lastLoginAt: nowIso,
-        lastActiveAt: nowIso,
-        isActive: true
-      }, { merge: true }).catch(() => {});
-    }
-
-    // 1. ALWAYS check admins collection FIRST
-    const adminDoc = await db.collection(collections.admins).doc(req.uid).get();
-    if (adminDoc.exists) {
-      const adminData = adminDoc.data() as any;
-      const resolvedRole = String(adminData.role || 'admin').toLowerCase();
-      return res.json({
-        uid: req.uid,
-        id: req.uid,
-        name: adminData.name || (resolvedRole === 'superadmin' ? "Superadmin" : "Admin"),
-        email: adminData.email || req.email || "",
-        phone: adminData.mobile || "",
-        region: adminData.region || "Global",
-        role: resolvedRole,
-        createdAt: toISO(adminData.grantedAt || adminData.createdAt),
-      });
-    }
-
-    // 2. Admin added by email before first sign-in — only for a Firebase-verified email.
-    if (normalizedEmail && req.emailVerified) {
-      const adminEmailSnap = await db.collection(collections.admins)
-        .where('email', '==', normalizedEmail)
-        .limit(1)
-        .get();
-      if (!adminEmailSnap.empty) {
-        const adminData = adminEmailSnap.docs[0].data() as any;
-        const resolvedRole = String(adminData.role || 'admin').toLowerCase();
-        return res.json({
-          uid: req.uid,
-          id: req.uid,
-          name: adminData.name || (resolvedRole === 'superadmin' ? "Superadmin" : "Admin"),
-          email: adminData.email || req.email,
-          phone: adminData.mobile || "",
-          region: adminData.region || "Global",
-          role: resolvedRole,
-          createdAt: toISO(adminData.grantedAt || adminData.createdAt),
-        });
-      }
-
-    }
-
-    // 3. Query users collection by UID (or verified email)
-    const userDoc = await db.collection(collections.users).doc(req.uid).get();
-    let data = (userDoc.exists ? userDoc.data() : null) as any;
-
-    // Email fallback only for a Firebase-verified email — otherwise anyone could
-    // sign up with a member's address and read that member's profile.
-    if (!data && req.email && req.emailVerified) {
-      const emailSnap = await db.collection(collections.users)
-        .where('email', '==', req.email)
-        .limit(1)
-        .get();
-      if (!emailSnap.empty) {
-        data = emailSnap.docs[0].data() as any;
-      }
-
-      if (!data) {
-        const identSnap = await db.collection(collections.users)
-          .where('identifier', '==', req.email)
-          .limit(1)
-          .get();
-        if (!identSnap.empty) {
-          data = identSnap.docs[0].data() as any;
-        }
-      }
-    }
-
-    let isCaptainRole = false;
-
-    // Captain role only applies while a conclave is actively RUNNING or ACTIVE.
-    // Once a conclave ends/completes, captains revert to regular members!
-    // No user will register as captain.
-    try {
-      const conclavesSnap = await db.collection(collections.conclaves).get();
-      for (const cDoc of conclavesSnap.docs) {
-        const cData = cDoc.data();
-        const evalResult = evaluateConclaveStatus(cData);
-        const effectiveStatus = (evalResult?.status || cData.status || '').toLowerCase();
-        const isLiveConclave = effectiveStatus === 'active' || effectiveStatus === 'running';
-
-        // Captain role only applies while a conclave is actively RUNNING or ACTIVE.
-        if (!isLiveConclave) {
-          continue;
-        }
-
-        // 1. Check registrations by UID in this active conclave
-        if (req.uid) {
-          const regDoc = await db.collection(collections.conclaves).doc(cDoc.id).collection('registrations').doc(req.uid).get();
-          if (regDoc.exists) {
-            const reg = regDoc.data();
-            if (reg?.role === 'captain' || reg?.isCaptain === true || reg?.isTableCaptain === true) {
-              isCaptainRole = true;
-              break;
-            }
-          }
-        }
-
-        // 2. Check registrations by email in this active conclave
-        if (req.email) {
-          const regSnap = await db.collection(collections.conclaves).doc(cDoc.id).collection('registrations')
-            .where('email', '==', req.email)
-            .limit(1)
-            .get();
-          if (!regSnap.empty) {
-            const reg = regSnap.docs[0].data();
-            if (reg?.role === 'captain' || reg?.isCaptain === true || reg?.isTableCaptain === true) {
-              isCaptainRole = true;
-              break;
-            }
-          }
-        }
-
-        // 3. Check participants in this active conclave document
-        const participants = Array.isArray(cData.participants) ? cData.participants : [];
-        const part = participants.find((p: any) =>
-          (req.email && p.email?.toLowerCase() === req.email.toLowerCase()) ||
-          (req.uid && (String(p.id) === String(req.uid) || p.uid === req.uid || p._originalUid === req.uid))
-        );
-        if (part && (part.role === 'captain' || part.isCaptain === true)) {
-          isCaptainRole = true;
-          break;
-        }
-
-        // 4. Check if marked isCaptain while registered in this live conclave
-        if (data?.isCaptain === true && part) {
-          isCaptainRole = true;
-          break;
-        }
-      }
-    } catch (_) {}
-
-    const dbRole = (data?.role || 'member').toLowerCase();
-    const isSpecialRole = dbRole === 'superadmin' || dbRole === 'admin' || dbRole === 'regional_admin' || dbRole === 'coordinator';
-    const finalRole = isCaptainRole ? 'captain' : (isSpecialRole ? dbRole : 'member');
-    res.json({
-      uid: req.uid,
-      id: req.uid,
-      name: data?.name || "Member",
-      email: data?.email || req.email || "",
-      phone: data?.phone || "",
-      company: data?.businessName || "",
-      category: data?.businessCategory || "",
-      chapter: data?.chapter || "",
-      location: data?.location || "",
-      createdAt: toISO(data?.createdAt || data?.registeredAt),
-      role: finalRole,
-      isCaptain: isCaptainRole,
-    });
-  } catch (err: any) {
-    console.error("GET /me failed:", err?.message ?? err);
-    res.status(500).json({ error: "Couldn't load your profile. Please try again." });
-  }
+  res.json(await users.getMe({ uid: req.uid, email: req.email, emailVerified: req.emailVerified }));
 }
 
 export async function updateMe(req: AuthedRequest, res: Response) {
-  try {
-    const { name, email, phone, mobile, company, businessName, category, businessCategory, chapter, region, designation, organization } = req.body ?? {};
-
-    const updates: any = { id: req.uid };
-    if (name !== undefined) updates.name = name;
-    if (email !== undefined) updates.email = email;
-    if (phone !== undefined || mobile !== undefined) {
-      const raw = String(phone ?? mobile ?? "").trim();
-      let digitsOnly = raw.replace(/\D/g, "");
-      if (digitsOnly.length === 10) {
-        digitsOnly = "91" + digitsOnly;
-      }
-      updates.phone = digitsOnly ? `+${digitsOnly}` : raw;
-      updates.mobile = digitsOnly.length >= 10 ? digitsOnly.slice(-10) : raw;
-      updates.identifier = digitsOnly ? `${digitsOnly}@bni121.conclave` : `${raw}@bni121.conclave`;
-    }
-    if (company !== undefined || businessName !== undefined) {
-      updates.company = company ?? businessName;
-      updates.businessName = businessName ?? company;
-    }
-    if (category !== undefined || businessCategory !== undefined) {
-      updates.category = category ?? businessCategory;
-      updates.businessCategory = businessCategory ?? category;
-    }
-    if (chapter !== undefined) updates.chapter = chapter;
-    if (region !== undefined) {
-      updates.region = region;
-      updates.location = String(region).toLowerCase();
-    }
-    if (designation !== undefined) updates.designation = designation;
-    if (organization !== undefined) updates.organization = organization;
-    updates.country = updates.country ?? "India";
-    updates.updatedAt = new Date().toISOString();
-
-    const userDocRef = db.collection(collections.users).doc(req.uid);
-    const userDoc = await userDocRef.get();
-
-    if (userDoc.exists) {
-      await userDocRef.set(updates, { merge: true });
-    } else {
-      const adminDocRef = db.collection(collections.admins).doc(req.uid);
-      const adminDoc = await adminDocRef.get();
-      if (adminDoc.exists) {
-        await adminDocRef.set(updates, { merge: true });
-      } else {
-        await userDocRef.set(updates, { merge: true });
-      }
-    }
-
-    res.json({ success: true, message: "Profile updated successfully.", profile: updates });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || "Failed to update profile." });
-  }
+  const profile = await users.updateMe(req.uid, req.body ?? {});
+  res.json({ success: true, message: "Profile updated successfully.", profile });
 }
 
 export async function listConclaves(req: AuthedRequest, res: Response) {
@@ -878,78 +589,11 @@ export async function syncConclave(req: AuthedRequest, res: Response) {
   res.json(result);
 }
 
-export async function resolveIdentifier(req: any, res: Response) {
-  try {
-    const rawInput = String(req.body?.identifier || '').trim().toLowerCase();
-    if (!rawInput) {
-      return res.status(400).json({ error: "Identifier is required." });
-    }
-
-    const digitsOnly = rawInput.replace(/\D/g, '');
-    const isPhoneNumber = digitsOnly.length >= 10 && digitsOnly.length <= 12;
-    const tenDigit = isPhoneNumber ? digitsOnly.slice(-10) : '';
-
-    let foundUser: any = null;
-
-    // 1. Search users collection by email
-    const emailSnap = await db.collection(collections.users)
-      .where('email', '==', rawInput)
-      .limit(1)
-      .get();
-    if (!emailSnap.empty) {
-      foundUser = emailSnap.docs[0].data();
-    }
-
-    // 2. Search users collection by mobile / phone if not found yet
-    if (!foundUser && tenDigit) {
-      const mobileSnap = await db.collection(collections.users)
-        .where('mobile', '==', tenDigit)
-        .limit(1)
-        .get();
-      if (!mobileSnap.empty) {
-        foundUser = mobileSnap.docs[0].data();
-      } else {
-        const phoneSnap = await db.collection(collections.users)
-          .where('phone', '==', `+91${tenDigit}`)
-          .limit(1)
-          .get();
-        if (!phoneSnap.empty) {
-          foundUser = phoneSnap.docs[0].data();
-        }
-      }
-    }
-
-    // 3. Search users collection by identifier field
-    if (!foundUser && (rawInput || tenDigit)) {
-      const idSnap = await db.collection(collections.users)
-        .where('identifier', '==', rawInput)
-        .limit(1)
-        .get();
-      if (!idSnap.empty) {
-        foundUser = idSnap.docs[0].data();
-      }
-    }
-
-    // 4. Resolve exact auth email string for Firebase Auth login
-    let authEmail = rawInput;
-    if (foundUser) {
-      authEmail = foundUser.identifier || foundUser.email || (tenDigit ? `91${tenDigit}@bni121.conclave` : rawInput);
-    } else if (isPhoneNumber) {
-      authEmail = `91${tenDigit}@bni121.conclave`;
-    }
-
-    return res.json({
-      authEmail,
-      found: !!foundUser,
-      user: foundUser ? {
-        id: foundUser.id,
-        email: foundUser.email,
-        name: foundUser.name,
-        role: foundUser.role || 'member'
-      } : null
-    });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message || "Failed to resolve identifier." });
-  }
+/**
+ * PUBLIC: maps an email/phone to the Firebase sign-in address. Returns only
+ * that address — no profile fields and no "found" flag (anti-enumeration).
+ */
+export async function resolveIdentifier(req: AuthedRequest, res: Response) {
+  res.json({ authEmail: await users.resolveSignInAddress(req.body?.identifier) });
 }
 

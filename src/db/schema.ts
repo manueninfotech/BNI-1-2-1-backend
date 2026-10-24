@@ -46,6 +46,9 @@ export const users = pgTable(
     uid: text("uid").primaryKey(),
     name: text("name").notNull().default(""),
     email: text("email"),
+    /** Firebase sign-in address. For phone accounts it is synthetic
+     *  (919515409973@bni121.conclave) — never show it to a human. */
+    identifier: text("identifier"),
     authEmail: text("auth_email"),
     phone: text("phone"),
     company: text("company"),
@@ -71,7 +74,11 @@ export const users = pgTable(
     updatedAt: updatedAt(),
     legacy: legacy(),
   },
-  (t) => [index("users_phone_idx").on(t.phone), index("users_email_idx").on(t.email)],
+  (t) => [
+    index("users_phone_idx").on(t.phone),
+    index("users_email_idx").on(sql`lower(${t.email})`),
+    index("users_identifier_idx").on(sql`lower(${t.identifier})`),
+  ],
 );
 
 /**

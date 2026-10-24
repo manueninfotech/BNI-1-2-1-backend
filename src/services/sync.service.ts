@@ -360,7 +360,7 @@ export async function syncConclave(
       fromUserId: r.fromUserId,
       toUserId: r.toUserId,
       fromName: giver?.name ?? "",
-      fromBusinessName: giver?.businessName ?? "",
+      fromBusinessName: giver?.company ?? "",
       notes: r.notes ?? "",
       status: r.status || "Pending",
       createdAt: r.createdAt ?? null,

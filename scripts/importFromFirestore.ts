@@ -112,7 +112,7 @@ const S = toStr, D = toDate, I = toInt, N = toNum, B = (v: unknown) => toBool(v)
 // ---------------------------------------------------------------------------
 
 const userSpec: Spec = {
-  name: [["name"], S], email: [["email"], S], authEmail: [["authEmail"], S],
+  name: [["name"], S], email: [["email"], S], identifier: [["identifier"], S], authEmail: [["authEmail"], S],
   phone: [["phone", "mobile"], S], company: [["company", "businessName"], S],
   category: [["category", "businessCategory"], S], chapter: [["chapter"], S],
   region: [["region"], S], state: [["state"], S], country: [["country"], S],

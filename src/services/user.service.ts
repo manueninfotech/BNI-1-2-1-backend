@@ -1,54 +1,393 @@
-import { db, collections } from "../config/firebase.js";
-import { getAllDocs, toDate, toIso } from "../utils/firestore.js";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { auth } from "../config/firebase.js";
+import { pgdb } from "../db/client.js";
+import { admins, conclaves, registrations, users } from "../db/schema.js";
+import { audit } from "../audit/audit.service.js";
+import { ApiError } from "../middleware/errors.js";
 import { getAutoLogoutHours } from "./settings.service.js";
 
-export interface UserDoc {
-  name?: string;
-  /**
-   * How they sign in. For a phone account this is a SYNTHETIC address
-   * (919515409973@bni121.conclave) — never show it to a human.
-   */
-  identifier?: string;
-  /** Real, reachable contacts. Both are collected at registration. */
-  email?: string;
-  phone?: string;
-  company?: string;
-  category?: string;
-  businessName?: string;
-  businessCategory?: string;
-  location?: unknown;
-  chapter?: string | null;
-  region?: string;
-  state?: string;
-  country?: string;
-  createdAt?: unknown;
-  lastLoginAt?: unknown;
+/**
+ * Members (the `users` table). Login stays on Firebase Auth; `uid` is the
+ * Firebase uid. Every profile change is audited.
+ *
+ * Response shapes keep the field names the app and admin panel already use
+ * (`businessName`, `businessCategory`, `mobile`, …) so the switch to Postgres
+ * needs no client change.
+ */
+
+export type UserRow = typeof users.$inferSelect;
+
+/** Synthetic sign-in addresses for phone accounts — never shown to a human. */
+export const PHONE_ACCOUNT_DOMAIN = "@bni121.conclave";
+const isSynthetic = (v?: string | null) => !!v && v.toLowerCase().endsWith(PHONE_ACCOUNT_DOMAIN);
+
+/** "+919515409973" from "9515409973" / "919515409973" / "+91 95154 09973". */
+export function normalizePhone(raw: unknown): { phone: string; tenDigit: string; identifier: string } | null {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+  let digits = s.replace(/\D/g, "");
+  if (digits.length === 10) digits = `91${digits}`;
+  if (digits.length < 11 || digits.length > 15) throw ApiError.badRequest("Enter a valid phone number.");
+  return { phone: `+${digits}`, tenDigit: digits.slice(-10), identifier: `${digits}${PHONE_ACCOUNT_DOMAIN}` };
 }
 
-export function fetchUsers(uids: string[]) {
-  return getAllDocs<UserDoc>(
-    uids.map((uid) => db.collection(collections.users).doc(uid)),
-  );
+export async function fetchUsers(uids: string[]): Promise<Map<string, UserRow>> {
+  const out = new Map<string, UserRow>();
+  const unique = [...new Set(uids.filter(Boolean))];
+  for (let i = 0; i < unique.length; i += 500) {
+    const rows = await pgdb.select().from(users).where(inArray(users.uid, unique.slice(i, i + 500)));
+    for (const r of rows) out.set(r.uid, r);
+  }
+  return out;
+}
+
+export async function getUser(uid: string): Promise<UserRow | null> {
+  const [row] = await pgdb.select().from(users).where(eq(users.uid, uid));
+  return row ?? null;
+}
+
+/** A member's display name, for notification copy. */
+export async function displayName(uid: string): Promise<string> {
+  try {
+    return (await getUser(uid))?.name || "A member";
+  } catch {
+    return "A member";
+  }
 }
 
 /**
- * "Active" = logged in and not yet auto-logged-out.
- *
- * Derived from `users/{uid}.lastLoginAt` rather than from phones reporting in,
- * because at the venue the phones may not be able to reach anything. A user with
- * no recorded login has never signed in on a build that tracks it, and counts as
- * inactive rather than being silently assumed present.
+ * "Active" = logged in and not yet auto-logged-out. Derived from lastLoginAt
+ * rather than phones reporting in, because at the venue the phones may not be
+ * able to reach anything.
  */
-export function isActiveUser(
-  user: UserDoc | undefined,
-  autoLogoutHours: number,
-  now: Date,
-): boolean {
-  if (!user) return false;
-  const lastLogin = toDate(user.lastLoginAt);
-  if (!lastLogin) return false; // Must have logged in to be active
-  return now.getTime() - lastLogin.getTime() < autoLogoutHours * 3_600_000;
+export function isActiveUser(user: Pick<UserRow, "lastLoginAt"> | undefined | null, autoLogoutHours: number, now: Date): boolean {
+  if (!user?.lastLoginAt) return false;
+  return now.getTime() - user.lastLoginAt.getTime() < autoLogoutHours * 3_600_000;
 }
+
+// ---------------------------------------------------------------------------
+// Member directory (visible to every signed-in member → safe fields ONLY)
+// ---------------------------------------------------------------------------
+
+export async function listMemberDirectory() {
+  const rows = await pgdb
+    .select()
+    .from(users)
+    .where(sql`trim(${users.name}) <> ''`)
+    .orderBy(asc(users.name));
+  // Contact details (email, phone, identifier) are deliberately never included.
+  return rows.map((d) => ({
+    uid: d.uid,
+    name: d.name.trim(),
+    photoUrl: d.photoUrl ?? null,
+    businessName: (d.company ?? "").trim(),
+    businessCategory: (d.category ?? "").trim(),
+    location: (d.location ?? "").trim(),
+    chapter: d.chapter ?? null,
+    region: d.region ?? null,
+    membership: (d.membership ?? "").trim(),
+    lookingFor: (d.lookingFor ?? "").trim(),
+    canOffer: (d.canOffer ?? "").trim(),
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// /me
+// ---------------------------------------------------------------------------
+
+/** Records a sign-in / activity ping (telemetry, not a change — not audited). */
+export async function touchActivity(uid: string) {
+  const now = new Date();
+  await pgdb
+    .update(users)
+    .set({ lastLoginAt: now, lastActiveAt: now, isActive: true })
+    .where(eq(users.uid, uid))
+    .catch(() => {});
+}
+
+/** True while the user is a table captain in a conclave that is currently running. */
+async function isLiveCaptain(uid: string): Promise<boolean> {
+  const [row] = await pgdb
+    .select({ n: sql<number>`count(*)::int` })
+    .from(registrations)
+    .innerJoin(conclaves, eq(conclaves.id, registrations.conclaveId))
+    .where(and(eq(registrations.userId, uid), eq(registrations.role, "captain"), inArray(conclaves.status, ["running", "active"])));
+  return (row?.n ?? 0) > 0;
+}
+
+export interface MeInput {
+  uid: string;
+  email?: string;
+  emailVerified?: boolean;
+}
+
+/**
+ * The signed-in caller's profile. Admin roles come ONLY from the admins table;
+ * a member is "captain" only while captaining a running conclave.
+ */
+export async function getMe({ uid, email, emailVerified }: MeInput) {
+  void touchActivity(uid);
+
+  const [admin] = await pgdb.select().from(admins).where(eq(admins.uid, uid));
+  if (admin) {
+    return {
+      uid,
+      id: uid,
+      name: admin.name || (admin.role === "superadmin" ? "Superadmin" : "Admin"),
+      email: admin.email || email || "",
+      phone: admin.phone ?? "",
+      region: admin.region ?? "Global",
+      role: admin.role,
+      createdAt: admin.grantedAt.toISOString(),
+    };
+  }
+
+  let user = await getUser(uid);
+  // Email fallback only for a Firebase-verified email — otherwise anyone could
+  // sign up with a member's address and read that member's profile.
+  if (!user && email && emailVerified) {
+    const e = email.toLowerCase().trim();
+    [user] = await pgdb
+      .select()
+      .from(users)
+      .where(or(sql`lower(${users.email}) = ${e}`, sql`lower(${users.identifier}) = ${e}`))
+      .limit(1);
+  }
+
+  const captain = await isLiveCaptain(uid);
+  return {
+    uid,
+    id: uid,
+    name: user?.name || "Member",
+    email: user?.email || email || "",
+    phone: user?.phone ?? "",
+    company: user?.company ?? "",
+    category: user?.category ?? "",
+    chapter: user?.chapter ?? "",
+    location: user?.location ?? "",
+    createdAt: (user?.createdAt ?? new Date()).toISOString(),
+    role: captain ? "captain" : "member",
+    isCaptain: captain,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Profile update
+// ---------------------------------------------------------------------------
+
+export interface UpdateMeInput {
+  name?: unknown;
+  email?: unknown;
+  phone?: unknown;
+  mobile?: unknown;
+  company?: unknown;
+  businessName?: unknown;
+  category?: unknown;
+  businessCategory?: unknown;
+  chapter?: unknown;
+  region?: unknown;
+  designation?: unknown;
+  organization?: unknown;
+}
+
+const str = (v: unknown, max = 200) => String(v ?? "").trim().slice(0, max);
+
+/**
+ * Updates the caller's own profile. For an admin account only the harmless
+ * fields (name, phone, designation, organization) are editable — `region` drives
+ * regional authorization, so it changes only through the coordinator screen.
+ */
+export async function updateMe(uid: string, input: UpdateMeInput) {
+  const [admin] = await pgdb.select().from(admins).where(eq(admins.uid, uid));
+  if (admin) {
+    const patch: Partial<typeof admins.$inferInsert> = {};
+    if (input.name !== undefined) {
+      patch.name = str(input.name);
+      if (!patch.name) throw ApiError.badRequest("Name can't be empty.");
+    }
+    if (input.phone !== undefined || input.mobile !== undefined) patch.phone = normalizePhone(input.phone ?? input.mobile)?.phone ?? null;
+    if (input.designation !== undefined) patch.designation = str(input.designation);
+    if (input.organization !== undefined) patch.organization = str(input.organization);
+    if (!Object.keys(patch).length) throw ApiError.badRequest("Nothing to update.");
+    await pgdb.transaction(async (tx) => {
+      const [after] = await tx.update(admins).set({ ...patch, updatedAt: new Date() }).where(eq(admins.uid, uid)).returning();
+      await audit.change({ action: "admin.update_self", entityType: "admin", entityId: uid, before: admin, after }, tx);
+    });
+    return { id: uid, ...patch };
+  }
+
+  const patch: Partial<typeof users.$inferInsert> = {};
+  if (input.name !== undefined) {
+    patch.name = str(input.name);
+    if (!patch.name) throw ApiError.badRequest("Name can't be empty.");
+  }
+  if (input.email !== undefined) {
+    const e = str(input.email).toLowerCase();
+    if (e && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw ApiError.badRequest("Enter a valid email.");
+    patch.email = e || null;
+  }
+  if (input.phone !== undefined || input.mobile !== undefined) {
+    const p = normalizePhone(input.phone ?? input.mobile);
+    patch.phone = p?.phone ?? null;
+    // `identifier` is the Firebase sign-in for phone accounts; it follows the phone.
+    if (p) patch.identifier = p.identifier;
+  }
+  if (input.company !== undefined || input.businessName !== undefined) patch.company = str(input.company ?? input.businessName);
+  if (input.category !== undefined || input.businessCategory !== undefined) patch.category = str(input.category ?? input.businessCategory);
+  if (input.chapter !== undefined) patch.chapter = str(input.chapter) || null;
+  if (input.region !== undefined) {
+    patch.region = str(input.region) || null;
+    patch.location = patch.region ? patch.region.toLowerCase() : null;
+  }
+  if (input.designation !== undefined) patch.designation = str(input.designation);
+
+  return pgdb.transaction(async (tx) => {
+    const [before] = await tx.select().from(users).where(eq(users.uid, uid)).for("update");
+    const [after] = before
+      ? await tx.update(users).set({ ...patch, updatedAt: new Date() }).where(eq(users.uid, uid)).returning()
+      : await tx.insert(users).values({ uid, country: "India", ...patch }).returning();
+    await audit.change({ action: before ? "user.update" : "user.create", entityType: "user", entityId: uid, before: before ?? null, after }, tx);
+    return {
+      id: uid,
+      name: after.name,
+      email: after.email,
+      phone: after.phone,
+      mobile: after.phone?.slice(-10) ?? "",
+      company: after.company,
+      businessName: after.company,
+      category: after.category,
+      businessCategory: after.category,
+      chapter: after.chapter,
+      region: after.region,
+      designation: after.designation,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Account deletion (App Store Guideline 5.1.1(v))
+// ---------------------------------------------------------------------------
+
+/**
+ * Deletes the caller's profile and in-app notifications (cascade), then their
+ * Firebase login. Event history (registrations, attendance, referrals) is kept
+ * as history but no longer resolves to a live account. The audit row records
+ * only that it happened — not the deleted personal data.
+ */
+export async function deleteOwnAccount(uid: string) {
+  await pgdb.transaction(async (tx) => {
+    const [before] = await tx.delete(users).where(eq(users.uid, uid)).returning();
+    await audit.change({ action: "user.delete_self", entityType: "user", entityId: uid, metadata: { hadProfile: !!before } }, tx);
+  });
+  await auth.deleteUser(uid).catch((e) =>
+    console.error(JSON.stringify({ level: "error", msg: "deleteAccount: firebase deleteUser failed", uid, err: (e as Error).message })),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sign-in helper (public endpoint)
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps what a member typed (email or phone) to the Firebase sign-in address.
+ *
+ * PUBLIC, so it returns ONLY that address — never name, email, uid or role, and
+ * no "found" flag (that would let anyone test whether a number is a member).
+ */
+export async function resolveSignInAddress(rawInput: unknown): Promise<string> {
+  const input = String(rawInput ?? "").trim().toLowerCase();
+  if (!input) throw ApiError.badRequest("Identifier is required.");
+  const digits = input.replace(/\D/g, "");
+  const isPhone = !input.includes("@") && digits.length >= 10 && digits.length <= 12;
+  const tenDigit = isPhone ? digits.slice(-10) : "";
+
+  const [u] = await pgdb
+    .select({ identifier: users.identifier, email: users.email })
+    .from(users)
+    .where(
+      isPhone
+        ? or(eq(users.phone, `+91${tenDigit}`), sql`lower(${users.identifier}) = ${`91${tenDigit}${PHONE_ACCOUNT_DOMAIN}`}`)
+        : or(sql`lower(${users.email}) = ${input}`, sql`lower(${users.identifier}) = ${input}`),
+    )
+    .limit(1);
+
+  if (u) return (u.identifier || u.email || input).toLowerCase();
+  return isPhone ? `91${tenDigit}${PHONE_ACCOUNT_DOMAIN}` : input;
+}
+
+// ---------------------------------------------------------------------------
+// Admin views
+// ---------------------------------------------------------------------------
+
+/** Every member for the admin Members page. */
+export async function listAllMembersForAdmin() {
+  const rows = await pgdb.select().from(users).orderBy(asc(users.name));
+  return rows.map((d) => ({
+    id: d.uid,
+    name: d.name || "Unknown Member",
+    company: d.company ?? "",
+    category: d.category ?? "",
+    region: d.region || d.location || "Global",
+    chapter: d.chapter ?? "",
+    status: d.lastLoginAt ? "Active" : "Inactive",
+    email: d.email ?? "",
+    mobile: d.phone ?? "",
+  }));
+}
+
+/** Admin search by email / phone / sign-in identifier (exact matches). */
+export async function findUsers(query: string) {
+  const q = query.trim();
+  if (q.length < 3) throw ApiError.badRequest("Enter at least 3 characters.");
+  const lower = q.toLowerCase();
+  let phone: string | null = null;
+  if (!q.includes("@") && q.replace(/\D/g, "").length >= 10) {
+    try {
+      phone = normalizePhone(q)?.phone ?? null;
+    } catch {
+      phone = null;
+    }
+  }
+  const rows = await pgdb
+    .select()
+    .from(users)
+    .where(
+      or(
+        sql`lower(${users.email}) = ${lower}`,
+        sql`lower(${users.identifier}) = ${lower}`,
+        ...(phone ? [eq(users.phone, phone)] : []),
+      ),
+    )
+    .limit(10);
+  return rows.map((u) => ({
+    uid: u.uid,
+    name: u.name,
+    email: u.email ?? "",
+    phone: u.phone ?? "",
+    businessName: u.company ?? "",
+    businessCategory: u.category ?? "",
+  }));
+}
+
+/** Member-level roles an admin may set on a profile. Admin roles live in `admins`. */
+const MEMBER_ROLES = new Set(["member", "captain"]);
+
+export async function setUserRole(uid: string, role: unknown) {
+  const r = String(role ?? "").toLowerCase();
+  if (!MEMBER_ROLES.has(r)) {
+    throw ApiError.badRequest('role must be "member" or "captain". Admin access is granted from the Coordinators page.');
+  }
+  await pgdb.transaction(async (tx) => {
+    const [before] = await tx.select().from(users).where(eq(users.uid, uid)).for("update");
+    if (!before) throw ApiError.notFound("No such user.");
+    const [after] = await tx.update(users).set({ role: r, updatedAt: new Date() }).where(eq(users.uid, uid)).returning();
+    await audit.change({ action: "user.set_role", entityType: "user", entityId: uid, before, after }, tx);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Registrants (a conclave's roster joined with profiles)
+// ---------------------------------------------------------------------------
 
 export interface Registrant {
   uid: string;
@@ -71,51 +410,41 @@ export interface Registrant {
   lastLoginAt: string | null;
 }
 
-/** Everyone registered for a conclave, joined with their profile. */
 export async function listRegistrants(conclaveId: string): Promise<Registrant[]> {
-  const regsSnap = await db
-    .collection(collections.conclaves)
-    .doc(conclaveId)
-    .collection(collections.registrations)
-    .get();
-
-  const [users, autoLogoutHours] = await Promise.all([
-    fetchUsers(regsSnap.docs.map((d) => d.id)),
+  const [regs, autoLogoutHours] = await Promise.all([
+    pgdb.select().from(registrations).where(eq(registrations.conclaveId, conclaveId)),
     getAutoLogoutHours(),
   ]);
+  const profiles = await fetchUsers(regs.map((r) => r.userId));
   const now = new Date();
 
-  const out: Registrant[] = regsSnap.docs.map((doc) => {
-    const reg = doc.data();
-    const u = users.get(doc.id);
-
-    const rawLoc = u?.location ?? reg?.location ?? "";
-
-    return {
-      uid: doc.id,
-      role: (reg.role ?? "member") as "captain" | "member",
-      registeredAt: toIso(reg.registeredAt),
-      name: u?.name ?? reg?.name ?? "",
-      // Real contacts first. `identifier` is the fallback only for accounts
-      // created before both were collected — and for a phone account it is a
-      // synthetic address the admin cannot use.
-      phone: u?.phone ?? reg?.phone ?? (u?.identifier?.includes("@") ? "" : u?.identifier ?? ""),
-      email: u?.email ?? reg?.email ?? (u?.identifier?.includes("@bni121.conclave") ? "" : u?.identifier ?? ""),
-      company: u?.company ?? u?.businessName ?? reg?.company ?? "",
-      businessName: u?.businessName ?? u?.company ?? reg?.company ?? "",
-      category: u?.category ?? u?.businessCategory ?? reg?.category ?? "",
-      businessCategory: u?.businessCategory ?? u?.category ?? reg?.category ?? "",
-      chapter: u?.chapter ?? reg?.chapter ?? "",
-      region: u?.region ?? reg?.region ?? "",
-      state: u?.state ?? reg?.state ?? "",
-      country: u?.country ?? reg?.country ?? "",
-      location: rawLoc,
-      createdAt: toIso(u?.createdAt) || toIso(reg?.registeredAt) || new Date().toISOString(),
-      isActive: isActiveUser(u, autoLogoutHours, now),
-      lastLoginAt: toIso(u?.lastLoginAt),
-    };
-  });
-
-  out.sort((a, b) => a.name.localeCompare(b.name));
-  return out;
+  return regs
+    .map((reg) => {
+      const u = profiles.get(reg.userId);
+      // Real contacts first; a phone account's identifier is synthetic and useless to an admin.
+      const identifier = u?.identifier && !isSynthetic(u.identifier) ? u.identifier : "";
+      const company = u?.company ?? reg.company ?? "";
+      const category = u?.category ?? reg.category ?? "";
+      return {
+        uid: reg.userId,
+        role: (reg.role === "captain" ? "captain" : "member") as "captain" | "member",
+        registeredAt: reg.registeredAt?.toISOString() ?? null,
+        name: u?.name || reg.name || "",
+        phone: u?.phone ?? reg.phone ?? "",
+        email: u?.email ?? reg.email ?? identifier,
+        company,
+        businessName: company,
+        category,
+        businessCategory: category,
+        chapter: u?.chapter ?? reg.chapter ?? "",
+        region: u?.region ?? reg.region ?? "",
+        state: u?.state ?? reg.state ?? "",
+        country: u?.country ?? reg.country ?? "",
+        location: u?.location ?? "",
+        createdAt: (u?.createdAt ?? reg.registeredAt)?.toISOString() ?? null,
+        isActive: isActiveUser(u, autoLogoutHours, now),
+        lastLoginAt: u?.lastLoginAt?.toISOString() ?? null,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
