@@ -1,5 +1,6 @@
 import { Router } from "express";
-import { requireAdmin, requireSuperadmin } from "../middleware/auth.js";
+import { requireAdmin, requireRole, requireSuperadmin } from "../middleware/auth.js";
+import { queryAudit } from "../audit/audit.query.js";
 import { asyncHandler } from "../middleware/errors.js";
 import * as c from "../controllers/admin.controller.js";
 
@@ -64,6 +65,15 @@ router.get("/conclaves/:id/feedback", asyncHandler(c.listConclaveFeedback));
 router.get("/conclaves/:id/payments", asyncHandler(c.getConclavePayments));
 
 // Revenue — platform-wide, SUPERADMIN only.
+// Audit trail — who did what, when, from where (admins and superadmins only).
+router.get(
+  "/audit",
+  requireRole("admin", "superadmin"),
+  asyncHandler(async (req, res) => {
+    res.json(await queryAudit(req.query));
+  }),
+);
+
 router.get("/revenue", requireSuperadmin, asyncHandler(c.getRevenue));
 router.get("/revenue/transactions", requireSuperadmin, asyncHandler(c.listTransactions));
 

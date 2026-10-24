@@ -3,6 +3,7 @@ import type { DecodedIdToken } from "firebase-admin/auth";
 import { auth, db, collections } from "../config/firebase.js";
 import { env } from "../config/env.js";
 import { ApiError } from "./errors.js";
+import { setActor } from "../observability/context.js";
 
 /**
  * A request that has passed through requireUser / requireAdmin.
@@ -72,13 +73,16 @@ async function insecureDevIdentity(req: Request): Promise<{ uid: string; email?:
  */
 export async function requireUser(req: Request, _res: Response, next: NextFunction) {
   if (env.allowInsecureAdmin) {
-    Object.assign(req, await insecureDevIdentity(req));
+    const dev = await insecureDevIdentity(req);
+    Object.assign(req, dev);
+    setActor({ uid: dev.uid, role: "member", email: dev.email ?? null });
     return next();
   }
   const decoded = await verify(bearerToken(req));
   (req as AuthedRequest).uid = decoded.uid;
   (req as AuthedRequest).email = decoded.email;
   (req as AuthedRequest).emailVerified = decoded.email_verified;
+  setActor({ uid: decoded.uid, role: "member", email: decoded.email ?? null, name: decoded.name ?? null });
   next();
 }
 
@@ -150,13 +154,19 @@ export async function isAdmin(uid: string, email?: string, emailVerified?: boole
  */
 export async function requireAdmin(req: Request, _res: Response, next: NextFunction) {
   if (env.allowInsecureAdmin) {
-    Object.assign(req, await insecureDevIdentity(req));
+    const dev = await insecureDevIdentity(req);
+    Object.assign(req, dev);
+    setActor({ uid: dev.uid, role: "admin", email: dev.email ?? null, name: "insecure-dev" });
     return next();
   }
   const decoded = await verify(bearerToken(req));
-  if (!(await adminRecord(decoded.uid, decoded.email, decoded.email_verified))) {
+  // Record who is trying before deciding, so a refused attempt is attributed.
+  setActor({ uid: decoded.uid, role: "member", email: decoded.email ?? null, name: decoded.name ?? null });
+  const record = await adminRecord(decoded.uid, decoded.email, decoded.email_verified);
+  if (!record) {
     throw ApiError.forbidden("You are not an administrator.");
   }
+  setActor({ uid: decoded.uid, role: record.role, email: decoded.email ?? null, name: decoded.name ?? null });
   (req as AuthedRequest).uid = decoded.uid;
   (req as AuthedRequest).email = decoded.email;
   next();
@@ -174,4 +184,20 @@ export async function requireSuperadmin(req: Request, _res: Response, next: Next
     throw ApiError.forbidden("This area is restricted to the platform superadmin.");
   }
   next();
+}
+
+/**
+ * Gates a route to specific admin roles (e.g. keep coordinators out of the
+ * platform-wide audit log). Mounted AFTER requireAdmin.
+ */
+export function requireRole(...roles: string[]) {
+  const allowed = new Set(roles.map((r) => r.toLowerCase()));
+  return async (req: Request, _res: Response, next: NextFunction) => {
+    if (env.allowInsecureAdmin) return next();
+    const record = await adminRecord((req as AuthedRequest).uid);
+    if (!record || !allowed.has(record.role)) {
+      throw ApiError.forbidden("You don't have access to this area.");
+    }
+    next();
+  };
 }

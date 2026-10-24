@@ -21,6 +21,8 @@ import { sql } from "drizzle-orm";
 import { pgdb, pool } from "../src/db/client.js";
 import * as t from "../src/db/schema.js";
 import { env } from "../src/config/env.js";
+import { audit } from "../src/audit/audit.service.js";
+import { runAsSystem } from "../src/observability/context.js";
 
 if (!/localhost|127\.0\.0\.1/.test(env.databaseUrl) && !process.argv.includes("--allow-remote")) {
   console.error(`Refusing to import into a non-local database (${env.databaseUrl.replace(/:[^:@/]+@/, ":***@")}). Pass --allow-remote.`);
@@ -314,6 +316,10 @@ async function main() {
     await ins(t.payments, rows.payments);
   });
 
+  await audit.system("data.import_from_firestore", {
+    counts: Object.fromEntries(Object.entries(rows).map(([k, v]) => [k, v.length])),
+  });
+
   console.log("\nImported:");
   for (const [k, v] of Object.entries(rows)) console.log(`  ${k.padEnd(14)} ${v.length}`);
   if (orphanNotes) console.log(`  (skipped ${orphanNotes} notifications of deleted users)`);
@@ -324,7 +330,7 @@ async function main() {
   }
 }
 
-main()
+runAsSystem("import-from-firestore", main, "script")
   .then(() => pool.end())
   .catch(async (e) => {
     console.error(e);

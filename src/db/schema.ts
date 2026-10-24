@@ -18,6 +18,7 @@ import {
   text,
   integer,
   bigint,
+  bigserial,
   boolean,
   timestamp,
   jsonb,
@@ -342,4 +343,68 @@ export const payments = pgTable(
     updatedAt: updatedAt(),
   },
   (t) => [index("payments_conclave_idx").on(t.conclaveId)],
+);
+
+// ---------------------------------------------------------------------------
+// Audit trail
+// ---------------------------------------------------------------------------
+
+/**
+ * Append-only record of every action taken in the system.
+ *
+ * Two kinds of row share this table, linked by `request_id`:
+ * - kind = "request": written automatically for EVERY state-changing API call
+ *   (and every rejected sign-in / permission check), whoever made it — mobile
+ *   app, admin panel, webhook. Guarantees coverage even where no service
+ *   remembered to log.
+ * - kind = "change": written by the services for meaningful domain changes,
+ *   with a field-level before → after diff in `changes`.
+ * - kind = "system": scheduled jobs and scripts (no HTTP request).
+ *
+ * UPDATE and DELETE are blocked by a trigger (see the migration), so history
+ * can't be rewritten from the application.
+ */
+export const auditLog = pgTable(
+  "audit_log",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    occurredAt: ts("occurred_at").notNull().defaultNow(),
+    kind: text("kind").notNull(), // request | change | system
+    requestId: text("request_id"),
+
+    // Who
+    actorUid: text("actor_uid"),
+    actorRole: text("actor_role"), // member | captain | coordinator | admin | superadmin | system | webhook | anonymous
+    actorEmail: text("actor_email"),
+    actorName: text("actor_name"),
+
+    // From where
+    source: text("source"), // mobile_app | admin_panel | webhook | system | script | unknown
+    ip: text("ip"),
+    userAgent: text("user_agent"),
+
+    // What
+    action: text("action").notNull(), // e.g. conclave.update, registration.create, http.POST
+    entityType: text("entity_type"),
+    entityId: text("entity_id"),
+    conclaveId: text("conclave_id"),
+    changes: jsonb("changes").$type<Record<string, { from: unknown; to: unknown }> | null>(),
+    metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
+
+    // Request + result
+    method: text("method"),
+    route: text("route"),
+    statusCode: integer("status_code"),
+    outcome: text("outcome").notNull().default("success"), // success | failure | denied
+    error: text("error"),
+    durationMs: integer("duration_ms"),
+  },
+  (t) => [
+    index("audit_occurred_idx").on(t.occurredAt),
+    index("audit_actor_idx").on(t.actorUid, t.occurredAt),
+    index("audit_entity_idx").on(t.entityType, t.entityId, t.occurredAt),
+    index("audit_conclave_idx").on(t.conclaveId, t.occurredAt),
+    index("audit_action_idx").on(t.action, t.occurredAt),
+    index("audit_request_idx").on(t.requestId),
+  ],
 );

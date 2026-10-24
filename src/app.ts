@@ -3,6 +3,7 @@ import cors from "cors";
 import { env } from "./config/env.js";
 import { errorHandler, notFoundHandler } from "./middleware/errors.js";
 import { generalLimiter } from "./middleware/rateLimit.js";
+import { requestContext } from "./middleware/requestContext.js";
 import adminRoutes from "./routes/admin.routes.js";
 import memberRoutes from "./routes/member.routes.js";
 import webhookRoutes from "./routes/webhook.routes.js";
@@ -23,6 +24,10 @@ export function createApp() {
   // Vercel and most hosts sit behind a proxy; without this the rate limiter and
   // request IPs see the proxy rather than the client.
   app.set("trust proxy", 1);
+
+  // Request id + caller context + automatic audit of every state-changing call.
+  // First, so even rejected and malformed requests are traced.
+  app.use(requestContext);
 
   app.use(
     cors({
