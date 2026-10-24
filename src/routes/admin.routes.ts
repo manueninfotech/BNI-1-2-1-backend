@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAdmin, requireSuperadmin } from "../middleware/auth.js";
+import { requireAdmin, requireRole, requireSuperadmin } from "../middleware/auth.js";
 import { asyncHandler } from "../middleware/errors.js";
 import * as c from "../controllers/admin.controller.js";
 
@@ -73,17 +73,19 @@ router.post("/users/:uid/reset-link", asyncHandler(c.resetLink));
 router.get("/users", asyncHandler(c.listAllUsers));
 router.post("/users/:uid/role", asyncHandler(c.setUserRole));
 
-// Superadmin Regions Management
-router.get("/regions", asyncHandler(c.listRegions));
-router.post("/regions", asyncHandler(c.createRegion));
-router.patch("/regions/:id", asyncHandler(c.updateRegion));
-router.delete("/regions/:id", asyncHandler(c.deleteRegion));
+// Regions and admin accounts: admins and superadmins only (not coordinators).
+// Who may manage which account is checked again in the controller.
+const manageAccess = requireRole("admin", "superadmin");
 
-// Superadmin Coordinators Management
-router.get("/coordinators", asyncHandler(c.listCoordinators));
-router.post("/coordinators", asyncHandler(c.createCoordinator));
-router.patch("/coordinators/:uid", asyncHandler(c.updateCoordinator));
-router.post("/coordinators/:uid/reset-password", asyncHandler(c.resetCoordinatorPassword));
-router.delete("/coordinators/:uid", asyncHandler(c.deleteCoordinator));
+router.get("/regions", asyncHandler(c.listRegions));
+router.post("/regions", manageAccess, asyncHandler(c.createRegion));
+router.patch("/regions/:id", manageAccess, asyncHandler(c.updateRegion));
+router.delete("/regions/:id", manageAccess, asyncHandler(c.deleteRegion));
+
+router.get("/coordinators", manageAccess, asyncHandler(c.listCoordinators));
+router.post("/coordinators", manageAccess, asyncHandler(c.createCoordinator));
+router.patch("/coordinators/:uid", manageAccess, asyncHandler(c.updateCoordinator));
+router.post("/coordinators/:uid/reset-password", manageAccess, asyncHandler(c.resetCoordinatorPassword));
+router.delete("/coordinators/:uid", manageAccess, asyncHandler(c.deleteCoordinator));
 
 export default router;

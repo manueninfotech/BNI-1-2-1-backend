@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import type { Response } from "express";
-import type { AuthedRequest } from "../middleware/auth.js";
+import { adminRoleOf, canManage, type AuthedRequest } from "../middleware/auth.js";
 import { db, auth, collections } from "../config/firebase.js";
 import * as conclaves from "../services/conclave.service.js";
 import { toDate } from "../utils/firestore.js";
@@ -605,6 +605,23 @@ export async function deleteRegion(req: AuthedRequest, res: Response) {
   res.json({ message: "Region deleted successfully." });
 }
 
+
+// ---- Who may manage which admin account ------------------------------------
+const ADMIN_ROLES = new Set(["coordinator", "admin", "superadmin"]);
+
+/** Throws 403 unless the caller may manage an account with `targetRole`. */
+async function assertCanManage(req: AuthedRequest, targetRole: string) {
+  const actorRole = await adminRoleOf(req.uid);
+  if (!canManage(actorRole, targetRole)) {
+    throw ApiError.forbidden(`A ${actorRole ?? "non-admin"} can't manage ${targetRole} accounts.`);
+  }
+}
+async function targetRoleOf(uid: string): Promise<string> {
+  const doc = await db.collection(collections.admins).doc(uid).get();
+  if (!doc.exists) throw ApiError.notFound("Admin account not found.");
+  return String(doc.data()?.role ?? "coordinator").toLowerCase();
+}
+
 // ---- Superadmin Coordinators CRUD -----------------------------------------
 
 export async function listCoordinators(_req: AuthedRequest, res: Response) {
@@ -627,6 +644,9 @@ export async function createCoordinator(req: AuthedRequest, res: Response) {
   if (!email || !password || !name) {
     return res.status(400).json({ error: "Email, password, and name are required." });
   }
+  const newRole = String(role || "coordinator").toLowerCase();
+  if (!ADMIN_ROLES.has(newRole)) throw ApiError.badRequest("role must be coordinator, admin or superadmin.");
+  await assertCanManage(req, newRole);
 
   let formattedPhone = mobile ? mobile.trim() : "";
   if (formattedPhone) {
@@ -657,7 +677,7 @@ export async function createCoordinator(req: AuthedRequest, res: Response) {
     mobile: mobile || "",
     region: region || "Guntur Region",
     status: status || "Active",
-    role: role || "coordinator",
+    role: newRole,
     grantedAt: new Date()
   });
   res.status(201).json({ uid, message: "Coordinator created successfully." });
@@ -666,6 +686,13 @@ export async function createCoordinator(req: AuthedRequest, res: Response) {
 export async function updateCoordinator(req: AuthedRequest, res: Response) {
   const { uid } = req.params;
   const { name, mobile, region, status, role } = req.body ?? {};
+  await assertCanManage(req, await targetRoleOf(uid));
+  if (role !== undefined) {
+    const r = String(role).toLowerCase();
+    if (!ADMIN_ROLES.has(r)) throw ApiError.badRequest("role must be coordinator, admin or superadmin.");
+    await assertCanManage(req, r);
+    if (uid === req.uid) throw ApiError.badRequest("You can't change your own role.");
+  }
   const updateData: any = {};
   if (name !== undefined) updateData.name = name;
   if (mobile !== undefined) updateData.mobile = mobile;
@@ -706,15 +733,18 @@ export async function updateCoordinator(req: AuthedRequest, res: Response) {
 export async function resetCoordinatorPassword(req: AuthedRequest, res: Response) {
   const { uid } = req.params;
   const { password } = req.body ?? {};
-  if (!password) {
-    return res.status(400).json({ error: "Password is required." });
+  if (!password || String(password).length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters." });
   }
+  await assertCanManage(req, await targetRoleOf(uid));
   await auth.updateUser(uid, { password });
   res.json({ message: "Password reset successfully." });
 }
 
 export async function deleteCoordinator(req: AuthedRequest, res: Response) {
   const { uid } = req.params;
+  if (uid === req.uid) throw ApiError.badRequest("You can't remove your own access.");
+  await assertCanManage(req, await targetRoleOf(uid));
   await db.collection(collections.admins).doc(uid).delete();
   try {
     await auth.deleteUser(uid);

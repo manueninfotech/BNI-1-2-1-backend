@@ -175,3 +175,27 @@ export async function requireSuperadmin(req: Request, _res: Response, next: Next
   }
   next();
 }
+
+/** The caller's stored admin role ("superadmin" | "admin" | "coordinator"), or null. */
+export async function adminRoleOf(uid: string): Promise<string | null> {
+  if (env.allowInsecureAdmin) return "superadmin";
+  return (await adminRecord(uid))?.role ?? null;
+}
+
+/** May an account with role `actor` manage (create/edit/reset/delete) one with role `target`? */
+export function canManage(actor: string | null, target: string): boolean {
+  return actor === "superadmin" || (actor === "admin" && target === "coordinator");
+}
+
+/**
+ * Gates a route to specific admin roles (e.g. keep coordinators out of account
+ * and region management). Mounted AFTER requireAdmin.
+ */
+export function requireRole(...roles: string[]) {
+  const allowed = new Set(roles.map((r) => r.toLowerCase()));
+  return async (req: Request, _res: Response, next: NextFunction) => {
+    const role = await adminRoleOf((req as AuthedRequest).uid);
+    if (!role || !allowed.has(role)) throw ApiError.forbidden("You don't have access to this area.");
+    next();
+  };
+}

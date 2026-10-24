@@ -342,7 +342,13 @@ export async function updateMe(req: AuthedRequest, res: Response) {
       const adminDocRef = db.collection(collections.admins).doc(req.uid);
       const adminDoc = await adminDocRef.get();
       if (adminDoc.exists) {
-        await adminDocRef.set(updates, { merge: true });
+        // Admins may edit only harmless fields here — `region` drives regional
+        // authorization and changes only through the coordinator screen.
+        const allowed: Record<string, unknown> = { updatedAt: updates.updatedAt };
+        for (const k of ["name", "phone", "mobile", "designation", "organization"]) {
+          if (updates[k] !== undefined) allowed[k] = updates[k];
+        }
+        await adminDocRef.set(allowed, { merge: true });
       } else {
         await userDocRef.set(updates, { merge: true });
       }
@@ -938,16 +944,9 @@ export async function resolveIdentifier(req: any, res: Response) {
       authEmail = `91${tenDigit}@bni121.conclave`;
     }
 
-    return res.json({
-      authEmail,
-      found: !!foundUser,
-      user: foundUser ? {
-        id: foundUser.id,
-        email: foundUser.email,
-        name: foundUser.name,
-        role: foundUser.role || 'member'
-      } : null
-    });
+    // PUBLIC endpoint: return ONLY the sign-in address — no profile fields and
+    // no "found" flag, so it can't be used to look members up.
+    return res.json({ authEmail });
   } catch (err: any) {
     return res.status(500).json({ error: err.message || "Failed to resolve identifier." });
   }
