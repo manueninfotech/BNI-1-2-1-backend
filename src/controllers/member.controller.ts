@@ -561,22 +561,10 @@ export async function createPaymentOrder(req: AuthedRequest, res: Response) {
   res.json(order);
 }
 
+/** Withdraw — only before a schedule exists and never once paid (see registration.service). */
 export async function deregister(req: AuthedRequest, res: Response) {
-  const conclaveId = req.params.id;
-  const uid = req.uid;
-
-  try {
-    await db
-      .collection(collections.conclaves)
-      .doc(conclaveId)
-      .collection(collections.registrations)
-      .doc(uid)
-      .delete();
-
-    res.json({ message: "Registration cancelled." });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || "Failed to cancel registration." });
-  }
+  await registration.deregister(req.params.id, req.uid);
+  res.json({ message: "Registration cancelled." });
 }
 
 export async function syncConclave(req: AuthedRequest, res: Response) {

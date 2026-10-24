@@ -197,6 +197,7 @@ export const registrations = pgTable(
     country: text("country"),
     mealPreference: text("meal_preference"),
     needsAccommodation: text("needs_accommodation"),
+    specialInstructions: text("special_instructions"),
     paymentStatus: text("payment_status"),
     amountPaid: numeric("amount_paid", { mode: "number" }),
     payment: jsonb("payment").$type<Record<string, unknown> | null>(),
@@ -207,6 +208,8 @@ export const registrations = pgTable(
   (t) => [
     primaryKey({ columns: [t.conclaveId, t.userId] }),
     index("registrations_user_idx").on(t.userId),
+    // A Razorpay payment can pay for exactly one registration, ever.
+    uniqueIndex("registrations_payment_id_uq").on(sql`(${t.payment}->>'paymentId')`).where(sql`${t.payment}->>'paymentId' IS NOT NULL`),
   ],
 );
 

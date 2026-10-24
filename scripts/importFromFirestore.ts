@@ -162,7 +162,8 @@ const registrationSpec: Spec = {
   phone: [["phone", "mobile"], S], company: [["company", "businessName"], S],
   category: [["category", "businessCategory"], S], chapter: [["chapter"], S], region: [["region"], S],
   state: [["state"], S], country: [["country"], S], mealPreference: [["mealPreference"], S],
-  needsAccommodation: [["needsAccommodation"], S], paymentStatus: [["paymentStatus"], S],
+  needsAccommodation: [["needsAccommodation"], S], specialInstructions: [["specialInstructions"], S],
+  paymentStatus: [["paymentStatus"], S],
   amountPaid: [["amountPaid"], N], payment: [["payment"], J], addedBy: [["addedBy"], J],
   registeredAt: [["registeredAt"], D],
 };
