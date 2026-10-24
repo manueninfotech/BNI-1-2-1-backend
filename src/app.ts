@@ -1,15 +1,14 @@
 import express from "express";
 import cors from "cors";
 import { env } from "./config/env.js";
-import { errorHandler, notFoundHandler } from "./middleware/errors.js";
+import { asyncHandler, errorHandler, notFoundHandler } from "./middleware/errors.js";
+import { signedLink } from "./services/storage.service.js";
 import { generalLimiter } from "./middleware/rateLimit.js";
 import { requestContext } from "./middleware/requestContext.js";
 import adminRoutes from "./routes/admin.routes.js";
 import memberRoutes from "./routes/member.routes.js";
 import webhookRoutes from "./routes/webhook.routes.js";
 
-import path from "path";
-import fs from "fs";
 
 /**
  * Builds the Express app.
@@ -47,14 +46,18 @@ export function createApp() {
   );
   app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-  // Ensure uploads/agendas folder exists
-  const uploadsDir = path.join(process.cwd(), "uploads", "agendas");
-  if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-  }
-
-  // Serve static uploads
-  app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+  // Stored files: a short-lived signed link to a private blob (see storage.service).
+  app.get(
+    "/api/files/*path",
+    asyncHandler(async (req, res) => {
+      const raw = (req.params as { path?: string | string[] }).path;
+      const path = Array.isArray(raw) ? raw.join("/") : String(raw ?? "");
+      const link = await signedLink(path);
+      if (!link) return res.status(404).json({ error: "File not found." });
+      res.setHeader("Cache-Control", "private, no-store");
+      res.redirect(302, link);
+    }),
+  );
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });

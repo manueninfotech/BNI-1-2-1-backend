@@ -19,15 +19,12 @@ export const env = {
    */
   firebaseServiceAccount: process.env.FIREBASE_SERVICE_ACCOUNT ?? "",
 
+  /** Azure Blob Storage (replaces Firebase Storage). The container stays private. */
+  azureStorageConnectionString: process.env.AZURE_STORAGE_CONNECTION_STRING ?? "",
+  azureStorageContainer: process.env.AZURE_STORAGE_CONTAINER ?? "conclave-files",
+
   /** Postgres connection string (replaces Firestore). */
   databaseUrl: process.env.DATABASE_URL ?? "postgres://localhost:5432/conclave_dev",
-
-  /**
-   * Cloud Storage bucket for uploaded files (agenda PDFs). Defaults to this
-   * project's bucket; override per environment if needed.
-   */
-  firebaseStorageBucket:
-    process.env.FIREBASE_STORAGE_BUCKET ?? "conclave-1-2-1.firebasestorage.app",
 
   /**
    * Bypasses admin authentication. LOCAL DEVELOPMENT ONLY — it makes every

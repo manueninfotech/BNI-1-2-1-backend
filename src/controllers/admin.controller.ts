@@ -1,10 +1,8 @@
-import fs from "fs";
 import * as referralsSvc from "../services/referrals.service.js";
 import { assertRegion, regionScope } from "../middleware/conclaveAccess.js";
 import * as adminsService from "../services/admins.service.js";
 import * as usersService from "../services/user.service.js";
 import * as regionsService from "../services/regions.service.js";
-import path from "path";
 import type { Response } from "express";
 import type { AuthedRequest } from "../middleware/auth.js";
 import * as conclaves from "../services/conclave.service.js";
@@ -12,7 +10,6 @@ import * as schedule from "../services/schedule.service.js";
 import * as roles from "../services/role.service.js";
 import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
-import { uploadBufferToStorage } from "../services/storage.service.js";
 import * as categories from "../services/categories.service.js";
 import * as settings from "../services/settings.service.js";
 import * as feedback from "../services/feedback.service.js";
@@ -136,77 +133,12 @@ export async function lockSchedule(req: AuthedRequest, res: Response) {
 }
 
 export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  const agendaDoc = req.body?.agendaDocument;
-
-  if (!agendaDoc) {
-    const ref = conclaves.conclaveRef(id);
-    await ref.set({
-      agendaDocument: null,
-      updatedAt: new Date().toISOString()
-    }, { merge: true });
-    return res.json({ message: "Agenda document cleared.", agendaDocument: null });
-  }
-
-  let fileUrl = agendaDoc.dataUrl || agendaDoc.url || "";
-  let savedFileName = agendaDoc.name || "agenda.pdf";
-  // Object path in Firebase Storage — kept so the file can be deleted later.
-  let storagePath = "";
-
-  // Upload to Firebase Storage when a base64 data URL is provided.
-  if (agendaDoc.dataUrl && agendaDoc.dataUrl.startsWith("data:")) {
-    try {
-      // data:<contentType>;base64,<data>
-      const match = agendaDoc.dataUrl.match(/^data:([^;]+);base64,(.*)$/s);
-      const contentType = match?.[1] || agendaDoc.type || "application/pdf";
-      const base64Data = match?.[2] ?? agendaDoc.dataUrl.split(";base64,")[1] ?? "";
-      const buffer = Buffer.from(base64Data, "base64");
-
-      const result = await uploadBufferToStorage(buffer, savedFileName, contentType, "agendas");
-      if (result) {
-        fileUrl = result.url;
-        storagePath = result.path;
-        console.log(`[Storage] Uploaded agenda to Firebase Storage: ${result.path}`);
-      } else {
-        // Fallback to local disk if Storage is unreachable.
-        const uploadsDir = path.join(process.cwd(), "uploads", "agendas");
-        if (!fs.existsSync(uploadsDir)) {
-          fs.mkdirSync(uploadsDir, { recursive: true });
-        }
-        const cleanName = savedFileName.replace(/[^a-zA-Z0-9_.-]/g, "_");
-        const fileNameOnDisk = `${id}_${Date.now()}_${cleanName}`;
-        fs.writeFileSync(path.join(uploadsDir, fileNameOnDisk), buffer);
-        fileUrl = `/uploads/agendas/${fileNameOnDisk}`;
-      }
-    } catch (err: any) {
-      console.error("Failed to process agenda document upload:", err);
-    }
-  }
-
-  const finalDocRecord = {
-    name: savedFileName,
-    url: fileUrl,
-    dataUrl: fileUrl,
-    // Storage object path (was Cloudinary public_id). `publicId` kept as an alias
-    // so any existing admin-panel code reading that field still works.
-    storagePath,
-    publicId: storagePath,
-    rawText: agendaDoc.rawText || agendaDoc.agendaText || "",
-    agendaText: agendaDoc.agendaText || agendaDoc.rawText || "",
-    type: agendaDoc.type || "application/pdf",
-    size: agendaDoc.size || "1.0 MB",
-    uploadedAt: new Date().toISOString()
-  };
-
-  const ref = conclaves.conclaveRef(id);
-  await ref.set({
-    agendaDocument: finalDocRecord,
-    updatedAt: new Date().toISOString()
-  }, { merge: true });
-
-  res.json({ message: "Agenda document uploaded and saved to server successfully.", agendaDocument: finalDocRecord });
+  const agendaDocument = await conclaves.setAgenda(req.params.id, req.body?.agendaDocument ?? null);
+  res.json({
+    message: agendaDocument ? "Agenda document uploaded and saved." : "Agenda document cleared.",
+    agendaDocument,
+  });
 }
-
 
 export async function complete(req: AuthedRequest, res: Response) {
   const result = await conclaves.completeConclave(req.params.id);

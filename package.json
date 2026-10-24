@@ -25,6 +25,7 @@
     "emulator": "npx firebase-tools emulators:start --config ../firebase.json"
   },
   "dependencies": {
+    "@azure/storage-blob": "^12.34.0",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.4",

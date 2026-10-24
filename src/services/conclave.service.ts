@@ -11,6 +11,7 @@ import {
   TERMINAL_STATUSES,
 } from "../domain/conclave.js";
 import { notifyConclave, notifyUser } from "./notification.service.js";
+import { decodeDataUrl, deleteFile, uploadFile, type StoredFile } from "./storage.service.js";
 import { resolveNotification, getConclaveDefaults, getRoundTiming, type RoundTiming } from "./settings.service.js";
 
 /**
@@ -796,4 +797,43 @@ export async function listForMember(uid: string, email?: string) {
       : c.participants,
     isRegistered: registered.has(c.id),
   }));
+}
+
+/**
+ * Attach (or clear) a conclave's agenda document. The file is stored first; the
+ * conclave change is then audited; the previous file is deleted afterwards.
+ */
+export async function setAgenda(
+  id: string,
+  input: { dataUrl?: string; url?: string; name?: string; rawText?: string; agendaText?: string } | null,
+) {
+  const { row } = await getConclaveOrThrow(id);
+  let record: Record<string, unknown> | null = null;
+
+  if (input) {
+    const name = String(input.name || "agenda.pdf").slice(0, 120);
+    let stored: StoredFile | null = null;
+    if (input.dataUrl?.startsWith("data:")) {
+      const { contentType, data } = decodeDataUrl(input.dataUrl);
+      stored = await uploadFile("agendas", name, contentType, data);
+    } else if (!input.url && !input.rawText && !input.agendaText) {
+      throw ApiError.badRequest("Send the agenda as a file (data URL) or as text.");
+    }
+    const text = String(input.agendaText || input.rawText || "").slice(0, 20_000);
+    record = {
+      name,
+      url: stored?.url ?? input.url ?? "",
+      storagePath: stored?.path ?? "",
+      type: stored?.contentType ?? "application/pdf",
+      bytes: stored?.bytes ?? 0,
+      agendaText: text,
+      rawText: text,
+      uploadedAt: new Date().toISOString(),
+    };
+  }
+
+  await mutate(id, record ? "conclave.agenda_set" : "conclave.agenda_clear", () => ({ agendaDocument: record }));
+  const previous = (row.agendaDocument as { storagePath?: string } | null)?.storagePath;
+  if (previous && previous !== record?.storagePath) await deleteFile(previous);
+  return record;
 }
