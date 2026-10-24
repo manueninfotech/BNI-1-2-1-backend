@@ -20,6 +20,8 @@ const as = <T>(uid: string, fn: () => Promise<T>) =>
   runWithContext({ requestId: `t-${Math.random().toString(36).slice(2)}`, source: "mobile_app", actor: { uid, role: "member" }, changeCount: 0 }, fn);
 
 let conclaveId = "";
+// audit_log is append-only and persists across runs, so every audit lookup
+// below is scoped to this run's conclave.
 /** Round-1 seating: captain of table 1, a member at table 1, and someone at table 2. */
 let cap = "", mate = "", other = "";
 let roundStart = 0;
@@ -90,7 +92,7 @@ describe("referrals", () => {
     expect(await pgdb.select().from(referrals)).toHaveLength(1);
     const referralPushes = pushes.filter((p) => JSON.stringify(p).includes("referral_received"));
     expect(referralPushes).toHaveLength(1);
-    const [a] = await pgdb.select().from(auditLog).where(and(eq(auditLog.action, "referral.create"), eq(auditLog.entityId, "r1")));
+    const [a] = await pgdb.select().from(auditLog).where(and(eq(auditLog.action, "referral.create"), eq(auditLog.entityId, "r1"), eq(auditLog.conclaveId, conclaveId)));
     expect(a.actorUid).toBe(mate);
   });
 
@@ -126,7 +128,7 @@ describe("referrals", () => {
     await as(cap, () => syncConclave(conclaveId, cap, { referrals: [{ ...ref("r7", mate, cap), notes: "rewritten", status: "Accepted" }] }));
     const [r] = await pgdb.select().from(referrals).where(eq(referrals.id, "r7"));
     expect(r).toMatchObject({ notes: "n", status: "Accepted" });
-    const [a] = await pgdb.select().from(auditLog).where(and(eq(auditLog.action, "referral.status"), eq(auditLog.entityId, "r7")));
+    const [a] = await pgdb.select().from(auditLog).where(and(eq(auditLog.action, "referral.status"), eq(auditLog.entityId, "r7"), eq(auditLog.conclaveId, conclaveId)));
     expect(a.changes).toMatchObject({ status: { from: "Pending", to: "Accepted" } });
   });
 
@@ -148,7 +150,7 @@ describe("state returned to the phone", () => {
     expect(r.mySchedule).toHaveLength(4);
     expect(r.tableNumber).toBe(1);
     expect(r.conclaveStatus).toMatchObject({ id: conclaveId, status: "running", currentRound: 1 });
-    const [a] = await pgdb.select().from(auditLog).where(and(eq(auditLog.action, "attendance.sync"), eq(auditLog.actorUid, mate)));
+    const [a] = await pgdb.select().from(auditLog).where(and(eq(auditLog.action, "attendance.sync"), eq(auditLog.actorUid, mate), eq(auditLog.conclaveId, conclaveId)));
     expect(a.metadata).toMatchObject({ marks: 1, selfMarks: 1 });
   });
 });
