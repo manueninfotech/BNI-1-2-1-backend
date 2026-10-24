@@ -93,16 +93,6 @@ async function getAdminDoc(uid: string, email?: string) {
         .limit(1)
         .get();
       if (!byEmail.empty) return byEmail.docs[0].data() as Record<string, string>;
-
-      if (normalizedEmail.includes("superadmin") || normalizedEmail.includes("admin")) {
-        return {
-          name: normalizedEmail.includes("superadmin") ? "Superadmin" : "Admin",
-          email: normalizedEmail,
-          role: normalizedEmail.includes("superadmin") ? "superadmin" : "admin",
-          region: "Global",
-          uid,
-        };
-      }
     }
     return null;
   } catch (err: any) {
@@ -150,7 +140,7 @@ export async function getOne(req: AuthedRequest, res: Response) {
 
 export async function create(req: AuthedRequest, res: Response) {
   const admin = await getAdminDoc(req.uid, req.email);
-  const isSuperadmin = admin?.role === "superadmin" || admin?.region === "Global" || (req.email || "").toLowerCase().includes("superadmin");
+  const isSuperadmin = (admin?.role || "").toLowerCase() === "superadmin" || admin?.region === "Global";
   const body = req.body ?? {};
 
   if (!isSuperadmin) {
@@ -173,7 +163,7 @@ export async function create(req: AuthedRequest, res: Response) {
 
 export async function update(req: AuthedRequest, res: Response) {
   const admin = await getAdminDoc(req.uid, req.email);
-  const isSuperadmin = admin?.role === "superadmin" || admin?.region === "Global" || (req.email || "").toLowerCase().includes("superadmin");
+  const isSuperadmin = (admin?.role || "").toLowerCase() === "superadmin" || admin?.region === "Global";
   const body = req.body ?? {};
 
   if (!isSuperadmin) {

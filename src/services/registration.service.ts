@@ -1,8 +1,7 @@
 import { db, collections } from "../config/firebase.js";
 import { ApiError } from "../middleware/errors.js";
 import { conclaveWindow, windowsOverlap } from "../domain/schedulingRules.js";
-import { TERMINAL_STATUSES } from "../domain/conclave.js";
-import { getConclaveOrThrow, conclaveRef } from "./conclave.service.js";
+import { getConclaveOrThrow, conclaveRef, evaluateConclaveStatus } from "./conclave.service.js";
 import { verifyPayment } from "./razorpay.service.js";
 
 /** The registration fee for a conclave, in rupees. 0 (or unset) means free. */
@@ -23,12 +22,13 @@ export function registrationFeeOf(conclave: any): number {
 export async function assertRegisterable(conclaveId: string, uid: string) {
   const { data: conclave } = await getConclaveOrThrow(conclaveId);
 
-  if (
-    conclave.isRegistrationOpen === false ||
-    conclave.status === "completed" ||
-    conclave.status === "ended" ||
-    conclave.status === "cancelled"
-  ) {
+  const statusLower = String(conclave.status || "").toLowerCase();
+  if (conclave.isScheduleLocked === true || statusLower === "locked") {
+    throw ApiError.conflict("Registration is closed because the conclave schedule is locked.");
+  }
+
+  const evalResult = evaluateConclaveStatus(conclave);
+  if (!evalResult.isRegistrationOpen) {
     throw ApiError.conflict("Registration is not open for this conclave.");
   }
 
@@ -40,11 +40,27 @@ export async function assertRegisterable(conclaveId: string, uid: string) {
   const target = conclaveWindow(conclave);
   if (!target) throw ApiError.conflict("This conclave has no date set yet.");
 
-  const others = await db
-    .collection(collections.conclaves)
-    .where("status", "not-in", [...TERMINAL_STATUSES])
-    .get();
-  const candidates = others.docs.filter((d) => d.id !== conclaveId);
+  const allConclavesSnap = await db.collection(collections.conclaves).get();
+  const now = new Date();
+
+  const candidates = allConclavesSnap.docs.filter((d) => {
+    if (d.id === conclaveId) return false;
+    const other = d.data();
+    const otherStatus = String(other.status || "").toLowerCase();
+
+    // 1. Completed / cancelled conclaves never clash!
+    if (otherStatus === "completed" || otherStatus === "ended" || otherStatus === "cancelled") {
+      return false;
+    }
+
+    // 2. Conclaves that have already concluded in the past (e.g. morning event) never clash!
+    const otherWindow = conclaveWindow(other);
+    if (otherWindow && otherWindow.end <= now) {
+      return false;
+    }
+
+    return true;
+  });
 
   if (candidates.length > 0) {
     const regs = await db.getAll(
@@ -57,7 +73,7 @@ export async function assertRegisterable(conclaveId: string, uid: string) {
       if (!otherWindow || !windowsOverlap(target, otherWindow)) continue;
       throw ApiError.conflict(
         `This clashes with "${other.name}", which you are already registered for. ` +
-          `Two conclaves at the same time cannot both be attended, and registrations cannot be withdrawn.`,
+        `Two conclaves at the same time cannot both be attended, and registrations cannot be withdrawn.`,
         {
           conflictsWith: {
             conclaveId: candidates[i].id,
@@ -187,7 +203,7 @@ export async function register(conclaveId: string, uid: string, details: Record<
   if (phone) userUpdate.phone = phone;
 
   if (Object.keys(userUpdate).length > 0) {
-    await userRef.set(userUpdate, { merge: true }).catch(() => {});
+    await userRef.set(userUpdate, { merge: true }).catch(() => { });
   }
 
   return { alreadyRegistered: false };

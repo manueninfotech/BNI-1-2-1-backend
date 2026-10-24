@@ -7,7 +7,7 @@ import {
   TERMINAL_STATUSES,
 } from "../domain/conclave.js";
 import { toDate, toIso } from "../utils/firestore.js";
-import { notifyConclave, notifyUser } from "./notification.service.js";
+import { notifyConclave, notifyUser, recordUserNotification } from "./notification.service.js";
 import { resolveNotification, getConclaveDefaults, getRoundTiming } from "./settings.service.js";
 
 export const conclaveRef = (id: string) =>
@@ -177,44 +177,32 @@ export function validateConclaveDates(
 
 /**
  * Evaluates conclave status dynamically based on current date/time vs reg dates and event start/end dates & times.
- * A conclave is shown as "running" ONLY if its start date & start time have already arrived!
  */
 export function evaluateConclaveStatus(data: any): { status: string; isRegistrationOpen: boolean } {
   try {
-    const now = new Date();
+    const rawStatus = String(data?.status || "").trim();
+    const statusLower = rawStatus.toLowerCase();
 
-    // Preserve terminal statuses an admin has set explicitly (completed or
-    // cancelled). These are final decisions and must NOT be recomputed from the
-    // time window — otherwise a conclave ended early, before its scheduled
-    // endDateTime, or one whose rounds have run (currentRound > 0), flips back to
-    // "running" below and the app keeps showing it as a live conclave.
-    if (data?.status && TERMINAL_STATUSES.has(data.status)) {
-      return { status: data.status, isRegistrationOpen: false };
+    // 1. Preserve terminal statuses (completed or cancelled) - never auto-reopen
+    if (statusLower === "completed" || statusLower === "cancelled") {
+      return {
+        status: statusLower === "completed" ? ConclaveStatus.completed : ConclaveStatus.cancelled,
+        isRegistrationOpen: false,
+      };
     }
 
-    const eventStart = data?.date ? toDate(data.date) : (data?.startDate ? toDate(data.startDate) : null);
-    const eventEnd = data?.endDate ? toDate(data.endDate) : (data?.date ? toDate(data.date) : null);
-    const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
-    const regEnd = data?.regEndDate ? toDate(data.regEndDate) : null;
-
-    const startDateTime = combineDateTime(eventStart, data?.startTime, "start");
-    const endDateTime = combineDateTime(eventEnd ?? eventStart, data?.endTime, "end");
-    const regStartDateTime = combineDateTime(regStart, data?.regStartTime, "start");
-    const regEndDateTime = combineDateTime(regEnd, data?.regEndTime, "end");
-
-    // 1. Completed once the event's end has passed.
-    if (endDateTime && now > endDateTime) {
-      return { status: ConclaveStatus.completed, isRegistrationOpen: false };
-    }
-
-    // 2. Running once the event's start has arrived (or rounds have run).
-    const hasLiveRounds = Number(data?.currentRound) > 0;
-    if (startDateTime && (now >= startDateTime || hasLiveRounds)) {
+    // 2. An admin-started conclave stays running until an admin explicitly finishes it!
+    // Conclaves never start or end automatically on a clock.
+    if (statusLower === "running") {
       return { status: ConclaveStatus.running, isRegistrationOpen: false };
     }
 
-    // An explicit admin override wins over registration dates, but never over
-    // the event lifecycle checks above.
+    // 3. Registrations are strictly closed once the conclave schedule is marked as locked!
+    if (data?.isScheduleLocked || statusLower === "locked") {
+      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    }
+
+    // 4. Admin registration override (Open / Closed)
     const registrationOverride = String(data?.registrationOverride ?? "").toLowerCase();
     if (registrationOverride === "open") {
       return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
@@ -223,21 +211,20 @@ export function evaluateConclaveStatus(data: any): { status: string; isRegistrat
       return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
     }
 
-    // Without an override, the registration WINDOW governs.
-    // 3. Not open yet.
+    // 5. If registration start date is in the future and not overridden:
+    const now = new Date();
+    const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
+    const regStartDateTime = combineDateTime(regStart, data?.regStartTime, "start");
     if (regStartDateTime && now < regStartDateTime) {
       return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
     }
-    // 4. Past the registration close time.
-    if (regEndDateTime && now > regEndDateTime) {
-      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
-    }
-    // 5. Within the window and no override → registration is open.
+
+    // 6. Registrations remain open up to the conclave status being marked as locked!
     return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
   } catch (err) {
     return {
       status: data?.status || ConclaveStatus.registrationOpen,
-      isRegistrationOpen: data?.isRegistrationOpen ?? true
+      isRegistrationOpen: data?.isRegistrationOpen ?? true,
     };
   }
 }
@@ -381,6 +368,15 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
     updates.status = evalResult.status;
   }
   updates.isRegistrationOpen = evalResult.isRegistrationOpen;
+
+  if (mergedData.isScheduleLocked || String(mergedData.status || '').toLowerCase() === 'locked') {
+    updates.registrationOverride = "closed";
+    updates.isRegistrationOpen = false;
+    if (body.status === undefined && data.status !== ConclaveStatus.completed) {
+      updates.status = ConclaveStatus.registrationClosed;
+    }
+  }
+
   updates.updatedAt = new Date();
 
   if (body.personsPerTable !== undefined || body.roundCount !== undefined) {
@@ -404,7 +400,131 @@ export async function updateConclave(id: string, body: Record<string, unknown>) 
 
   clearConclaveCache();
   await ref.update(updates);
+  void notifyConclaveDetailsUpdated(id, data, updates).catch(() => { });
   return Object.keys(updates);
+}
+
+/**
+ * Detects changes to key conclave details (name, date/postponed, time, venue, status)
+ * and notifies all registered members via FCM push + in-app inbox.
+ */
+export async function notifyConclaveDetailsUpdated(
+  conclaveId: string,
+  oldData: any,
+  updates: Record<string, unknown>
+): Promise<void> {
+  try {
+    const changes: string[] = [];
+    const conclaveName = String(updates.name || oldData.name || "BNI Conclave").trim();
+
+    // 1. Name change
+    if (updates.name !== undefined && String(updates.name).trim() !== String(oldData.name || "").trim()) {
+      changes.push(`Name changed to "${updates.name}"`);
+    }
+
+    // 2. Date change / Postponed
+    const oldDateObj = oldData.startDate || oldData.date ? new Date(oldData.startDate || oldData.date) : null;
+    const newDateObj = (updates.startDate || updates.date) ? new Date((updates.startDate || updates.date) as string | Date) : null;
+    if (newDateObj && oldDateObj && !isNaN(newDateObj.getTime()) && !isNaN(oldDateObj.getTime())) {
+      const oldDateStr = oldDateObj.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      const newDateStr = newDateObj.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      if (oldDateStr !== newDateStr) {
+        if (newDateObj.getTime() > oldDateObj.getTime()) {
+          changes.push(`Event Postponed: Rescheduled to ${newDateStr}`);
+        } else {
+          changes.push(`Date changed to ${newDateStr}`);
+        }
+      }
+    } else if (newDateObj && !oldDateObj && !isNaN(newDateObj.getTime())) {
+      const newDateStr = newDateObj.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      changes.push(`Date set to ${newDateStr}`);
+    }
+
+    // 3. Timing change
+    const oldStartTime = String(oldData.startTime || "").trim();
+    const newStartTime = updates.startTime !== undefined ? String(updates.startTime || "").trim() : oldStartTime;
+    const oldEndTime = String(oldData.endTime || "").trim();
+    const newEndTime = updates.endTime !== undefined ? String(updates.endTime || "").trim() : oldEndTime;
+
+    if ((updates.startTime !== undefined && newStartTime !== oldStartTime) ||
+      (updates.endTime !== undefined && newEndTime !== oldEndTime)) {
+      const formatTime = (t: string) => {
+        if (!t) return "";
+        const m = t.match(/^(\d{1,2}):(\d{2})/);
+        if (m) {
+          let h = parseInt(m[1], 10);
+          const mins = m[2];
+          const meridian = h >= 12 ? "PM" : "AM";
+          if (h > 12) h -= 12;
+          if (h === 0) h = 12;
+          return `${h}:${mins} ${meridian}`;
+        }
+        return t;
+      };
+      const displayNewTiming = `${formatTime(newStartTime)} – ${formatTime(newEndTime)}`.trim();
+      changes.push(`Timing updated to ${displayNewTiming}`);
+    }
+
+    // 4. Venue change
+    const oldVenue = String(oldData.venueLocation || oldData.venue || "").trim();
+    const newVenue = updates.venueLocation !== undefined
+      ? String(updates.venueLocation || "").trim()
+      : (updates.venue !== undefined ? String(updates.venue || "").trim() : oldVenue);
+    if ((updates.venueLocation !== undefined || updates.venue !== undefined) && newVenue && newVenue !== oldVenue) {
+      changes.push(`Venue moved to ${newVenue}`);
+    }
+
+    // 5. Status / Cancellation / Postponement
+    if (updates.status !== undefined && String(updates.status).toLowerCase() !== String(oldData.status || "").toLowerCase()) {
+      const statusLower = String(updates.status).toLowerCase();
+      if (statusLower === "cancelled") {
+        changes.push("The conclave has been CANCELLED");
+      } else if (statusLower.includes("postpone")) {
+        changes.push("Event has been marked as POSTPONED");
+      }
+    }
+
+    // If no attendee-facing details changed, do nothing
+    if (changes.length === 0) return;
+
+    const isPostponedOrCancelled = changes.some(c =>
+      c.toLowerCase().includes("postpone") || c.toLowerCase().includes("cancelled") || c.toLowerCase().includes("reschedule")
+    );
+    const title = isPostponedOrCancelled
+      ? `Important Update: ${conclaveName}`
+      : `Conclave Details Updated: ${conclaveName}`;
+    const body = changes.join(". ") + ".";
+
+    const payload = {
+      title,
+      body,
+      type: "conclave_updated",
+      data: {
+        conclaveId,
+        type: "conclave_updated",
+        name: conclaveName,
+        changes: changes.join("; "),
+        updatedAt: new Date().toISOString()
+      }
+    };
+
+    // 1. Broadcast to conclave FCM topic
+    void notifyConclave(conclaveId, payload).catch(() => { });
+
+    // 2. Notify all registered attendees
+    const ref = conclaveRef(conclaveId);
+    const regsSnap = await ref.collection(collections.registrations).get();
+
+    for (const doc of regsSnap.docs) {
+      const uid = doc.id;
+      // Send FCM push notification to individual member
+      void notifyUser(uid, payload, "general").catch(() => { });
+      // Record notification in user's in-app inbox
+      void recordUserNotification(uid, payload).catch(() => { });
+    }
+  } catch (err) {
+    console.error(`Failed to notify attendees for conclave ${conclaveId} updates:`, err);
+  }
 }
 
 /** Open or close registration. Two-way, unlike a one-shot "close". */
@@ -418,8 +538,14 @@ export async function setRegistrationOpen(id: string, open: boolean) {
     );
   }
 
+  if (data.isScheduleLocked && open) {
+    throw ApiError.conflict(
+      "Cannot open registrations on a conclave whose schedule is locked.",
+    );
+  }
+
   // Record the admin's intent as the override and recompute. The override can
-  // bypass registration dates, but not event lifecycle or terminal status.
+  // bypass registration dates, but not event lifecycle, locked schedule, or terminal status.
   const override = open ? "open" : "closed";
   const evalResult = evaluateConclaveStatus({ ...data, registrationOverride: override });
   await ref.update({
@@ -445,8 +571,8 @@ export async function cancelConclave(id: string) {
   if (status === ConclaveStatus.running) {
     throw ApiError.conflict(
       "This conclave is running — it cannot be cancelled. Use End Conclave to " +
-        "stop it now; members keep their attendance and referrals, and get their " +
-        "summaries.",
+      "stop it now; members keep their attendance and referrals, and get their " +
+      "summaries.",
     );
   }
 
@@ -459,21 +585,23 @@ export async function cancelConclave(id: string) {
     isRegistrationOpen: false,
     cancelledAt: new Date(),
   });
+  void notifyConclaveDetailsUpdated(id, data, { status: "cancelled" }).catch(() => { });
 }
 
 /** Lock the schedule for a conclave without ending the conclave. */
 export async function lockConclaveSchedule(id: string) {
   const { ref, data } = await getConclaveOrThrow(id);
-  const evalResult = evaluateConclaveStatus(data);
   await ref.update({
     isScheduleLocked: true,
-    status: data.status === ConclaveStatus.completed ? ConclaveStatus.completed : evalResult.status,
+    isRegistrationOpen: false,
+    registrationOverride: "closed",
+    status: data.status === ConclaveStatus.completed ? ConclaveStatus.completed : ConclaveStatus.registrationClosed,
     updatedAt: new Date()
   });
   clearConclaveCache();
   // Publishing the schedule is when everyone should be told: members that their
   // schedule is ready, captains which table they're anchoring. Best-effort.
-  try { await notifyScheduleReady(id); } catch {}
+  try { await notifyScheduleReady(id); } catch { }
 }
 
 /**
@@ -593,7 +721,7 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
         const shown = Math.min(liveRound, Number(data.roundCount) || liveRound);
         throw ApiError.conflict(
           `Round ${roundNumber} has already run — the conclave is on round ${shown}. ` +
-            `Rounds advance automatically, so you don't need to start them by hand.`,
+          `Rounds advance automatically, so you don't need to start them by hand.`,
           { liveRound: shown },
         );
       }
@@ -617,7 +745,7 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
     if (other) {
       throw ApiError.conflict(
         `You are already running "${other.data().name}". End it before starting another — ` +
-          `rounds are advanced by hand, and you cannot be in two rooms at once.`,
+        `rounds are advanced by hand, and you cannot be in two rooms at once.`,
         { runningConclaveId: other.id },
       );
     }
@@ -650,9 +778,9 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
     // round screen — so a topic-only push reaches almost no one before rounds.
     const roundRegs = await ref.collection(collections.registrations).get();
     for (const reg of roundRegs.docs) {
-      void notifyUser(reg.id, { title: startedMsg.title, body: startedMsg.body, data: roundData }, "round_alerts").catch(() => {});
+      void notifyUser(reg.id, { title: startedMsg.title, body: startedMsg.body, data: roundData }, "round_alerts").catch(() => { });
     }
-  } catch {}
+  } catch { }
 
   return roundStartedAt;
 }
@@ -687,7 +815,7 @@ export async function pauseRound(id: string) {
       body: `Round ${data.currentRound || 1} has been paused by the admin.`,
       data: { conclaveId: id, type: "round_paused" },
     });
-  } catch {}
+  } catch { }
 
   return { isRoundPaused: true, pausedAt, elapsedMs };
 }
@@ -723,7 +851,7 @@ export async function resumeRound(id: string) {
       body: `Round ${data.currentRound || 1} has resumed!`,
       data: { conclaveId: id, type: "round_resumed" },
     });
-  } catch {}
+  } catch { }
 
   return { isRoundPaused: false, currentRoundStartedAt: newStartedAt };
 }
@@ -762,7 +890,7 @@ export async function closeRound(id: string) {
       body: `Round ${curRound} has concluded.`,
       data: { conclaveId: id, type: "round_ended", roundNumber: String(curRound) },
     });
-  } catch {}
+  } catch { }
 
   return { closedRound: curRound, isEnded: true };
 }
@@ -817,7 +945,7 @@ export async function listConclaves(region?: string) {
           if (evalResult.status !== ConclaveStatus.completed) {
             d.status = evalResult.status;
             d.isRegistrationOpen = evalResult.isRegistrationOpen;
-            doc.ref.update({ status: evalResult.status, isRegistrationOpen: evalResult.isRegistrationOpen }).catch(() => {});
+            doc.ref.update({ status: evalResult.status, isRegistrationOpen: evalResult.isRegistrationOpen }).catch(() => { });
           }
         } else if (d.status !== ConclaveStatus.completed && d.status !== ConclaveStatus.cancelled) {
           const evalResult = evaluateConclaveStatus(d);
