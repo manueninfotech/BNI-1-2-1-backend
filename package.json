@@ -2,7 +2,7 @@
   "name": "conclave-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "BNI 121 Conclave — API and matching engine",
+  "description": "BNI 121 Conclave \u2014 API and matching engine",
   "type": "module",
   "main": "src/index.ts",
   "engines": {
@@ -16,13 +16,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "create-admin": "tsx scripts/createAdmin.ts",
-    "seed": "tsx scripts/seed.ts",
-    "seed-full": "tsx scripts/seedFullConclave.ts",
-    "delete-conclave": "tsx scripts/deleteSeededConclave.ts",
-    "check-rules": "tsx scripts/checkRules.ts",
-    "patch-conclaves": "tsx scripts/patchConclaveFields.ts",
-    "sync-db": "tsx src/scripts/syncDb.ts",
-    "emulator": "npx firebase-tools emulators:start --config ../firebase.json"
+    "seed": "tsx scripts/seedDev.ts",
+    "import-firestore": "tsx scripts/importFromFirestore.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
     "@azure/storage-blob": "^12.34.0",

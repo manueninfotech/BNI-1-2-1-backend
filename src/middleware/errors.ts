@@ -52,6 +52,13 @@ export function asyncHandler(
   fn: (req: any, res: Response, next: NextFunction) => Promise<unknown>,
 ) {
   return (req: Request, res: Response, next: NextFunction) => {
+    // Capture the matched route and its params NOW: if the handler throws,
+    // Express unwinds req.baseUrl/req.params before the response finishes, and
+    // the audit row would lose which conclave/record the failed call was for.
+    if (!res.locals.auditRoute && (req as any).route?.path) {
+      res.locals.auditRoute = `${req.baseUrl ?? ""}${(req as any).route.path}`;
+      res.locals.auditParams = { ...(req.params as Record<string, string>) };
+    }
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 }

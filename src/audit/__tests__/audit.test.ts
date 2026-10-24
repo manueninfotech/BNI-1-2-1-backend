@@ -6,6 +6,7 @@ import { pgdb, pool } from "../../db/client.js";
 import { auditLog } from "../../db/schema.js";
 import { audit, diff, redact } from "../audit.service.js";
 import { requestContext } from "../../middleware/requestContext.js";
+import { ApiError, asyncHandler, errorHandler } from "../../middleware/errors.js";
 import { runAsSystem, runWithContext, setActor } from "../../observability/context.js";
 
 afterAll(async () => {
@@ -137,6 +138,15 @@ describe("requestContext middleware (end to end)", () => {
     app.post("/api/admin/secret", (_req, res) => {
       res.status(403).json({ error: "nope" });
     });
+    const router = express.Router();
+    router.patch(
+      "/conclaves/:id/fail",
+      asyncHandler(async () => {
+        throw new ApiError(409, "Cannot edit a conclave that is running.");
+      }),
+    );
+    app.use("/api/admin", router);
+    app.use(errorHandler);
     const server = app.listen(0);
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     try {
@@ -183,6 +193,23 @@ describe("requestContext middleware (end to end)", () => {
     });
     await settle();
     expect(await rowsFor(requestId)).toHaveLength(0);
+  });
+
+  it("keeps the route and record ids on a FAILED request", async () => {
+    const requestId = `test-fail-${Date.now()}`;
+    await withServer(async (base) => {
+      await fetch(`${base}/api/admin/conclaves/c77/fail`, { method: "PATCH", headers: { "X-Request-Id": requestId, "Content-Type": "application/json" }, body: "{}" });
+    });
+    await settle();
+    const [row] = await rowsFor(requestId);
+    expect(row).toMatchObject({
+      statusCode: 409,
+      outcome: "failure",
+      route: "/api/admin/conclaves/:id/fail",
+      conclaveId: "c77",
+      entityId: "c77",
+      error: "Cannot edit a conclave that is running.",
+    });
   });
 
   it("logs refused requests as denied", async () => {

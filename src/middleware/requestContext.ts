@@ -47,8 +47,8 @@ export function requestContext(req: Request, res: Response, next: NextFunction) 
     const denied = status === 401 || status === 403;
     if (!MUTATING.has(req.method) && !denied) return;
     // Route PATTERN (/api/admin/conclaves/:id), not the raw URL, so rows group.
-    const route = `${req.baseUrl ?? ""}${(req as any).route?.path ?? ""}` || req.path;
-    const params = (req.params ?? {}) as Record<string, string>;
+    const route = (res.locals.auditRoute as string | undefined) ?? (`${req.baseUrl ?? ""}${(req as any).route?.path ?? ""}` || req.path);
+    const params = ((res.locals.auditParams as Record<string, string> | undefined) ?? req.params ?? {}) as Record<string, string>;
     runWithContext(ctx, () =>
       audit.request({
         method: req.method,

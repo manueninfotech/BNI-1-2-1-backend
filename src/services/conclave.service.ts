@@ -1,5 +1,4 @@
 import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
-import { db, collections } from "../config/firebase.js";
 import { pgdb } from "../db/client.js";
 import { conclaves, registrations, users } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
@@ -26,14 +25,6 @@ import { resolveNotification, getConclaveDefaults, getRoundTiming, type RoundTim
 export type ConclaveRow = typeof conclaves.$inferSelect;
 type ConclavePatch = Partial<typeof conclaves.$inferInsert>;
 
-/**
- * @deprecated Firestore handle kept only for services not yet moved to Postgres
- * (registrations, sync, stats, feedback, payments). Removed at cut-over.
- */
-export const conclaveRef = (id: string) => db.collection(collections.conclaves).doc(id);
-
-/** No-op kept for callers not yet ported (there is no cache any more). */
-export function clearConclaveCache() {}
 
 // ---------------------------------------------------------------------------
 // API shape — identical field names to the Firestore era, so clients don't change
@@ -97,16 +88,11 @@ export function toView(row: ConclaveRow, registrationCount?: number) {
 }
 export type ConclaveView = ReturnType<typeof toView>;
 
-/**
- * The conclave (API shape) and its row. `ref` is the deprecated Firestore handle
- * for services not yet ported.
- */
+/** The conclave row and its API shape; 404 if it doesn't exist. */
 export async function getConclaveOrThrow(id: string) {
   const [row] = await pgdb.select().from(conclaves).where(eq(conclaves.id, id));
   if (!row) throw ApiError.notFound("Conclave not found.");
-  // `data` stays loosely typed for the services not yet ported (they were
-  // written against untyped Firestore docs); new code should use `row`.
-  return { row, data: toView(row) as any, ref: conclaveRef(id) };
+  return { row, data: toView(row) };
 }
 
 /** Audit view of a conclave: everything except the bulky engine output. */
