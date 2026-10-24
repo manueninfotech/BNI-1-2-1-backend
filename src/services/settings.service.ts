@@ -1,12 +1,12 @@
-import { db, collections } from "../config/firebase.js";
+import { readSetting, writeSetting } from "../repositories/settings.repo.js";
 
 export const DEFAULT_AUTO_LOGOUT_HOURS = 5;
 
 /**
- * The app-wide auto-logout window, from `settings/app`.
+ * The app-wide auto-logout window, from the `app` settings row.
  *
  * Cached: it is read on most requests, it changes almost never, and each read is
- * a full Firestore round trip.
+ * a database round trip.
  */
 let cache: { value: number; expiresAt: number } | null = null;
 const TTL_MS = 60_000;
@@ -15,13 +15,8 @@ export async function getAutoLogoutHours(): Promise<number> {
   if (cache && Date.now() < cache.expiresAt) return cache.value;
 
   let value = DEFAULT_AUTO_LOGOUT_HOURS;
-  try {
-    const doc = await db.collection(collections.settings).doc("app").get();
-    const hours = doc.data()?.autoLogoutHours;
-    if (typeof hours === "number" && hours > 0) value = hours;
-  } catch {
-    // Unreachable settings must not take the API down; the default is sane.
-  }
+  const hours = (await readSetting("app")).autoLogoutHours;
+  if (typeof hours === "number" && hours > 0) value = hours;
 
   cache = { value, expiresAt: Date.now() + TTL_MS };
   return value;
@@ -30,23 +25,14 @@ export async function getAutoLogoutHours(): Promise<number> {
 // ===========================================================================
 // Admin-managed settings (one doc per concern under settings/*).
 //
-// settings/* is already readable by signed-in users (firestore.rules), so the
-// app-facing ones need no rules change. Writes go only through these setters,
-// behind admin routes. Each getter falls back to a sane default.
+// Stored in the Postgres `settings` table. Writes go only through these
+// setters, behind admin routes, and are audited. Each getter falls back to a
+// sane default.
 // ===========================================================================
 
-const settingsRef = (doc: string) => db.collection(collections.settings).doc(doc);
-
-async function readSettings(doc: string): Promise<Record<string, any>> {
-  try {
-    const snap = await settingsRef(doc).get();
-    return snap.exists ? (snap.data() as Record<string, any>) : {};
-  } catch {
-    return {};
-  }
-}
-async function writeSettings(doc: string, data: Record<string, any>): Promise<void> {
-  await settingsRef(doc).set({ ...data, updatedAt: new Date() }, { merge: true });
+const readSettings = readSetting;
+async function writeSettings(key: string, data: Record<string, any>): Promise<void> {
+  await writeSetting(key, data);
 }
 
 function posInt(v: any, fallback: number): number {

@@ -1,4 +1,5 @@
 import fs from "fs";
+import * as regionsService from "../services/regions.service.js";
 import path from "path";
 import type { Response } from "express";
 import type { AuthedRequest } from "../middleware/auth.js";
@@ -520,88 +521,21 @@ export async function attendance(req: AuthedRequest, res: Response) {
 // ---- Superadmin Regions CRUD ----------------------------------------------
 
 export async function listRegions(_req: AuthedRequest, res: Response) {
-  const snap = await db.collection(collections.regions).get();
-  let regionsList = snap.docs.map(doc => ({ id: doc.id, ...doc.data() as any }));
-
-  if (snap.empty) {
-    const defaults = ["Guntur Region", "Vijayawada Region", "Visakhapatnam Region", "Singapore Metro"];
-    const batch = db.batch();
-    for (const name of defaults) {
-      const ref = db.collection(collections.regions).doc();
-      batch.set(ref, {
-        name,
-        status: "Active",
-        createdAt: new Date(),
-        membersCount: 0,
-        conclavesCount: 0
-      });
-    }
-    await batch.commit();
-    const newSnap = await db.collection(collections.regions).get();
-    regionsList = newSnap.docs.map(doc => ({ id: doc.id, ...doc.data() as any }));
-  }
-
-  // Fetch conclaves & users to calculate counts dynamically
-  const [conclavesSnap, usersSnap] = await Promise.all([
-    db.collection(collections.conclaves).get(),
-    db.collection(collections.users).get()
-  ]);
-
-  // Map of region name -> conclaves count
-  const conclaveCounts: Record<string, number> = {};
-  conclavesSnap.docs.forEach(doc => {
-    const data = doc.data();
-    const reg = data.region || "Global";
-    conclaveCounts[reg] = (conclaveCounts[reg] || 0) + 1;
-  });
-
-  // Map of region name -> members count
-  const memberCounts: Record<string, number> = {};
-  usersSnap.docs.forEach(doc => {
-    const data = doc.data();
-    const loc = data.location;
-    const reg = data.region || (loc ? (typeof loc === "object" ? loc.place : loc) : undefined) || "Global";
-    memberCounts[reg] = (memberCounts[reg] || 0) + 1;
-  });
-
-  // Attach counts to regions list
-  const list = regionsList.map(r => ({
-    ...r,
-    conclavesCount: conclaveCounts[r.name] || 0,
-    membersCount: memberCounts[r.name] || 0
-  }));
-
-  res.json(list);
+  res.json(await regionsService.listRegions());
 }
 
 export async function createRegion(req: AuthedRequest, res: Response) {
-  const { name, status } = req.body ?? {};
-  if (!name) {
-    return res.status(400).json({ error: "Region name is required." });
-  }
-  const docRef = await db.collection(collections.regions).add({
-    name,
-    status: status || "Active",
-    createdAt: new Date(),
-    membersCount: 0,
-    conclavesCount: 0
-  });
-  res.status(201).json({ id: docRef.id, message: "Region created successfully." });
+  const { id } = await regionsService.createRegion(req.body ?? {});
+  res.status(201).json({ id, message: "Region created successfully." });
 }
 
 export async function updateRegion(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  const { name, status } = req.body ?? {};
-  const updateData: any = {};
-  if (name !== undefined) updateData.name = name;
-  if (status !== undefined) updateData.status = status;
-  await db.collection(collections.regions).doc(id).update(updateData);
+  await regionsService.updateRegion(req.params.id, req.body ?? {});
   res.json({ message: "Region updated successfully." });
 }
 
 export async function deleteRegion(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  await db.collection(collections.regions).doc(id).delete();
+  await regionsService.deleteRegion(req.params.id);
   res.json({ message: "Region deleted successfully." });
 }
 

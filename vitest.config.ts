@@ -8,5 +8,8 @@ export default defineConfig({
       NODE_ENV: "test",
     },
     globalSetup: ["./src/test/globalSetup.ts"],
+    // Database tests share one Postgres; run files one at a time so a TRUNCATE
+    // in one file can't race another.
+    fileParallelism: false,
   },
 });
