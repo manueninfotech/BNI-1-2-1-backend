@@ -182,7 +182,6 @@ export async function me(req: AuthedRequest, res: Response) {
           createdAt: toISO(adminData.grantedAt || adminData.createdAt),
         });
       }
-
     }
 
     // 3. Query users collection by UID (or verified email)
@@ -406,19 +405,32 @@ export async function listConclaves(req: AuthedRequest, res: Response) {
 
       // Fallback: search by Phone number matching
       if (userPhone) {
-        const regsSnap = await db
+        const phoneVariants = [userPhone, `+91${userPhone}`];
+        if (userData.phone && !phoneVariants.includes(userData.phone)) phoneVariants.push(userData.phone);
+        if (userData.mobile && !phoneVariants.includes(userData.mobile)) phoneVariants.push(userData.mobile);
+
+        const byPhone = await db
           .collection(collections.conclaves)
           .doc(c.id)
           .collection(collections.registrations)
+          .where('phone', 'in', phoneVariants.slice(0, 10))
+          .limit(1)
           .get();
-        for (const doc of regsSnap.docs) {
-          const r = doc.data() as any;
-          const regPhoneRaw = String(r.phone || r.mobile || r.identifier || '').replace(/\D/g, '');
-          const regPhone = regPhoneRaw.length >= 10 ? regPhoneRaw.slice(-10) : regPhoneRaw;
-          if (regPhone && userPhone && regPhone === userPhone) {
-            registeredSet.add(c.id);
-            return;
-          }
+        if (!byPhone.empty) {
+          registeredSet.add(c.id);
+          return;
+        }
+
+        const byIdentifierPhone = await db
+          .collection(collections.conclaves)
+          .doc(c.id)
+          .collection(collections.registrations)
+          .where('identifier', 'in', phoneVariants.slice(0, 10))
+          .limit(1)
+          .get();
+        if (!byIdentifierPhone.empty) {
+          registeredSet.add(c.id);
+          return;
         }
       }
     }),
