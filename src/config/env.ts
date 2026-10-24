@@ -61,3 +61,9 @@ export const env = {
 } as const;
 
 export const isProduction = env.nodeEnv === "production";
+
+// The insecure-admin switch makes every endpoint public. Refuse to boot with it
+// in production rather than trusting that nobody ever sets it there.
+if (isProduction && env.allowInsecureAdmin) {
+  throw new Error("ALLOW_INSECURE_ADMIN=true is not allowed when NODE_ENV=production.");
+}

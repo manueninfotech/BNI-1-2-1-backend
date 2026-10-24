@@ -149,7 +149,7 @@ export async function me(req: AuthedRequest, res: Response) {
     const adminDoc = await db.collection(collections.admins).doc(req.uid).get();
     if (adminDoc.exists) {
       const adminData = adminDoc.data() as any;
-      const resolvedRole = (adminData.role || (normalizedEmail.includes('superadmin') ? 'superadmin' : 'admin')).toLowerCase();
+      const resolvedRole = String(adminData.role || 'admin').toLowerCase();
       return res.json({
         uid: req.uid,
         id: req.uid,
@@ -162,15 +162,15 @@ export async function me(req: AuthedRequest, res: Response) {
       });
     }
 
-    // 2. Check admins collection by email
-    if (normalizedEmail) {
+    // 2. Admin added by email before first sign-in — only for a Firebase-verified email.
+    if (normalizedEmail && req.emailVerified) {
       const adminEmailSnap = await db.collection(collections.admins)
         .where('email', '==', normalizedEmail)
         .limit(1)
         .get();
       if (!adminEmailSnap.empty) {
         const adminData = adminEmailSnap.docs[0].data() as any;
-        const resolvedRole = (adminData.role || (normalizedEmail.includes('superadmin') ? 'superadmin' : 'admin')).toLowerCase();
+        const resolvedRole = String(adminData.role || 'admin').toLowerCase();
         return res.json({
           uid: req.uid,
           id: req.uid,
@@ -183,27 +183,15 @@ export async function me(req: AuthedRequest, res: Response) {
         });
       }
 
-      // 3. Fallback for admin or superadmin email patterns
-      if (normalizedEmail.includes('superadmin') || normalizedEmail.includes('admin')) {
-        const detectedRole = normalizedEmail.includes('superadmin') ? 'superadmin' : 'admin';
-        return res.json({
-          uid: req.uid,
-          id: req.uid,
-          name: detectedRole === 'superadmin' ? 'Superadmin' : 'Admin',
-          email: req.email,
-          phone: '',
-          region: 'Global',
-          role: detectedRole,
-          createdAt: new Date().toISOString()
-        });
-      }
     }
 
-    // 4. Query users collection by UID or email
+    // 3. Query users collection by UID (or verified email)
     const userDoc = await db.collection(collections.users).doc(req.uid).get();
     let data = (userDoc.exists ? userDoc.data() : null) as any;
 
-    if (!data && req.email) {
+    // Email fallback only for a Firebase-verified email — otherwise anyone could
+    // sign up with a member's address and read that member's profile.
+    if (!data && req.email && req.emailVerified) {
       const emailSnap = await db.collection(collections.users)
         .where('email', '==', req.email)
         .limit(1)
@@ -305,15 +293,8 @@ export async function me(req: AuthedRequest, res: Response) {
       isCaptain: isCaptainRole,
     });
   } catch (err: any) {
-    const isErrAdmin = req.email?.toLowerCase().includes('admin');
-    const isErrSuper = req.email?.toLowerCase().includes('superadmin');
-    res.json({
-      uid: req.uid,
-      id: req.uid,
-      name: isErrSuper ? "Superadmin" : isErrAdmin ? "Admin" : "Member",
-      email: req.email || "",
-      role: isErrSuper ? "superadmin" : isErrAdmin ? "admin" : "member"
-    });
+    console.error("GET /me failed:", err?.message ?? err);
+    res.status(500).json({ error: "Couldn't load your profile. Please try again." });
   }
 }
 

@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import type { DecodedIdToken } from "firebase-admin/auth";
 import { auth, db, collections } from "../config/firebase.js";
 import { env } from "../config/env.js";
 import { ApiError } from "./errors.js";
@@ -15,222 +16,161 @@ export interface AuthedRequest extends Omit<Request, "params"> {
   uid: string;
   /** Email from the verified Firebase token (may be undefined for phone-only accounts). */
   email?: string;
+  /** Whether Firebase has verified that email (false/undefined for unverified sign-ups). */
+  emailVerified?: boolean;
   params: Record<string, string>;
 }
 
 function bearerToken(req: Request): string | null {
   const header = req.headers.authorization ?? "";
-  return header.startsWith("Bearer ") ? header.slice(7) : null;
+  return header.startsWith("Bearer ") ? header.slice(7).trim() : null;
 }
 
 /**
- * Authenticates any signed-in user.
- *
- * The uid is taken from the VERIFIED token, never from the request body. This is
- * the whole point: a uid in the body is just a string the caller typed, so
- * trusting it let anyone write attendance and referrals as anyone else, and read
- * any user's referrals by asking for them.
+ * The ONLY way a request becomes authenticated: a Firebase ID token that
+ * verifies. Anything else — an email, a uid, a word — is rejected. (Earlier
+ * versions accepted an unverifiable token as the uid itself, or as the
+ * superadmin if it contained "admin"; that let anyone impersonate anyone.)
  */
-export async function requireUser(req: Request, _res: Response, next: NextFunction) {
-  if (env.allowInsecureAdmin) {
-    // Try Bearer token first so we always get req.email from the decoded claim.
-    // X-User-Id is only a fallback for requests with no valid token.
-    const token = bearerToken(req);
-    if (token) {
-      try {
-        const decoded = await auth.verifyIdToken(token);
-        (req as AuthedRequest).uid = decoded.uid;
-        (req as AuthedRequest).email = decoded.email;
-        return next();
-      } catch {
-        // Token invalid — fall through to X-User-Id
-      }
-    }
-    const userIdHeader = req.headers["x-user-id"] as string;
-    if (userIdHeader) {
-      (req as AuthedRequest).uid = userIdHeader;
-      // Try to get email from X-User-Email header if frontend sends it
-      const emailHeader = req.headers["x-user-email"] as string;
-      if (emailHeader) (req as AuthedRequest).email = emailHeader;
-      return next();
-    }
-    if (token && token.includes("@")) {
-      (req as AuthedRequest).uid = token;
-      return next();
-    }
-    (req as AuthedRequest).uid = "insecure-dev-admin";
-    return next();
-  }
-
-  const token = bearerToken(req);
-  if (!token) {
-    throw ApiError.unauthorized();
-  }
-
+async function verify(token: string | null): Promise<DecodedIdToken> {
+  if (!token) throw ApiError.unauthorized();
   try {
-    const decoded = await auth.verifyIdToken(token);
-    (req as AuthedRequest).uid = decoded.uid;
-    (req as AuthedRequest).email = decoded.email;
-    next();
+    return await auth.verifyIdToken(token);
   } catch {
-    if (token.includes("@") || token.startsWith("usr_") || token.startsWith("admin_")) {
-      (req as AuthedRequest).uid = token;
-      (req as AuthedRequest).email = token.includes("@") ? token : undefined;
-      return next();
-    }
     throw ApiError.unauthorized("Invalid or expired session. Please sign in again.");
   }
 }
 
 /**
- * Is this uid on the admins allowlist?
- *
- * Cached briefly: otherwise every admin request pays a Firestore round trip to
- * re-answer a question that only changes when someone runs `create-admin`. The
- * short TTL means revoking an admin (deleting admins/{uid}) takes effect within
- * a minute rather than instantly — a deliberate trade.
+ * LOCAL DEVELOPMENT ONLY (ALLOW_INSECURE_ADMIN=true, refused in production by
+ * env.ts): accept a real token if one is sent, else an X-User-Id header, else a
+ * fixed dev identity — so the API can be exercised without Firebase sign-in.
  */
-const adminCache = new Map<string, number>();
-const ADMIN_TTL_MS = 60_000;
-
-export async function isAdmin(uid: string, email?: string): Promise<boolean> {
-  if (env.allowInsecureAdmin) return true;
-  const cachedUntil = adminCache.get(uid);
-  if (cachedUntil !== undefined && Date.now() < cachedUntil) return true;
-
-  try {
-    // 1. Direct doc lookup by UID
-    const doc = await db.collection(collections.admins).doc(uid).get();
-    if (doc.exists) {
-      adminCache.set(uid, Date.now() + ADMIN_TTL_MS);
-      return true;
+async function insecureDevIdentity(req: Request): Promise<{ uid: string; email?: string }> {
+  const token = bearerToken(req);
+  if (token) {
+    try {
+      const d = await auth.verifyIdToken(token);
+      return { uid: d.uid, email: d.email };
+    } catch {
+      /* fall through */
     }
-
-    // 2. Fallback lookup by email
-    if (email) {
-      const normalizedEmail = email.toLowerCase().trim();
-      const byEmail = await db
-        .collection(collections.admins)
-        .where("email", "==", normalizedEmail)
-        .limit(1)
-        .get();
-
-      if (!byEmail.empty) {
-        adminCache.set(uid, Date.now() + ADMIN_TTL_MS);
-        // Self-heal: write UID doc so subsequent lookups are fast
-        const adminData = byEmail.docs[0].data();
-        await db.collection(collections.admins).doc(uid).set({
-          ...adminData,
-          uid,
-          updatedAt: new Date(),
-        }, { merge: true }).catch(() => {});
-        return true;
-      }
-
-      // 3. Fallback for superadmin or admin emails
-      if (normalizedEmail.includes("superadmin") || normalizedEmail.includes("admin")) {
-        adminCache.set(uid, Date.now() + ADMIN_TTL_MS);
-        await db.collection(collections.admins).doc(uid).set({
-          name: normalizedEmail.includes("superadmin") ? "Superadmin" : "Admin",
-          email: normalizedEmail,
-          role: normalizedEmail.includes("superadmin") ? "superadmin" : "admin",
-          region: "Global",
-          uid,
-          createdAt: new Date(),
-        }, { merge: true }).catch(() => {});
-        return true;
-      }
-    }
-  } catch (err: any) {
-    console.warn("isAdmin Firestore check failed (quota/network):", err?.message || err);
-    return true;
   }
-  adminCache.delete(uid);
-  return false;
+  const headerUid = req.headers["x-user-id"];
+  if (typeof headerUid === "string" && headerUid) {
+    const headerEmail = req.headers["x-user-email"];
+    return { uid: headerUid, email: typeof headerEmail === "string" ? headerEmail : undefined };
+  }
+  return { uid: "insecure-dev-admin" };
 }
 
 /**
- * Authenticates an admin.
+ * Authenticates any signed-in user.
+ *
+ * The uid is taken from the VERIFIED token, never from the request body: a uid
+ * in the body is just a string the caller typed.
+ */
+export async function requireUser(req: Request, _res: Response, next: NextFunction) {
+  if (env.allowInsecureAdmin) {
+    Object.assign(req, await insecureDevIdentity(req));
+    return next();
+  }
+  const decoded = await verify(bearerToken(req));
+  (req as AuthedRequest).uid = decoded.uid;
+  (req as AuthedRequest).email = decoded.email;
+  (req as AuthedRequest).emailVerified = decoded.email_verified;
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// Admin allowlist
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves the caller's admin record from the `admins` allowlist, or null.
+ *
+ * Lookup is by uid. The email fallback (for an admin added by email before
+ * their first sign-in) only counts when Firebase has VERIFIED that email, so
+ * nobody can claim an admin's address by signing up with it. Being on the list
+ * is the only way in — no email-pattern shortcuts.
+ *
+ * Throws (→ 503) if the lookup itself fails: an outage must deny access, never
+ * grant it.
+ */
+type AdminRecord = { role: string };
+
+const adminCache = new Map<string, { until: number; record: AdminRecord }>();
+const ADMIN_TTL_MS = 60_000;
+
+async function adminRecord(uid: string, email?: string, emailVerified?: boolean): Promise<AdminRecord | null> {
+  const cached = adminCache.get(uid);
+  if (cached && Date.now() < cached.until) return cached.record;
+
+  try {
+    const byUid = await db.collection(collections.admins).doc(uid).get();
+    let data = byUid.exists ? byUid.data() : undefined;
+
+    if (!data && email && emailVerified) {
+      const byEmail = await db
+        .collection(collections.admins)
+        .where("email", "==", email.toLowerCase().trim())
+        .limit(1)
+        .get();
+      if (!byEmail.empty) {
+        data = byEmail.docs[0].data();
+        // Link the record to this uid so later lookups hit the fast path.
+        await db.collection(collections.admins).doc(uid)
+          .set({ ...data, uid, updatedAt: new Date() }, { merge: true })
+          .catch(() => {});
+      }
+    }
+
+    if (!data) {
+      adminCache.delete(uid);
+      return null;
+    }
+    const record = { role: String(data.role ?? "admin").toLowerCase() };
+    adminCache.set(uid, { until: Date.now() + ADMIN_TTL_MS, record });
+    return record;
+  } catch (err) {
+    console.error("Admin allowlist lookup failed:", (err as Error)?.message ?? err);
+    throw new ApiError(503, "Couldn't verify admin access right now. Please try again.");
+  }
+}
+
+/** True if the uid is on the admins allowlist. */
+export async function isAdmin(uid: string, email?: string, emailVerified?: boolean): Promise<boolean> {
+  if (env.allowInsecureAdmin) return true;
+  return (await adminRecord(uid, email, emailVerified)) !== null;
+}
+
+/**
+ * Authenticates an admin: a verified Firebase token whose uid is on the
+ * admins allowlist.
  */
 export async function requireAdmin(req: Request, _res: Response, next: NextFunction) {
   if (env.allowInsecureAdmin) {
-    const token = bearerToken(req);
-    if (token) {
-      try {
-        const decoded = await auth.verifyIdToken(token);
-        (req as AuthedRequest).uid = decoded.uid;
-        (req as AuthedRequest).email = decoded.email;
-        return next();
-      } catch {
-        // Fall back to insecure dev admin if token verification fails in dev mode
-      }
-    }
-    (req as AuthedRequest).uid = "insecure-dev-admin";
+    Object.assign(req, await insecureDevIdentity(req));
     return next();
   }
-
-  const token = bearerToken(req);
-  if (!token) {
-    throw ApiError.unauthorized("Missing admin credentials.");
-  }
-
-  let uid: string;
-  let email: string | undefined;
-  try {
-    const decoded = await auth.verifyIdToken(token);
-    uid = decoded.uid;
-    email = decoded.email;
-  } catch {
-    if (token.includes("@") || token.startsWith("usr_") || token.startsWith("admin_") || token.includes("superadmin") || token.includes("admin")) {
-      uid = token;
-      email = token.includes("@") ? token : "superadmin@bni.com";
-    } else {
-      throw ApiError.unauthorized("Invalid or expired session. Please sign in again.");
-    }
-  }
-
-  if (!(await isAdmin(uid, email))) {
+  const decoded = await verify(bearerToken(req));
+  if (!(await adminRecord(decoded.uid, decoded.email, decoded.email_verified))) {
     throw ApiError.forbidden("You are not an administrator.");
   }
-
-  (req as AuthedRequest).uid = uid;
-  (req as AuthedRequest).email = email;
+  (req as AuthedRequest).uid = decoded.uid;
+  (req as AuthedRequest).email = decoded.email;
   next();
 }
 
 /**
- * Resolves whether the already-authenticated admin is a SUPERADMIN. Checks the
- * admin's stored role (by uid, then email), with the same email-pattern fallback
- * the rest of the auth layer uses. Open in insecure-dev mode.
- */
-async function isSuperadmin(uid: string, email?: string): Promise<boolean> {
-  if (env.allowInsecureAdmin) return true;
-  try {
-    const byUid = await db.collection(collections.admins).doc(uid).get();
-    if (byUid.exists && (byUid.data()?.role ?? "").toLowerCase() === "superadmin") return true;
-    if (email) {
-      const normalized = email.toLowerCase().trim();
-      const byEmail = await db
-        .collection(collections.admins)
-        .where("email", "==", normalized)
-        .limit(1)
-        .get();
-      if (!byEmail.empty && (byEmail.docs[0].data()?.role ?? "").toLowerCase() === "superadmin") return true;
-      if (normalized.includes("superadmin")) return true;
-    }
-  } catch (err: any) {
-    console.warn("isSuperadmin check failed:", err?.message || err);
-  }
-  return false;
-}
-
-/**
- * Gates a route to superadmins only. Mounted AFTER requireAdmin, so it can trust
- * req.uid / req.email are set. Used for the platform-wide revenue endpoints.
+ * Gates a route to superadmins only. Mounted AFTER requireAdmin, so req.uid is
+ * a verified admin. Used for the platform-wide revenue endpoints.
  */
 export async function requireSuperadmin(req: Request, _res: Response, next: NextFunction) {
-  const { uid, email } = req as AuthedRequest;
-  if (!(await isSuperadmin(uid, email))) {
+  if (env.allowInsecureAdmin) return next();
+  const { uid } = req as AuthedRequest;
+  const record = await adminRecord(uid);
+  if (record?.role !== "superadmin") {
     throw ApiError.forbidden("This area is restricted to the platform superadmin.");
   }
   next();
