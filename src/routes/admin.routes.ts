@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAdmin, requireRole, requireSuperadmin } from "../middleware/auth.js";
 import { queryAudit } from "../audit/audit.query.js";
+import { requireConclaveAccess } from "../middleware/conclaveAccess.js";
 import { asyncHandler } from "../middleware/errors.js";
 import * as c from "../controllers/admin.controller.js";
 
@@ -29,7 +30,8 @@ router.put("/categories", asyncHandler(c.setCategories)); // replace whole list
 router.post("/categories", asyncHandler(c.addCategory)); // { name }
 router.post("/categories/remove", asyncHandler(c.removeCategory)); // { name }
 
-// Conclaves
+// Conclaves. Every /conclaves/:id/... route is region-checked here, once.
+router.use("/conclaves/:id", asyncHandler(requireConclaveAccess));
 router.get("/conclaves", asyncHandler(c.list));
 router.get("/conclaves/:id", asyncHandler(c.getOne));
 router.post("/conclaves", asyncHandler(c.create));

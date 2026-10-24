@@ -1,4 +1,5 @@
 import fs from "fs";
+import { assertRegion, regionScope } from "../middleware/conclaveAccess.js";
 import * as adminsService from "../services/admins.service.js";
 import * as usersService from "../services/user.service.js";
 import * as regionsService from "../services/regions.service.js";
@@ -18,7 +19,6 @@ import * as categories from "../services/categories.service.js";
 import * as settings from "../services/settings.service.js";
 import * as feedback from "../services/feedback.service.js";
 import * as payments from "../services/payments.service.js";
-import { ApiError } from "../middleware/errors.js";
 
 // --- Payments / revenue ------------------------------------------------------
 
@@ -82,117 +82,38 @@ export async function removeCategory(req: AuthedRequest, res: Response) {
   res.json({ categories: await categories.removeCategory(req.body?.name) });
 }
 
-/** Fetch the admin doc for the caller — used to scope by region. */
-async function getAdminDoc(uid: string, email?: string) {
-  try {
-    const doc = await db.collection(collections.admins).doc(uid).get();
-    if (doc.exists) return doc.data() as Record<string, string>;
 
-    if (email) {
-      const normalizedEmail = email.toLowerCase().trim();
-      const byEmail = await db
-        .collection(collections.admins)
-        .where("email", "==", normalizedEmail)
-        .limit(1)
-        .get();
-      if (!byEmail.empty) return byEmail.docs[0].data() as Record<string, string>;
-
-      if (normalizedEmail.includes("superadmin") || normalizedEmail.includes("admin")) {
-        return {
-          name: normalizedEmail.includes("superadmin") ? "Superadmin" : "Admin",
-          email: normalizedEmail,
-          role: normalizedEmail.includes("superadmin") ? "superadmin" : "admin",
-          region: "Global",
-          uid,
-        };
-      }
-    }
-    return null;
-  } catch (err: any) {
-    console.warn("Failed to fetch admin doc for uid:", uid, err?.message || err);
-    return null;
-  }
-}
 
 export async function list(req: AuthedRequest, res: Response) {
-  try {
-    const admin = await getAdminDoc(req.uid, req.email);
-    const requestGlobal = req.query.global === 'true';
-    // Superadmin (role=superadmin OR region=Global) OR ?global=true sees every conclave.
-    // Any other coordinator sees only their own region.
-    const region =
-      !admin || admin.role === "superadmin" || admin.region === "Global" || requestGlobal
-        ? undefined   // no filter → all
-        : admin.region;
-    const items = await conclaves.listConclaves(region);
-    res.json(items);
-  } catch (err: any) {
-    console.error("Failed to list conclaves:", err?.message || err);
-    res.json([]);
-  }
+  // Superadmins and Global-region admins see every conclave; everyone else only
+  // their region. (?global=true no longer widens a regional admin's view.)
+  const scope = regionScope(req.admin);
+  if (scope === "__none__") return res.json([]);
+  res.json(await conclaves.listConclaves(scope ?? undefined));
 }
 
 export async function getOne(req: AuthedRequest, res: Response) {
-  const { data, doc } = await conclaves.getConclaveOrThrow(req.params.id);
-  const d = data as any;
-  res.json({
-    id: doc.id,
-    ...d,
-    date: toDate(d.date)?.toISOString() ?? null,
-    startDate: toDate(d.startDate || d.date)?.toISOString() ?? null,
-    endDate: toDate(d.endDate)?.toISOString() ?? null,
-    regStartDate: toDate(d.regStartDate)?.toISOString() ?? null,
-    regEndDate: toDate(d.regEndDate)?.toISOString() ?? null,
-    startTime: conclaves.normalizeTime(d.startTime),
-    endTime: conclaves.normalizeTime(d.endTime),
-    currentRoundStartedAt: toDate(d.currentRoundStartedAt)?.toISOString() ?? null,
-    roundPausedAt: toDate(d.roundPausedAt)?.toISOString() ?? null,
-  });
+  const { data } = await conclaves.getConclaveOrThrow(req.params.id);
+  res.json(data);
 }
 
-
 export async function create(req: AuthedRequest, res: Response) {
-  const admin = await getAdminDoc(req.uid, req.email);
-  const isSuperadmin = admin?.role === "superadmin" || admin?.region === "Global" || (req.email || "").toLowerCase().includes("superadmin");
-  const body = req.body ?? {};
-
-  if (!isSuperadmin) {
-    const adminRegion = admin?.region || admin?.scope;
-    if (!adminRegion) {
-      throw ApiError.forbidden("You must be assigned to an official region to create a conclave.");
-    }
-    if (body.region && body.region.trim().toLowerCase() !== adminRegion.trim().toLowerCase()) {
-      throw ApiError.forbidden(`You are only authorized to create conclaves within your assigned region: "${adminRegion}".`);
-    }
-    body.region = adminRegion;
+  const body = { ...(req.body ?? {}) };
+  const scope = regionScope(req.admin);
+  if (scope !== null) {
+    // Regional admins create only in their own region.
+    assertRegion(req.admin, body.region ?? scope);
+    body.region = scope;
   }
-
   const conclaveId = await conclaves.createConclave(body);
-  res.status(201).json({
-    message: "Conclave created. Registration is closed until you open it.",
-    conclaveId,
-  });
+  res.status(201).json({ message: "Conclave created. Registration is closed until you open it.", conclaveId });
 }
 
 export async function update(req: AuthedRequest, res: Response) {
-  const admin = await getAdminDoc(req.uid, req.email);
-  const isSuperadmin = admin?.role === "superadmin" || admin?.region === "Global" || (req.email || "").toLowerCase().includes("superadmin");
-  const body = req.body ?? {};
-
-  if (!isSuperadmin) {
-    const { data: existingConclave } = await conclaves.getConclaveOrThrow(req.params.id);
-    const adminRegion = admin?.region || admin?.scope;
-    if (adminRegion && existingConclave.region && existingConclave.region.trim().toLowerCase() !== adminRegion.trim().toLowerCase()) {
-      throw ApiError.forbidden(`You are only authorized to manage conclaves in your assigned region: "${adminRegion}".`);
-    }
-    if (body.region && adminRegion && body.region.trim().toLowerCase() !== adminRegion.trim().toLowerCase()) {
-      throw ApiError.forbidden(`You cannot change the conclave's region away from your assigned region: "${adminRegion}".`);
-    }
-    if (adminRegion) {
-      body.region = adminRegion;
-    }
-  }
-
+  const body = { ...(req.body ?? {}) };
+  // The route guard already checked the conclave is in the caller's region;
+  // a regional admin also can't move it out.
+  if (regionScope(req.admin) !== null && body.region !== undefined) assertRegion(req.admin, body.region);
   const updated = await conclaves.updateConclave(req.params.id, body);
   res.json({ message: "Conclave updated.", updated });
 }

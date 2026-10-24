@@ -1,3 +1,5 @@
+import { DEFAULT_LIMITS } from "../engine/types.js";
+
 /**
  * The conclave lifecycle, and the rules that hang off it.
  */
@@ -33,8 +35,11 @@ export const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
   ConclaveStatus.cancelled,
 ]);
 
-/** The engine's limits. A conclave outside these cannot be scheduled. */
-export const ROUND_LIMITS = { min: 1, max: 20 } as const;
+/**
+ * The engine's limits — taken FROM the engine, so a conclave that can't be
+ * scheduled is rejected when it's created, not when the admin hits Generate.
+ */
+export const ROUND_LIMITS = { min: DEFAULT_LIMITS.minRounds, max: DEFAULT_LIMITS.maxRounds } as const;
 export const MIN_PERSONS_PER_TABLE = 2;
 
 /**
