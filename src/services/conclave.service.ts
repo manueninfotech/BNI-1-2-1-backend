@@ -10,6 +10,7 @@ import {
   TERMINAL_STATUSES,
 } from "../domain/conclave.js";
 import { notifyConclave, notifyUser } from "./notification.service.js";
+import { notifyConclaveChanged } from "./live.service.js";
 import { decodeDataUrl, deleteFile, uploadFile, type StoredFile } from "./storage.service.js";
 import { resolveNotification, getConclaveDefaults, getRoundTiming, type RoundTiming } from "./settings.service.js";
 
@@ -126,6 +127,7 @@ async function mutate(
       { action, entityType: "conclave", entityId: id, conclaveId: id, before: auditable(before), after: auditable(after), metadata },
       tx,
     );
+    await notifyConclaveChanged(tx, id); // delivered to live listeners on commit
     return { before, after };
   });
 }
@@ -822,4 +824,12 @@ export async function setAgenda(
   const previous = (row.agendaDocument as { storagePath?: string } | null)?.storagePath;
   if (previous && previous !== record?.storagePath) await deleteFile(previous);
   return record;
+}
+
+/** One conclave for a member: full detail (schedule included), contacts stripped. */
+export async function getForMember(id: string, uid: string, email?: string) {
+  const all = await listForMember(uid, email);
+  const found = all.find((c) => c.id === id);
+  if (!found) throw ApiError.notFound("Conclave not found.");
+  return found;
 }

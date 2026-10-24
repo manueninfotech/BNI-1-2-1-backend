@@ -6,6 +6,7 @@ import { ConclaveStatus } from "../domain/conclave.js";
 import { runAsSystem } from "../observability/context.js";
 import { roundDurationMs } from "./conclave.service.js";
 import { getRoundTiming } from "./settings.service.js";
+import { notifyConclaveChanged } from "./live.service.js";
 
 /**
  * Auto-completion sweep.
@@ -80,6 +81,7 @@ export async function sweepFinishedConclaves(): Promise<number> {
         },
         tx,
       );
+      await notifyConclaveChanged(tx, row.id);
       completed++;
     }
     return completed;

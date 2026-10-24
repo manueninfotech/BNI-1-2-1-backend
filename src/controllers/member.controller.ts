@@ -2,7 +2,10 @@ import type { Response } from "express";
 import type { AuthedRequest } from "../middleware/auth.js";
 import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
-import { listForMember } from "../services/conclave.service.js";
+import { getForMember, listForMember } from "../services/conclave.service.js";
+import { subscribe } from "../services/live.service.js";
+import { listCategories } from "../services/categories.service.js";
+import { getAutoLogoutHours, getRoundTiming } from "../services/settings.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
 import * as feedback from "../services/feedback.service.js";
 import { ApiError } from "../middleware/errors.js";
@@ -154,3 +157,39 @@ export async function resolveIdentifier(req: AuthedRequest, res: Response) {
   res.json({ authEmail: await users.resolveSignInAddress(req.body?.identifier) });
 }
 
+
+// ---- App data (replaces the app's direct Firestore reads) -----------------
+
+/** Everything the app used to live-read from Firestore `settings/*`. */
+export async function appConfig(_req: AuthedRequest, res: Response) {
+  const [categories, roundTiming, autoLogoutHours] = await Promise.all([
+    listCategories(),
+    getRoundTiming(),
+    getAutoLogoutHours(),
+  ]);
+  res.json({ categories, roundTiming, autoLogoutHours });
+}
+
+export async function getConclave(req: AuthedRequest, res: Response) {
+  res.json(await getForMember(req.params.id, req.uid, req.emailVerified ? req.email : undefined));
+}
+
+/** Server-Sent Events: the conclave's live round state, pushed on every change. */
+export async function conclaveLive(req: AuthedRequest, res: Response) {
+  await subscribe(req.params.id, res as any);
+}
+
+export async function myProfile(req: AuthedRequest, res: Response) {
+  const profile = await users.getOwnProfile(req.uid);
+  if (!profile) throw ApiError.notFound("No profile yet.");
+  res.json(profile);
+}
+
+export async function setMyPhoto(req: AuthedRequest, res: Response) {
+  res.json(await users.setPhoto(req.uid, req.body?.dataUrl));
+}
+
+export async function removeMyPhoto(req: AuthedRequest, res: Response) {
+  await users.removePhoto(req.uid);
+  res.json({ ok: true });
+}

@@ -188,6 +188,11 @@ export interface UpdateMeInput {
   region?: unknown;
   designation?: unknown;
   organization?: unknown;
+  membership?: unknown;
+  lookingFor?: unknown;
+  canOffer?: unknown;
+  state?: unknown;
+  country?: unknown;
 }
 
 const str = (v: unknown, max = 200) => String(v ?? "").trim().slice(0, max);
@@ -240,6 +245,11 @@ export async function updateMe(uid: string, input: UpdateMeInput) {
     patch.location = patch.region ? patch.region.toLowerCase() : null;
   }
   if (input.designation !== undefined) patch.designation = str(input.designation);
+  if (input.membership !== undefined) patch.membership = str(input.membership);
+  if (input.lookingFor !== undefined) patch.lookingFor = str(input.lookingFor, 1000);
+  if (input.canOffer !== undefined) patch.canOffer = str(input.canOffer, 1000);
+  if (input.state !== undefined) patch.state = str(input.state) || null;
+  if (input.country !== undefined) patch.country = str(input.country) || null;
 
   return pgdb.transaction(async (tx) => {
     const [before] = await tx.select().from(users).where(eq(users.uid, uid)).for("update");
@@ -447,4 +457,76 @@ export async function listRegistrants(conclaveId: string): Promise<Registrant[]>
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ---------------------------------------------------------------------------
+// Own profile (the app's Profile screen) and profile photo
+// ---------------------------------------------------------------------------
+
+/** The caller's full profile — including their own contact details. */
+export async function getOwnProfile(uid: string) {
+  const u = await getUser(uid);
+  if (!u) return null;
+  return {
+    uid: u.uid,
+    name: u.name,
+    email: u.email ?? "",
+    phone: u.phone ?? "",
+    mobile: u.phone?.slice(-10) ?? "",
+    company: u.company ?? "",
+    businessName: u.company ?? "",
+    category: u.category ?? "",
+    businessCategory: u.category ?? "",
+    chapter: u.chapter ?? "",
+    region: u.region ?? "",
+    state: u.state ?? "",
+    country: u.country ?? "",
+    location: u.location ?? "",
+    designation: u.designation ?? "",
+    membership: u.membership ?? "",
+    lookingFor: u.lookingFor ?? "",
+    canOffer: u.canOffer ?? "",
+    photoUrl: u.photoUrl ?? null,
+    createdAt: u.createdAt.toISOString(),
+    updatedAt: u.updatedAt.toISOString(),
+  };
+}
+
+const PHOTO_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const PHOTO_MAX = 5 * 1024 * 1024;
+
+/** Replace the caller's profile photo (stored in Blob Storage), audited. */
+export async function setPhoto(uid: string, dataUrl: unknown) {
+  const { decodeDataUrl, uploadFile, deleteFile } = await import("./storage.service.js");
+  const { contentType, data } = decodeDataUrl(String(dataUrl ?? ""));
+  if (!PHOTO_TYPES.has(contentType)) throw ApiError.badRequest("Profile photos must be JPEG, PNG or WebP.");
+  if (data.length > PHOTO_MAX) throw ApiError.badRequest("Profile photos must be 5 MB or smaller.");
+  const stored = await uploadFile("avatars", `profile.${contentType.split("/")[1]}`, contentType, data);
+
+  const previous = await pgdb.transaction(async (tx) => {
+    const [before] = await tx.select().from(users).where(eq(users.uid, uid)).for("update");
+    if (!before) throw ApiError.notFound("Create your profile first.");
+    const [after] = await tx
+      .update(users)
+      .set({ photoUrl: stored.url, legacy: { ...before.legacy, photoPath: stored.path }, updatedAt: new Date() })
+      .where(eq(users.uid, uid))
+      .returning();
+    await audit.change({ action: "user.photo_set", entityType: "user", entityId: uid, before: { photoUrl: before.photoUrl }, after: { photoUrl: after.photoUrl } }, tx);
+    return before.legacy?.photoPath as string | undefined;
+  });
+  if (previous) await deleteFile(previous);
+  return { photoUrl: stored.url };
+}
+
+export async function removePhoto(uid: string) {
+  const { deleteFile } = await import("./storage.service.js");
+  const previous = await pgdb.transaction(async (tx) => {
+    const [before] = await tx.select().from(users).where(eq(users.uid, uid)).for("update");
+    if (!before) throw ApiError.notFound("No profile.");
+    const { photoPath, ...rest } = before.legacy ?? {};
+    await tx.update(users).set({ photoUrl: null, legacy: rest, updatedAt: new Date() }).where(eq(users.uid, uid));
+    await audit.change({ action: "user.photo_remove", entityType: "user", entityId: uid, before: { photoUrl: before.photoUrl }, after: { photoUrl: null } }, tx);
+    return photoPath as string | undefined;
+  });
+  if (previous) await deleteFile(previous);
 }

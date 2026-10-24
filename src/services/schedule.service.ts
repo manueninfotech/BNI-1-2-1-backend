@@ -9,6 +9,7 @@ import { ROLE_LOCKED_STATUSES } from "../domain/conclave.js";
 import { validateConfig, evaluateConclaveStatus, toView } from "./conclave.service.js";
 import { fetchUsers, isActiveUser } from "./user.service.js";
 import { getAutoLogoutHours } from "./settings.service.js";
+import { notifyConclaveChanged } from "./live.service.js";
 
 export interface GenerateOptions {
   /** Seat only ACTIVE users — the people actually in the room. */
@@ -196,6 +197,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
       tx,
     );
 
+    await notifyConclaveChanged(tx, conclaveId);
     return {
       tableCount: schedule.tableCount,
       captains: captainIds.length,
