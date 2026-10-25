@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { desc, eq } from "drizzle-orm";
 import { pgdb } from "../db/client.js";
-import { conclaves, payments, registrations } from "../db/schema.js";
+import { conclaves, payments, registrations, users } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
 import { env } from "../config/env.js";
 import { fetchOrderNotes } from "./razorpay.service.js";
@@ -188,17 +188,23 @@ export async function listTransactions(limit = 50): Promise<any> {
  * people who never registered — the organiser chasing unpaid members.
  */
 export async function getConclavePayments(conclaveId: string): Promise<any> {
-  const [regs, ledger] = await Promise.all([
-    pgdb.select().from(registrations).where(eq(registrations.conclaveId, conclaveId)),
+  const [rows, ledger] = await Promise.all([
+    pgdb
+      .select({ r: registrations, u: { name: users.name, email: users.email, phone: users.phone } })
+      .from(registrations)
+      .leftJoin(users, eq(users.uid, registrations.userId))
+      .where(eq(registrations.conclaveId, conclaveId)),
     pgdb.select().from(payments).where(eq(payments.conclaveId, conclaveId)),
   ]);
-  const members = regs.map((r) => {
+  const members = rows.map(({ r, u }) => {
     const pay = (r.payment ?? {}) as Record<string, any>;
+    // The registration keeps a snapshot only when the member filled one in;
+    // otherwise the profile is the source of the name and contact.
     return {
       uid: r.userId,
-      name: r.name,
-      email: r.email,
-      phone: r.phone,
+      name: r.name || u?.name || null,
+      email: r.email || u?.email || null,
+      phone: r.phone || u?.phone || null,
       registrationStatus: r.status ?? "pending",
       paymentStatus: r.paymentStatus ?? pay.status ?? (r.status === "confirmed" ? "paid" : "pending"),
       paymentMethod: pay.method ?? null,

@@ -27,6 +27,7 @@ router.patch("/me/one-to-ones/:id", asyncHandler(c.updateOneToOne));
 router.get("/me/notifications", asyncHandler(c.listNotifications));
 router.post("/me/notifications/read", asyncHandler(c.markNotificationsRead));
 router.get("/app-config", asyncHandler(c.appConfig));
+router.get("/categories", asyncHandler(c.listCategories)); // sign-up / profile pickers
 router.get("/me/profile", asyncHandler(c.myProfile));
 router.put("/me/photo", asyncHandler(c.setMyPhoto));
 router.delete("/me/photo", asyncHandler(c.removeMyPhoto));
