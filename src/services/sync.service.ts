@@ -58,30 +58,27 @@ const CLOCK_SLACK_MS = 2 * 60_000;
 const REFERRAL_STATUSES = new Set(["Pending", "Accepted", "Completed", "Declined"]);
 
 /**
- * When round `n`'s referral window was open: after everyone at the table has
- * talked, until the referral time is up. Derived from the live anchor and the
- * admin-tuned round timing (the same numbers the app shows).
+ * When referrals could be given in round `n`: the round's ACTIVE phase, exactly
+ * as the app shows it — each person's turn (bio, then their referral time),
+ * table by table — and closed at the transition ("Talking time is over…").
+ * Same numbers as the app: admin-tuned bio/referral seconds × the conclave's
+ * persons-per-table. (An earlier rule opened referrals only after ALL bios,
+ * which disagreed with the app and silently dropped referrals given during
+ * earlier turns.)
  */
 export function referralWindow(
   row: Pick<ConclaveRow, "currentRound" | "currentRoundStartedAt" | "personsPerTable" | "legacy">,
   timing: RoundTiming,
   roundNumber: number,
-  tableSize: number,
 ): { opens: number; closes: number } | null {
   if (!row.currentRoundStartedAt || !row.currentRound) return null;
   const roundMs = roundDurationMs(row.personsPerTable, timing, row.legacy?.roundBlockMinutes);
-  const roundStart = row.currentRoundStartedAt.getTime() + (roundNumber - row.currentRound) * roundMs;
-  const p = Math.max(1, tableSize);
-  const opens = roundStart + timing.bioSeconds * 1000 * p;
-  const closes = opens + timing.referralSeconds * 1000 * p;
+  const opens = row.currentRoundStartedAt.getTime() + (roundNumber - row.currentRound) * roundMs;
+  const p = Math.max(1, row.personsPerTable ?? 1);
+  const closes = opens + (timing.bioSeconds + timing.referralSeconds) * 1000 * p;
   return { opens, closes };
 }
 
-function tableSizeOf(schedule: StoredSchedule | null, participants: StoredParticipant[], round: number, uid: string, fallback: number) {
-  const pid = participants.find((p) => p._originalUid === uid)?.id;
-  const t = schedule?.rounds?.find((r) => r.roundNumber === round)?.tables?.find((tb) => tb.captainId === pid || tb.memberIds?.includes(pid as number));
-  return t ? (t.memberIds?.length ?? 0) + 1 : fallback;
-}
 
 export async function syncConclave(conclaveId: string, callerUid: string, payload: SyncPayload) {
   const serverReceivedAt = Date.now();
@@ -213,15 +210,14 @@ export async function syncConclave(conclaveId: string, callerUid: string, payloa
           continue;
         }
         if (!insecure && round === liveRound && Number.isFinite(madeAt)) {
-          const size = tableSizeOf(schedule, participants, round, String(r.fromUserId), conclave.personsPerTable ?? 6);
-          const w = referralWindow(conclave, timing, round, size);
+          const w = referralWindow(conclave, timing, round);
           if (w && madeAt < w.opens - CLOCK_SLACK_MS) {
-            errors.push(`Rejected referral ${id}: it was made during talking time in round ${round}. Referrals open in the referral window.`);
+            errors.push(`Rejected referral ${id}: it was made before round ${round} started.`);
             acceptedReferrals.push(id);
             continue;
           }
           if (w && madeAt > w.closes + CLOCK_SLACK_MS) {
-            errors.push(`Rejected referral ${id}: it was made after round ${round}'s referral window closed.`);
+            errors.push(`Rejected referral ${id}: it was made after round ${round}'s talking time ended.`);
             acceptedReferrals.push(id);
             continue;
           }

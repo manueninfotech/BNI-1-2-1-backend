@@ -104,10 +104,14 @@ describe("referrals", () => {
     expect(await pgdb.select().from(referrals)).toHaveLength(0);
   });
 
-  it("current round: judged by when it was made; past rounds synced late are kept; future refused", async () => {
-    // 10s into the round is talking time at any table size.
+  it("current round: whole active phase allowed, after it refused; late past-round syncs kept; future refused", async () => {
+    // Early in the round (someone's bio turn) is allowed — the app shows the
+    // Refer button for the whole active phase.
     const early = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r4", mate, cap, new Date(roundStart + 10_000))] }));
-    expect(early.errors.join(" ")).toMatch(/talking time/);
+    expect(early.errors).toEqual([]);
+    // After the round's talking time (4 people × 90s = 6 min, +2 min slack) it's refused.
+    const after = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r4b", mate, cap, new Date(roundStart + 9 * 60_000))] }));
+    expect(after.errors.join(" ")).toMatch(/talking time ended/);
 
     // The conclave moves on to round 3; a round-1 referral arrives late → kept.
     await pgdb.update(conclaves).set({ currentRound: 3, currentRoundStartedAt: new Date() }).where(eq(conclaves.id, conclaveId));
