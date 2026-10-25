@@ -5,6 +5,7 @@ import { conclaves, payments, registrations, users } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
 import { env } from "../config/env.js";
 import { fetchOrderNotes } from "./razorpay.service.js";
+import { registrationFeeOf } from "./registration.service.js";
 
 /**
  * Payment ledger, fed by the Razorpay webhook.
@@ -188,14 +189,17 @@ export async function listTransactions(limit = 50): Promise<any> {
  * people who never registered — the organiser chasing unpaid members.
  */
 export async function getConclavePayments(conclaveId: string): Promise<any> {
-  const [rows, ledger] = await Promise.all([
+  const [rows, ledger, [conclave]] = await Promise.all([
     pgdb
       .select({ r: registrations, u: { name: users.name, email: users.email, phone: users.phone } })
       .from(registrations)
       .leftJoin(users, eq(users.uid, registrations.userId))
       .where(eq(registrations.conclaveId, conclaveId)),
     pgdb.select().from(payments).where(eq(payments.conclaveId, conclaveId)),
+    pgdb.select().from(conclaves).where(eq(conclaves.id, conclaveId)),
   ]);
+  // A free conclave has nothing to pay: its registrations are "free", not "pending".
+  const registrationFee = registrationFeeOf(conclave);
   const members = rows.map(({ r, u }) => {
     const pay = (r.payment ?? {}) as Record<string, any>;
     // The registration keeps a snapshot only when the member filled one in;
@@ -206,7 +210,7 @@ export async function getConclavePayments(conclaveId: string): Promise<any> {
       email: r.email || u?.email || null,
       phone: r.phone || u?.phone || null,
       registrationStatus: r.status ?? "pending",
-      paymentStatus: r.paymentStatus ?? pay.status ?? (r.status === "confirmed" ? "paid" : "pending"),
+      paymentStatus: r.paymentStatus ?? pay.status ?? (registrationFee === 0 ? "free" : r.status === "confirmed" ? "paid" : "pending"),
       paymentMethod: pay.method ?? null,
       amount: pay.amount ?? r.amountPaid ?? null,
       paymentId: pay.paymentId ?? null,
@@ -231,8 +235,10 @@ export async function getConclavePayments(conclaveId: string): Promise<any> {
     }));
   return {
     conclaveId,
+    registrationFee,
     counts: {
       paid: members.filter((m) => m.paymentStatus === "paid").length,
+      free: members.filter((m) => m.paymentStatus === "free").length,
       pending: members.filter((m) => m.paymentStatus === "pending").length,
       failed: failedAttempts.length,
       total: members.length,

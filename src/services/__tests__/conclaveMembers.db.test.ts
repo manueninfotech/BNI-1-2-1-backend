@@ -142,6 +142,20 @@ describe("payments list", () => {
     const out = await pay.getConclavePayments(id);
     expect(out.members[0]).toMatchObject({ name: "Asha", email: "asha@x.com", phone: "+919000000001" });
   });
+
+  it("registrations for a free conclave show as free, not pending", async () => {
+    const free = await conclave();
+    const paid = await conclave({ registrationFee: 500 });
+    await pgdb.insert(registrations).values([
+      { conclaveId: free, userId: "m1", status: "pending" },
+      { conclaveId: paid, userId: "m1", status: "pending" },
+    ]);
+    const f = await pay.getConclavePayments(free);
+    expect(f.members[0].paymentStatus).toBe("free");
+    expect(f.counts).toMatchObject({ free: 1, pending: 0, total: 1 });
+    expect(f.registrationFee).toBe(0);
+    expect((await pay.getConclavePayments(paid)).members[0].paymentStatus).toBe("pending");
+  });
 });
 
 describe("member lists", () => {
