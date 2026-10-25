@@ -1,4 +1,7 @@
-import { db, collections } from "../config/firebase.js";
+import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { pgdb } from "../db/client.js";
+import { conclaves, registrations, users } from "../db/schema.js";
+import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import {
   ConclaveStatus,
@@ -6,41 +9,288 @@ import {
   MIN_PERSONS_PER_TABLE,
   TERMINAL_STATUSES,
 } from "../domain/conclave.js";
-import { toDate, toIso } from "../utils/firestore.js";
 import { notifyConclave, notifyUser } from "./notification.service.js";
-import { resolveNotification, getConclaveDefaults, getRoundTiming } from "./settings.service.js";
+import { notifyConclaveChanged } from "./live.service.js";
+import { decodeDataUrl, deleteFile, uploadFile, type StoredFile } from "./storage.service.js";
+import { resolveNotification, getConclaveDefaults, getRoundTiming, type RoundTiming } from "./settings.service.js";
 
-export const conclaveRef = (id: string) =>
-  db.collection(collections.conclaves).doc(id);
+/**
+ * Conclaves: lifecycle, registration window, and live rounds.
+ *
+ * Every state change runs in a transaction that locks the conclave row
+ * (SELECT … FOR UPDATE) and writes an audit "change" with the before → after
+ * diff, so two admins acting at once can't interleave, and nothing changes
+ * unrecorded. No in-process caches: they went stale across instances.
+ */
 
-const conclaveDocCache = new Map<string, { ref: any; data: any; doc: any }>();
-let conclavesListCache: any[] = [];
+export type ConclaveRow = typeof conclaves.$inferSelect;
+type ConclavePatch = Partial<typeof conclaves.$inferInsert>;
 
-export function clearConclaveCache() {
-  conclaveDocCache.clear();
-  conclavesListCache = [];
+
+// ---------------------------------------------------------------------------
+// API shape — identical field names to the Firestore era, so clients don't change
+// ---------------------------------------------------------------------------
+
+const iso = (d: Date | null | undefined) => (d ? d.toISOString() : null);
+
+export function toView(row: ConclaveRow, registrationCount?: number) {
+  return {
+    // Legacy-only fields first, so real columns always win.
+    ...(row.legacy ?? {}),
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    venueLocation: row.venueLocation,
+    region: row.region,
+    coordinator: row.coordinator,
+    creator: row.creator,
+    theme: row.theme,
+    dateRange: row.dateRange,
+    date: iso(row.startDate),
+    startDate: iso(row.startDate),
+    endDate: iso(row.endDate),
+    startTime: row.startTime,
+    endTime: row.endTime,
+    regStartDate: iso(row.regStartDate),
+    regEndDate: iso(row.regEndDate),
+    regStartTime: row.regStartTime,
+    regEndTime: row.regEndTime,
+    registrationOverride: row.registrationOverride,
+    isRegistrationOpen: row.isRegistrationOpen,
+    status: row.status,
+    memberLimit: row.memberLimit,
+    captainLimit: row.captainLimit,
+    registrationFee: row.registrationFee,
+    paymentDetails: row.paymentDetails,
+    chiefGuests: row.chiefGuests,
+    agendaDocument: row.agendaDocument,
+    allowAdminAddMembers: row.allowAdminAddMembers,
+    personsPerTable: row.personsPerTable,
+    roundCount: row.roundCount,
+    seed: row.seed,
+    schedule: row.schedule,
+    participants: row.participants,
+    scheduleSummary: row.scheduleSummary,
+    warnings: row.warnings,
+    snapshot: row.snapshot,
+    isScheduleLocked: row.isScheduleLocked,
+    currentRound: row.currentRound,
+    currentRoundStartedAt: iso(row.currentRoundStartedAt),
+    isRoundPaused: row.isRoundPaused,
+    roundPausedAt: iso(row.roundPausedAt),
+    roundElapsedMsBeforePause: row.roundElapsedMsBeforePause,
+    startedBy: row.startedBy,
+    completedAt: iso(row.completedAt),
+    cancelledAt: iso(row.cancelledAt),
+    createdAt: iso(row.createdAt),
+    updatedAt: iso(row.updatedAt),
+    ...(registrationCount !== undefined ? { registrationCount } : {}),
+  };
+}
+export type ConclaveView = ReturnType<typeof toView>;
+
+/** The conclave row and its API shape; 404 if it doesn't exist. */
+export async function getConclaveOrThrow(id: string) {
+  const [row] = await pgdb.select().from(conclaves).where(eq(conclaves.id, id));
+  if (!row) throw ApiError.notFound("Conclave not found.");
+  return { row, data: toView(row) };
 }
 
-export async function getConclaveOrThrow(id: string) {
-  const cached = conclaveDocCache.get(id);
-  if (cached) return cached;
+/** Audit view of a conclave: everything except the bulky engine output. */
+function auditable(row: ConclaveRow | null | undefined) {
+  if (!row) return null;
+  const { schedule, participants, snapshot, legacy, ...rest } = row;
+  void schedule; void participants; void snapshot; void legacy;
+  return rest;
+}
 
-  try {
-    const doc = await conclaveRef(id).get();
-    if (!doc.exists) {
-      throw ApiError.notFound("Conclave not found.");
-    }
-    const data = doc.data()!;
-    const res = { ref: conclaveRef(id), data, doc };
-    conclaveDocCache.set(id, res);
-    return res;
-  } catch (err: any) {
-    if (err instanceof ApiError) throw err;
-    throw ApiError.notFound("Conclave not found or database unavailable.");
+/**
+ * Locks the conclave row, lets `fn` decide the patch (or throw), applies it and
+ * audits it — all in one transaction.
+ */
+async function mutate(
+  id: string,
+  action: string,
+  fn: (row: ConclaveRow) => ConclavePatch | Promise<ConclavePatch>,
+  metadata?: Record<string, unknown>,
+): Promise<{ before: ConclaveRow; after: ConclaveRow }> {
+  return pgdb.transaction(async (tx) => {
+    const [before] = await tx.select().from(conclaves).where(eq(conclaves.id, id)).for("update");
+    if (!before) throw ApiError.notFound("Conclave not found.");
+    const patch = await fn(before);
+    const [after] = await tx
+      .update(conclaves)
+      .set({ ...patch, updatedAt: new Date() })
+      .where(eq(conclaves.id, id))
+      .returning();
+    await audit.change(
+      { action, entityType: "conclave", entityId: id, conclaveId: id, before: auditable(before), after: auditable(after), metadata },
+      tx,
+    );
+    await notifyConclaveChanged(tx, id); // delivered to live listeners on commit
+    return { before, after };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Validation and status rules (pure)
+// ---------------------------------------------------------------------------
+
+/** Validates the knobs the engine depends on. */
+export function validateConfig(personsPerTable: number, roundCount: number) {
+  if (!Number.isInteger(personsPerTable) || personsPerTable < MIN_PERSONS_PER_TABLE) {
+    throw ApiError.badRequest(`personsPerTable must be a whole number of at least ${MIN_PERSONS_PER_TABLE}.`);
+  }
+  if (!Number.isInteger(roundCount) || roundCount < ROUND_LIMITS.min || roundCount > ROUND_LIMITS.max) {
+    throw ApiError.badRequest(`roundCount must be between ${ROUND_LIMITS.min} and ${ROUND_LIMITS.max}.`);
   }
 }
 
-interface CreateInput {
+function toDate(v: unknown): Date | null {
+  if (v === null || v === undefined || v === "") return null;
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : v;
+  if (typeof v === "string" || typeof v === "number") {
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const maybe = v as { toDate?: () => Date };
+  return typeof maybe.toDate === "function" ? maybe.toDate() : null;
+}
+
+/** Parses "09:00", "09:00 AM", "17:30" into hours and minutes. */
+function parseTimeComponents(val: unknown): { hours: number; minutes: number } | null {
+  if (!val) return null;
+  if (typeof val === "string") {
+    const match = val.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+    if (match) {
+      let h = parseInt(match[1], 10);
+      const m = parseInt(match[2], 10);
+      const meridian = match[3]?.toUpperCase();
+      if (meridian === "PM" && h < 12) h += 12;
+      if (meridian === "AM" && h === 12) h = 0;
+      return { hours: h, minutes: m };
+    }
+  }
+  const d = toDate(val);
+  return d ? { hours: d.getHours(), minutes: d.getMinutes() } : null;
+}
+
+/** Date + "HH:mm", defaulting to start (00:00) or end (23:59:59.999) of day. */
+function combineDateTime(base: Date | null, time: unknown, edge: "start" | "end"): Date | null {
+  if (!base || Number.isNaN(base.getTime())) return null;
+  const comp = parseTimeComponents(time);
+  const d = new Date(base);
+  if (comp) d.setHours(comp.hours, comp.minutes, edge === "end" ? 59 : 0, edge === "end" ? 999 : 0);
+  else d.setHours(edge === "end" ? 23 : 0, edge === "end" ? 59 : 0, edge === "end" ? 59 : 0, edge === "end" ? 999 : 0);
+  return d;
+}
+
+interface DateFields {
+  date?: unknown; startDate?: unknown; endDate?: unknown; startTime?: unknown; endTime?: unknown;
+  regStartDate?: unknown; regEndDate?: unknown; regStartTime?: unknown; regEndTime?: unknown;
+}
+
+/**
+ * A nonsensical window (ends before it starts, registration open after the
+ * event begins, a new event in the past) can never be saved.
+ */
+export function validateConclaveDates(d: DateFields, opts: { isNew: boolean }) {
+  const now = new Date();
+  const eventStart = combineDateTime(toDate(d.date) ?? toDate(d.startDate), d.startTime, "start");
+  const eventEnd = combineDateTime(toDate(d.endDate) ?? toDate(d.date) ?? toDate(d.startDate), d.endTime, "end");
+  const regStart = combineDateTime(toDate(d.regStartDate), d.regStartTime, "start");
+  const regEnd = combineDateTime(toDate(d.regEndDate), d.regEndTime, "end");
+
+  if (eventStart && eventEnd && eventEnd < eventStart) {
+    throw ApiError.badRequest("The conclave can't end before it starts — check the event date and time.");
+  }
+  if (regStart && regEnd && regEnd <= regStart) {
+    throw ApiError.badRequest("Registration must open before it closes.");
+  }
+  if (regEnd && eventStart && regEnd > eventStart) {
+    throw ApiError.badRequest("Registration must close before the conclave starts — it can't stay open after the event has begun.");
+  }
+  if (opts.isNew && eventStart && eventStart < now) {
+    throw ApiError.badRequest("The conclave can't start in the past.");
+  }
+}
+
+/**
+ * Status from the clock and the admin's choices. "running" only once the start
+ * date & time have arrived (or rounds have run). Terminal statuses an admin set
+ * are final and never recomputed.
+ */
+export function evaluateConclaveStatus(data: any): { status: string; isRegistrationOpen: boolean } {
+  try {
+    const now = new Date();
+    if (data?.status && TERMINAL_STATUSES.has(data.status)) {
+      return { status: data.status, isRegistrationOpen: false };
+    }
+    const eventStart = toDate(data?.date) ?? toDate(data?.startDate);
+    const eventEnd = toDate(data?.endDate) ?? eventStart;
+    const startDateTime = combineDateTime(eventStart, data?.startTime, "start");
+    const endDateTime = combineDateTime(eventEnd, data?.endTime, "end");
+    const regStartDateTime = combineDateTime(toDate(data?.regStartDate), data?.regStartTime, "start");
+    const regEndDateTime = combineDateTime(toDate(data?.regEndDate), data?.regEndTime, "end");
+
+    if (endDateTime && now > endDateTime) return { status: ConclaveStatus.completed, isRegistrationOpen: false };
+    const hasLiveRounds = Number(data?.currentRound) > 0;
+    if (startDateTime && (now >= startDateTime || hasLiveRounds)) return { status: ConclaveStatus.running, isRegistrationOpen: false };
+
+    const override = String(data?.registrationOverride ?? "").toLowerCase();
+    if (override === "open") return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
+    if (override === "closed") return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+
+    if (regStartDateTime && now < regStartDateTime) return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
+    if (regEndDateTime && now > regEndDateTime) return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
+  } catch {
+    return { status: data?.status || ConclaveStatus.registrationOpen, isRegistrationOpen: data?.isRegistrationOpen ?? true };
+  }
+}
+
+export function normalizeTime(val: unknown): string | null {
+  if (!val) return null;
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    if (/^\d{1,2}:\d{2}/.test(trimmed)) return trimmed;
+  }
+  const d = toDate(val);
+  if (d) return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  return typeof val === "string" ? val.trim() : null;
+}
+
+/** Round length: admin-tuned talking cadence × table size, plus the transition. */
+export function roundDurationMs(personsPerTable: number | null | undefined, timing: RoundTiming, blockMinutes?: unknown): number {
+  const p = Math.max(1, Number(personsPerTable) || 1);
+  const active = (timing.bioSeconds + timing.referralSeconds) * 1000 * p;
+  const block = Number(blockMinutes);
+  if (Number.isFinite(block) && block > 0) return active + Math.max(0, block * 60 * 1000 - active);
+  return active + timing.bufferSeconds * 1000;
+}
+
+const ALL_STATUSES = new Set<string>(Object.values(ConclaveStatus));
+const OVERRIDES = new Set(["auto", "open", "closed"]);
+
+function dateInput(v: unknown, field: string): Date | null {
+  if (v === null || v === undefined || v === "") return null;
+  const d = toDate(v);
+  if (!d) throw ApiError.badRequest(`${field} is not a valid date.`);
+  return d;
+}
+function intInput(v: unknown, fallback: number, field: string): number {
+  if (v === undefined || v === null || v === "") return fallback;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) throw ApiError.badRequest(`${field} must be a whole number.`);
+  return n;
+}
+
+// ---------------------------------------------------------------------------
+// Create / update
+// ---------------------------------------------------------------------------
+
+export interface CreateInput {
   name?: string;
   venueLocation?: string;
   date?: string;
@@ -65,434 +315,200 @@ interface CreateInput {
   memberLimit?: number;
   captainLimit?: number;
   region?: string;
-  paymentDetails?: {
-    bankName?: string;
-    accountNumber?: string;
-    ifscCode?: string;
-    accountHolderName?: string;
-    upiId?: string;
-    upiQrImageUrl?: string;
-    registrationFee?: number;
-  };
+  paymentDetails?: Record<string, unknown>;
 }
 
-/**
- * Validates the knobs the engine depends on.
- */
-export function validateConfig(personsPerTable: number, roundCount: number) {
-  if (!Number.isInteger(personsPerTable) || personsPerTable < MIN_PERSONS_PER_TABLE) {
-    throw ApiError.badRequest(
-      `personsPerTable must be a whole number of at least ${MIN_PERSONS_PER_TABLE}.`,
-    );
-  }
-  if (
-    !Number.isInteger(roundCount) ||
-    roundCount < ROUND_LIMITS.min ||
-    roundCount > ROUND_LIMITS.max
-  ) {
-    throw ApiError.badRequest(
-      `roundCount must be between ${ROUND_LIMITS.min} and ${ROUND_LIMITS.max}.`,
-    );
-  }
-}
-
-/**
-/**
- * Parses time string (e.g. "09:00", "09:00 AM", "17:30") into hours and minutes.
- */
-function parseTimeComponents(val: unknown): { hours: number; minutes: number } | null {
-  if (!val) return null;
-  if (typeof val === 'string') {
-    const match = val.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
-    if (match) {
-      let h = parseInt(match[1], 10);
-      const m = parseInt(match[2], 10);
-      const meridian = match[3]?.toUpperCase();
-      if (meridian === 'PM' && h < 12) h += 12;
-      if (meridian === 'AM' && h === 12) h = 0;
-      return { hours: h, minutes: m };
-    }
-  }
-  const d = toDate(val);
-  if (d && !isNaN(d.getTime())) {
-    return { hours: d.getHours(), minutes: d.getMinutes() };
-  }
-  return null;
-}
-
-/**
- * Combines a date with an "HH:mm" time, defaulting to the start (00:00:00.000)
- * or end (23:59:59.999) of the day when no time is given. null for a missing or
- * invalid date.
- */
-function combineDateTime(base: Date | null, time: unknown, edge: "start" | "end"): Date | null {
-  if (!base || isNaN(base.getTime())) return null;
-  const comp = parseTimeComponents(time);
-  const d = new Date(base);
-  if (comp) d.setHours(comp.hours, comp.minutes, edge === "end" ? 59 : 0, edge === "end" ? 999 : 0);
-  else d.setHours(edge === "end" ? 23 : 0, edge === "end" ? 59 : 0, edge === "end" ? 59 : 0, edge === "end" ? 999 : 0);
-  return d;
-}
-
-/**
- * Enforces the conclave's timing rules at create and edit — the whole point is
- * that a nonsensical window (an event that ends before it starts, or
- * registration that stays open after the conclave has begun) can never be saved.
- * Throws ApiError.badRequest with a human message on the first violation. Each
- * field is only checked when present, so a partial edit that doesn't touch dates
- * passes untouched.
- */
-export function validateConclaveDates(
-  d: {
-    date?: unknown; startDate?: unknown; endDate?: unknown; startTime?: unknown; endTime?: unknown;
-    regStartDate?: unknown; regEndDate?: unknown; regStartTime?: unknown; regEndTime?: unknown;
-  },
-  opts: { isNew: boolean },
-) {
-  const now = new Date();
-  const eventStart = combineDateTime(
-    d.date ? toDate(d.date) : (d.startDate ? toDate(d.startDate) : null), d.startTime, "start",
-  );
-  const eventEnd = combineDateTime(
-    d.endDate ? toDate(d.endDate) : (d.date ? toDate(d.date) : null), d.endTime, "end",
-  );
-  const regStart = combineDateTime(d.regStartDate ? toDate(d.regStartDate) : null, d.regStartTime, "start");
-  const regEnd = combineDateTime(d.regEndDate ? toDate(d.regEndDate) : null, d.regEndTime, "end");
-
-  if (eventStart && eventEnd && eventEnd < eventStart) {
-    throw ApiError.badRequest("The conclave can't end before it starts — check the event date and time.");
-  }
-  if (regStart && regEnd && regEnd <= regStart) {
-    throw ApiError.badRequest("Registration must open before it closes.");
-  }
-  if (regEnd && eventStart && regEnd > eventStart) {
-    throw ApiError.badRequest(
-      "Registration must close before the conclave starts — it can't stay open after the event has begun.",
-    );
-  }
-  if (opts.isNew && eventStart && eventStart < now) {
-    throw ApiError.badRequest("The conclave can't start in the past.");
-  }
-}
-
-/**
- * Evaluates conclave status dynamically based on current date/time vs reg dates and event start/end dates & times.
- * A conclave is shown as "running" ONLY if its start date & start time have already arrived!
- */
-export function evaluateConclaveStatus(data: any): { status: string; isRegistrationOpen: boolean } {
-  try {
-    const now = new Date();
-
-    // Preserve terminal statuses an admin has set explicitly (completed or
-    // cancelled). These are final decisions and must NOT be recomputed from the
-    // time window — otherwise a conclave ended early, before its scheduled
-    // endDateTime, or one whose rounds have run (currentRound > 0), flips back to
-    // "running" below and the app keeps showing it as a live conclave.
-    if (data?.status && TERMINAL_STATUSES.has(data.status)) {
-      return { status: data.status, isRegistrationOpen: false };
-    }
-
-    const eventStart = data?.date ? toDate(data.date) : (data?.startDate ? toDate(data.startDate) : null);
-    const eventEnd = data?.endDate ? toDate(data.endDate) : (data?.date ? toDate(data.date) : null);
-    const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
-    const regEnd = data?.regEndDate ? toDate(data.regEndDate) : null;
-
-    const startDateTime = combineDateTime(eventStart, data?.startTime, "start");
-    const endDateTime = combineDateTime(eventEnd ?? eventStart, data?.endTime, "end");
-    const regStartDateTime = combineDateTime(regStart, data?.regStartTime, "start");
-    const regEndDateTime = combineDateTime(regEnd, data?.regEndTime, "end");
-
-    // 1. Completed once the event's end has passed.
-    if (endDateTime && now > endDateTime) {
-      return { status: ConclaveStatus.completed, isRegistrationOpen: false };
-    }
-
-    // 2. Running once the event's start has arrived (or rounds have run).
-    const hasLiveRounds = Number(data?.currentRound) > 0;
-    if (startDateTime && (now >= startDateTime || hasLiveRounds)) {
-      return { status: ConclaveStatus.running, isRegistrationOpen: false };
-    }
-
-    // An explicit admin override wins over registration dates, but never over
-    // the event lifecycle checks above.
-    const registrationOverride = String(data?.registrationOverride ?? "").toLowerCase();
-    if (registrationOverride === "open") {
-      return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
-    }
-    if (registrationOverride === "closed") {
-      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
-    }
-
-    // Without an override, the registration WINDOW governs.
-    // 3. Not open yet.
-    if (regStartDateTime && now < regStartDateTime) {
-      return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
-    }
-    // 4. Past the registration close time.
-    if (regEndDateTime && now > regEndDateTime) {
-      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
-    }
-    // 5. Within the window and no override → registration is open.
-    return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
-  } catch (err) {
-    return {
-      status: data?.status || ConclaveStatus.registrationOpen,
-      isRegistrationOpen: data?.isRegistrationOpen ?? true
-    };
-  }
-}
-
-export function normalizeTime(val: unknown): string | null {
-  if (!val) return null;
-  if (typeof val === "string") {
-    const trimmed = val.trim();
-    if (!trimmed) return null;
-    if (/^\d{1,2}:\d{2}/.test(trimmed)) {
-      return trimmed;
-    }
-    const d = toDate(trimmed);
-    if (d && !isNaN(d.getTime())) {
-      const hours = String(d.getHours()).padStart(2, "0");
-      const mins = String(d.getMinutes()).padStart(2, "0");
-      return `${hours}:${mins}`;
-    }
-    return trimmed;
-  }
-  const d = toDate(val);
-  if (d && !isNaN(d.getTime())) {
-    const hours = String(d.getHours()).padStart(2, "0");
-    const mins = String(d.getMinutes()).padStart(2, "0");
-    return `${hours}:${mins}`;
-  }
-  return null;
-}
-
-export async function createConclave(input: CreateInput) {
-  if (!input.name || !input.venueLocation) {
-    throw ApiError.badRequest("name and venueLocation are required.");
-  }
+export async function createConclave(input: CreateInput): Promise<string> {
+  const name = String(input.name ?? "").trim();
+  const venueLocation = String(input.venueLocation ?? "").trim();
+  if (!name || !venueLocation) throw ApiError.badRequest("name and venueLocation are required.");
 
   const defaults = await getConclaveDefaults();
-  const personsPerTable = input.personsPerTable ?? defaults.personsPerTable;
-  const roundCount = input.roundCount ?? defaults.roundCount;
+  const personsPerTable = intInput(input.personsPerTable, defaults.personsPerTable, "personsPerTable");
+  const roundCount = intInput(input.roundCount, defaults.roundCount, "roundCount");
   validateConfig(personsPerTable, roundCount);
-
-  // Reject a nonsensical window before anything is written.
   validateConclaveDates(input, { isNew: true });
 
-  const override = input.isRegistrationOpen === false ? "closed" : (input.registrationOverride || "open");
-  const evalResult = evaluateConclaveStatus({
-    regStartDate: input.regStartDate,
-    regEndDate: input.regEndDate,
-    regStartTime: input.regStartTime,
-    regEndTime: input.regEndTime,
-    date: input.date,
-    startDate: input.startDate,
-    endDate: input.endDate,
-    startTime: input.startTime,
-    endTime: input.endTime,
-    registrationOverride: override,
-  });
+  const override = input.isRegistrationOpen === false ? "closed" : input.registrationOverride || "open";
+  if (!OVERRIDES.has(override)) throw ApiError.badRequest("registrationOverride must be auto, open or closed.");
+  if (input.status !== undefined && !ALL_STATUSES.has(input.status)) throw ApiError.badRequest("Unknown status.");
 
-  const statusToSet = input.status || evalResult.status;
-  const isRegOpen = evalResult.isRegistrationOpen;
-
-  const ref = await db.collection(collections.conclaves).add({
-    name: input.name,
-    venueLocation: input.venueLocation,
+  const values = {
+    name,
+    venueLocation,
     region: input.region || "Global BNI Network",
     coordinator: input.coordinator || "",
     creator: input.creator || "",
     description: input.description || "",
     dateRange: input.dateRange || "",
-    date: input.date ? new Date(input.date) : new Date(),
-    endDate: input.endDate ? new Date(input.endDate) : null,
-    regStartDate: input.regStartDate ? new Date(input.regStartDate) : null,
-    regEndDate: input.regEndDate ? new Date(input.regEndDate) : null,
+    startDate: dateInput(input.date ?? input.startDate, "date") ?? new Date(),
+    endDate: dateInput(input.endDate, "endDate"),
+    regStartDate: dateInput(input.regStartDate, "regStartDate"),
+    regEndDate: dateInput(input.regEndDate, "regEndDate"),
     regStartTime: normalizeTime(input.regStartTime),
     regEndTime: normalizeTime(input.regEndTime),
-    registrationOverride: override,
     startTime: normalizeTime(input.startTime),
     endTime: normalizeTime(input.endTime),
+    registrationOverride: override,
     chiefGuests: Array.isArray(input.chiefGuests) ? input.chiefGuests : [],
-    status: statusToSet,
-    isRegistrationOpen: isRegOpen,
     personsPerTable,
     roundCount,
-    memberLimit: Number(input.memberLimit) || 100,
-    captainLimit: Number(input.captainLimit) || 12,
-    paymentDetails: input.paymentDetails || null,
-    currentRound: 0,
-    schedule: null,
-    participants: null,
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  });
+    memberLimit: intInput(input.memberLimit, 100, "memberLimit") || 100,
+    captainLimit: intInput(input.captainLimit, 12, "captainLimit") || 12,
+    paymentDetails: input.paymentDetails ?? null,
+    registrationFee: input.paymentDetails?.registrationFee !== undefined ? Number(input.paymentDetails.registrationFee) || 0 : null,
+  };
+  const evaluated = evaluateConclaveStatus({ ...values, date: values.startDate });
 
-  clearConclaveCache();
-  return ref.id;
+  return pgdb.transaction(async (tx) => {
+    const [row] = await tx
+      .insert(conclaves)
+      .values({ ...values, status: input.status || evaluated.status, isRegistrationOpen: evaluated.isRegistrationOpen })
+      .returning();
+    await audit.change({ action: "conclave.create", entityType: "conclave", entityId: row.id, after: auditable(row) }, tx);
+    return row.id;
+  });
 }
 
-export async function updateConclave(id: string, body: Record<string, unknown>) {
-  const { ref, data } = await getConclaveOrThrow(id);
-  const status = data.status ?? "";
+export async function updateConclave(id: string, body: Record<string, any>): Promise<string[]> {
+  const { before, after } = await mutate(id, "conclave.update", async (row) => {
+    if (row.status === ConclaveStatus.running || row.status === ConclaveStatus.completed) {
+      throw ApiError.conflict(`Cannot edit a conclave that is ${row.status}.`);
+    }
+    const u: ConclavePatch = {};
+    const text = (k: keyof ConclavePatch, v: unknown) => { if (v !== undefined) (u as any)[k] = v === null ? null : String(v); };
+    text("name", body.name);
+    text("venueLocation", body.venueLocation);
+    text("region", body.region);
+    text("coordinator", body.coordinator);
+    text("creator", body.creator);
+    text("description", body.description);
+    text("dateRange", body.dateRange);
+    if (u.name !== undefined && !u.name?.trim()) throw ApiError.badRequest("Name can't be empty.");
+    if (body.memberLimit !== undefined) u.memberLimit = intInput(body.memberLimit, 100, "memberLimit") || 100;
+    if (body.captainLimit !== undefined) u.captainLimit = intInput(body.captainLimit, 12, "captainLimit") || 12;
+    if (body.paymentDetails !== undefined) {
+      u.paymentDetails = body.paymentDetails;
+      if (body.paymentDetails?.registrationFee !== undefined) u.registrationFee = Number(body.paymentDetails.registrationFee) || 0;
+    }
+    if (body.chiefGuests !== undefined) u.chiefGuests = Array.isArray(body.chiefGuests) ? body.chiefGuests : [];
+    if (body.date !== undefined || body.startDate !== undefined) u.startDate = dateInput(body.date ?? body.startDate, "date");
+    if (body.endDate !== undefined) u.endDate = dateInput(body.endDate, "endDate");
+    if (body.regStartDate !== undefined) u.regStartDate = dateInput(body.regStartDate, "regStartDate");
+    if (body.regEndDate !== undefined) u.regEndDate = dateInput(body.regEndDate, "regEndDate");
+    if (body.regStartTime !== undefined) u.regStartTime = normalizeTime(body.regStartTime);
+    if (body.regEndTime !== undefined) u.regEndTime = normalizeTime(body.regEndTime);
+    if (body.startTime !== undefined) u.startTime = normalizeTime(body.startTime);
+    if (body.endTime !== undefined) u.endTime = normalizeTime(body.endTime);
+    if (body.status !== undefined) {
+      if (!ALL_STATUSES.has(body.status)) throw ApiError.badRequest("Unknown status.");
+      u.status = body.status;
+    }
+    if (body.registrationOverride !== undefined) {
+      const o = String(body.registrationOverride);
+      if (!OVERRIDES.has(o)) throw ApiError.badRequest("registrationOverride must be auto, open or closed.");
+      u.registrationOverride = o;
+    } else if (body.isRegistrationOpen !== undefined) {
+      u.registrationOverride = body.isRegistrationOpen ? "open" : "closed";
+    }
+    if (body.personsPerTable !== undefined || body.roundCount !== undefined) {
+      if (row.schedule) {
+        throw ApiError.conflict(
+          "A schedule already exists. Changing persons-per-table or round count would invalidate it — regenerate the schedule instead.",
+        );
+      }
+      const p = body.personsPerTable !== undefined ? Number(body.personsPerTable) : row.personsPerTable ?? NaN;
+      const r = body.roundCount !== undefined ? Number(body.roundCount) : row.roundCount ?? NaN;
+      validateConfig(p, r);
+      u.personsPerTable = p;
+      u.roundCount = r;
+    }
+    if (!Object.keys(u).length) throw ApiError.badRequest("Nothing to update.");
 
-  if (status === ConclaveStatus.running || status === ConclaveStatus.completed) {
-    throw ApiError.conflict(`Cannot edit a conclave that is ${status}.`);
+    // Validate and evaluate the RESULT of the edit, so a partial change that
+    // creates a bad window is rejected.
+    const merged = toView({ ...row, ...u } as ConclaveRow);
+    validateConclaveDates(merged, { isNew: false });
+    const evaluated = evaluateConclaveStatus(merged);
+    if (body.status === undefined) u.status = evaluated.status;
+    u.isRegistrationOpen = evaluated.isRegistrationOpen;
+    return u;
+  });
+  return Object.keys(auditChanges(before, after));
+}
+
+function auditChanges(before: ConclaveRow, after: ConclaveRow) {
+  const out: Record<string, true> = {};
+  for (const k of Object.keys(after) as (keyof ConclaveRow)[]) {
+    if (k === "updatedAt") continue;
+    if (JSON.stringify(before[k]) !== JSON.stringify(after[k])) out[k] = true;
   }
+  return out;
+}
 
-  const updates: Record<string, unknown> = {};
-  if (body.name !== undefined) updates.name = body.name;
-  if (body.venueLocation !== undefined) updates.venueLocation = body.venueLocation;
-  if (body.region !== undefined) updates.region = body.region;
-  if (body.coordinator !== undefined) updates.coordinator = body.coordinator;
-  if (body.creator !== undefined) updates.creator = body.creator;
-  if (body.description !== undefined) updates.description = body.description;
-  if (body.dateRange !== undefined) updates.dateRange = body.dateRange;
-  if (body.memberLimit !== undefined) updates.memberLimit = Number(body.memberLimit) || 100;
-  if (body.captainLimit !== undefined) updates.captainLimit = Number(body.captainLimit) || 12;
-  if (body.paymentDetails !== undefined) updates.paymentDetails = body.paymentDetails;
-  if (body.date !== undefined) updates.date = body.date ? new Date(body.date as string) : null;
-  if (body.startDate !== undefined) updates.startDate = body.startDate ? new Date(body.startDate as string) : null;
-  if (body.endDate !== undefined) updates.endDate = body.endDate ? new Date(body.endDate as string) : null;
-  if (body.regStartDate !== undefined) updates.regStartDate = body.regStartDate ? new Date(body.regStartDate as string) : null;
-  if (body.regEndDate !== undefined) updates.regEndDate = body.regEndDate ? new Date(body.regEndDate as string) : null;
-  if (body.regStartTime !== undefined) updates.regStartTime = normalizeTime(body.regStartTime);
-  if (body.regEndTime !== undefined) updates.regEndTime = normalizeTime(body.regEndTime);
-  if (body.startTime !== undefined) updates.startTime = normalizeTime(body.startTime);
-  if (body.endTime !== undefined) updates.endTime = normalizeTime(body.endTime);
-  if (body.status !== undefined) updates.status = body.status;
-  // The admin's open/closed intent. isRegistrationOpen=false (the form toggle) is
-  // the same signal.
-  if (body.registrationOverride !== undefined) {
-    updates.registrationOverride = String(body.registrationOverride);
-  } else if (body.isRegistrationOpen !== undefined) {
-    updates.registrationOverride = body.isRegistrationOpen ? "open" : "closed";
-  }
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
 
-  const mergedData = { ...data, ...updates };
+/** Open or close registration (two-way). */
+export async function setRegistrationOpen(id: string, open: boolean) {
+  await mutate(id, open ? "conclave.registration_open" : "conclave.registration_close", (row) => {
+    if (TERMINAL_STATUSES.has(row.status) || row.status === ConclaveStatus.running) {
+      throw ApiError.conflict(`Cannot change registration on a conclave that is ${row.status}.`);
+    }
+    const override = open ? "open" : "closed";
+    const evaluated = evaluateConclaveStatus({ ...toView(row), registrationOverride: override });
+    return { registrationOverride: override, isRegistrationOpen: evaluated.isRegistrationOpen, status: evaluated.status };
+  });
+}
 
-  // Validate the RESULT of the edit (merged), so a partial change that creates a
-  // bad window — e.g. moving registration past the event start — is rejected.
-  validateConclaveDates(mergedData, { isNew: false });
-
-  const evalResult = evaluateConclaveStatus(mergedData);
-  if (body.status === undefined) {
-    updates.status = evalResult.status;
-  }
-  updates.isRegistrationOpen = evalResult.isRegistrationOpen;
-  updates.updatedAt = new Date();
-
-  if (body.personsPerTable !== undefined || body.roundCount !== undefined) {
-    if (data.schedule) {
+/** Call a conclave off before it starts. */
+export async function cancelConclave(id: string) {
+  await mutate(id, "conclave.cancel", (row) => {
+    if (row.status === ConclaveStatus.completed) throw ApiError.conflict("A completed conclave cannot be cancelled.");
+    if (row.status === ConclaveStatus.running) {
       throw ApiError.conflict(
-        "A schedule already exists. Changing persons-per-table or round count would invalidate it — regenerate the schedule instead.",
+        "This conclave is running — it cannot be cancelled. Use End Conclave to stop it now; members keep their attendance and referrals, and get their summaries.",
       );
     }
-    const p = (body.personsPerTable as number) ?? data.personsPerTable;
-    const r = (body.roundCount as number) ?? data.roundCount;
-    validateConfig(p, r);
-    updates.personsPerTable = p;
-    updates.roundCount = r;
-  }
-
-  if (Object.keys(updates).length === 0) {
-    throw ApiError.badRequest("Nothing to update.");
-  }
-
-  updates.updatedAt = new Date();
-
-  clearConclaveCache();
-  await ref.update(updates);
-  return Object.keys(updates);
-}
-
-/** Open or close registration. Two-way, unlike a one-shot "close". */
-export async function setRegistrationOpen(id: string, open: boolean) {
-  const { ref, data } = await getConclaveOrThrow(id);
-  const status = data.status ?? "";
-
-  if (TERMINAL_STATUSES.has(status) || status === ConclaveStatus.running) {
-    throw ApiError.conflict(
-      `Cannot change registration on a conclave that is ${status}.`,
-    );
-  }
-
-  // Record the admin's intent as the override and recompute. The override can
-  // bypass registration dates, but not event lifecycle or terminal status.
-  const override = open ? "open" : "closed";
-  const evalResult = evaluateConclaveStatus({ ...data, registrationOverride: override });
-  await ref.update({
-    registrationOverride: override,
-    isRegistrationOpen: evalResult.isRegistrationOpen,
-    status: evalResult.status,
-    updatedAt: new Date(),
-  });
-  clearConclaveCache();
-}
-
-/**
- * Call a conclave off before it starts.
- */
-export async function cancelConclave(id: string) {
-  const { ref, data } = await getConclaveOrThrow(id);
-  const status = data.status ?? "";
-
-  if (status === ConclaveStatus.completed) {
-    throw ApiError.conflict("A completed conclave cannot be cancelled.");
-  }
-
-  if (status === ConclaveStatus.running) {
-    throw ApiError.conflict(
-      "This conclave is running — it cannot be cancelled. Use End Conclave to " +
-        "stop it now; members keep their attendance and referrals, and get their " +
-        "summaries.",
-    );
-  }
-
-  if (status === ConclaveStatus.cancelled) {
-    throw ApiError.conflict("This conclave is already cancelled.");
-  }
-
-  await ref.update({
-    status: ConclaveStatus.cancelled,
-    isRegistrationOpen: false,
-    cancelledAt: new Date(),
+    if (row.status === ConclaveStatus.cancelled) throw ApiError.conflict("This conclave is already cancelled.");
+    return { status: ConclaveStatus.cancelled, isRegistrationOpen: false, cancelledAt: new Date() };
   });
 }
 
-/** Lock the schedule for a conclave without ending the conclave. */
+/** Publish (lock) the schedule, then tell everyone. */
 export async function lockConclaveSchedule(id: string) {
-  const { ref, data } = await getConclaveOrThrow(id);
-  const evalResult = evaluateConclaveStatus(data);
-  await ref.update({
-    isScheduleLocked: true,
-    status: data.status === ConclaveStatus.completed ? ConclaveStatus.completed : evalResult.status,
-    updatedAt: new Date()
+  await mutate(id, "conclave.lock_schedule", (row) => {
+    if (!row.schedule) throw ApiError.badRequest("Generate a schedule before publishing it.");
+    const evaluated = evaluateConclaveStatus(toView(row));
+    return {
+      isScheduleLocked: true,
+      status: row.status === ConclaveStatus.completed ? ConclaveStatus.completed : evaluated.status,
+    };
   });
-  clearConclaveCache();
-  // Publishing the schedule is when everyone should be told: members that their
-  // schedule is ready, captains which table they're anchoring. Best-effort.
-  try { await notifyScheduleReady(id); } catch {}
+  // Best-effort: publishing is when members learn their schedule is ready and
+  // captains which table they anchor.
+  try {
+    await notifyScheduleReady(id);
+  } catch {}
 }
 
-/**
- * Tells every registered member their schedule is ready, and every captain the
- * table they're anchoring. Sent to each person's PERSONAL topic (subscribed on
- * sign-in), so it reaches them wherever they are in the app. Per-user
- * best-effort — one failure never blocks the rest.
- */
+async function registrantsOf(id: string) {
+  return pgdb
+    .select({ userId: registrations.userId, role: registrations.role, tableNumber: registrations.tableNumber })
+    .from(registrations)
+    .where(eq(registrations.conclaveId, id));
+}
+
+/** Personal push to every registrant: members "schedule ready", captains their table. */
 export async function notifyScheduleReady(id: string): Promise<{ captains: number; members: number }> {
-  const { ref } = await getConclaveOrThrow(id);
-  const regs = await ref.collection(collections.registrations).get();
   let captains = 0;
   let members = 0;
-  for (const reg of regs.docs) {
-    const r: any = reg.data();
+  for (const r of await registrantsOf(id)) {
     try {
       if (r.role === "captain") {
         await notifyUser(
-          reg.id,
+          r.userId,
           {
             title: "You're a Table Captain ⭐",
             body: `You're the captain for Table ${r.tableNumber ?? "your table"}. Please take your table and get ready to scan.`,
@@ -503,259 +519,167 @@ export async function notifyScheduleReady(id: string): Promise<{ captains: numbe
         captains++;
       } else {
         await notifyUser(
-          reg.id,
-          {
-            title: "Your conclave schedule is ready 📋",
-            body: "Tap to view your table and who you'll be meeting.",
-            data: { conclaveId: id, type: "schedule_ready" },
-          },
+          r.userId,
+          { title: "Your conclave schedule is ready 📋", body: "Tap to view your table and who you'll be meeting.", data: { conclaveId: id, type: "schedule_ready" } },
           "general",
         );
         members++;
       }
     } catch {
-      // keep going; a single bad token must not stop the broadcast
+      // one bad token must not stop the broadcast
     }
   }
   return { captains, members };
 }
 
-/**
- * End the conclave.
- */
+/** End the conclave. */
 export async function completeConclave(id: string) {
-  const { ref, data } = await getConclaveOrThrow(id);
-  const status = data.status ?? "";
-
-  if (status === ConclaveStatus.completed) {
-    throw ApiError.conflict("This conclave is already completed.");
-  }
-  if (status !== ConclaveStatus.running) {
-    throw ApiError.conflict(
-      `Only a running conclave can be completed (this one is ${status}).`,
-    );
-  }
-
-  await ref.update({
-    status: ConclaveStatus.completed,
-    isRegistrationOpen: false,
-    completedAt: new Date(),
-    isRoundPaused: false,
-    roundPausedAt: null,
+  const { before } = await mutate(id, "conclave.complete", (row) => {
+    if (row.status === ConclaveStatus.completed) throw ApiError.conflict("This conclave is already completed.");
+    if (row.status !== ConclaveStatus.running) {
+      throw ApiError.conflict(`Only a running conclave can be completed (this one is ${row.status}).`);
+    }
+    return { status: ConclaveStatus.completed, isRegistrationOpen: false, completedAt: new Date(), isRoundPaused: false, roundPausedAt: null };
   });
 
   const endedMsg = await resolveNotification("conclaveEnded");
-  await notifyConclave(id, {
-    title: endedMsg.title,
-    body: endedMsg.body,
-    data: { conclaveId: id, type: "conclave_completed" },
-  });
+  await notifyConclave(id, { title: endedMsg.title, body: endedMsg.body, data: { conclaveId: id, type: "conclave_completed" } });
 
-  const finalRound = data.currentRound ?? 0;
-  const roundCount = data.roundCount ?? 0;
+  const finalRound = before.currentRound ?? 0;
+  const roundCount = before.roundCount ?? 0;
   return { finalRound, roundCount, endedEarly: finalRound < roundCount };
 }
 
-/**
- * Start a round.
- */
-export async function startRound(id: string, roundNumber: number, adminUid: string) {
-  if (!Number.isInteger(roundNumber) || roundNumber < 1) {
-    throw ApiError.badRequest("roundNumber must be a positive whole number.");
-  }
-
-  const { ref, data } = await getConclaveOrThrow(id);
-
-  if (roundNumber > (data.roundCount ?? 0)) {
-    throw ApiError.badRequest(
-      `This conclave has only ${data.roundCount} rounds.`,
-    );
-  }
-
-  // Rounds auto-advance on the clock. If the admin tries to start a round that
-  // has already begun or elapsed, block it — re-starting (e.g. round 2 when the
-  // clock is already on round 3) would reset the anchor and yank everyone back.
-  if (roundNumber > 1 && data.status === ConclaveStatus.running) {
-    const anchor = toDate(data.currentRoundStartedAt);
-    const prevRound = Number(data.currentRound) || 0;
-    if (anchor && prevRound >= 1) {
-      const timing = await getRoundTiming();
-      const p = Math.max(1, Number(data.personsPerTable) || 1);
-      const active = (timing.bioSeconds + timing.referralSeconds) * 1000 * p;
-      const blockMin = Number(data.roundBlockMinutes);
-      const roundMs =
-        Number.isFinite(blockMin) && blockMin > 0
-          ? active + Math.max(0, blockMin * 60 * 1000 - active)
-          : active + timing.bufferSeconds * 1000;
-      const liveRound =
-        prevRound + Math.floor((Date.now() - anchor.getTime()) / roundMs);
-      if (roundNumber <= liveRound) {
-        const shown = Math.min(liveRound, Number(data.roundCount) || liveRound);
-        throw ApiError.conflict(
-          `Round ${roundNumber} has already run — the conclave is on round ${shown}. ` +
-            `Rounds advance automatically, so you don't need to start them by hand.`,
-          { liveRound: shown },
-        );
-      }
-    }
-  }
-
-  if (roundNumber === 1) {
-    if (!data.schedule) {
-      throw ApiError.badRequest(
-        "No schedule has been generated. Generate one before starting round 1.",
-      );
-    }
-
-    const running = await db
-      .collection(collections.conclaves)
-      .where("status", "==", ConclaveStatus.running)
-      .where("startedBy", "==", adminUid)
-      .get();
-
-    const other = running.docs.find((d) => d.id !== id);
-    if (other) {
-      throw ApiError.conflict(
-        `You are already running "${other.data().name}". End it before starting another — ` +
-          `rounds are advanced by hand, and you cannot be in two rooms at once.`,
-        { runningConclaveId: other.id },
-      );
-    }
-  }
-
+/** Start a round (round 1 starts the conclave). */
+export async function startRound(id: string, roundNumber: number, adminUid: string): Promise<Date> {
+  if (!Number.isInteger(roundNumber) || roundNumber < 1) throw ApiError.badRequest("roundNumber must be a positive whole number.");
+  const timing = await getRoundTiming();
   const roundStartedAt = new Date();
-  await ref.update({
-    status: ConclaveStatus.running,
-    isRegistrationOpen: false,
-    currentRound: roundNumber,
-    currentRoundStartedAt: roundStartedAt,
-    isRoundPaused: false,
-    roundPausedAt: null,
-    roundElapsedMsBeforePause: null,
-    ...(roundNumber === 1 ? { startedBy: adminUid } : {}),
-  });
-  conclaveDocCache.delete(id);
-  conclavesListCache = [];
+
+  await mutate(
+    id,
+    roundNumber === 1 ? "conclave.start" : "round.start",
+    async (row) => {
+      if (roundNumber > (row.roundCount ?? 0)) throw ApiError.badRequest(`This conclave has only ${row.roundCount} rounds.`);
+      if (TERMINAL_STATUSES.has(row.status)) throw ApiError.conflict(`This conclave is ${row.status}.`);
+
+      // Rounds auto-advance on the clock. Re-starting a round that has already
+      // begun or elapsed would reset the anchor and yank everyone back.
+      if (roundNumber > 1 && row.status === ConclaveStatus.running && row.currentRoundStartedAt && row.currentRound >= 1) {
+        const roundMs = roundDurationMs(row.personsPerTable, timing, row.legacy?.roundBlockMinutes);
+        const liveRound = row.currentRound + Math.floor((Date.now() - row.currentRoundStartedAt.getTime()) / roundMs);
+        if (roundNumber <= liveRound) {
+          const shown = Math.min(liveRound, row.roundCount || liveRound);
+          throw ApiError.conflict(
+            `Round ${roundNumber} has already run — the conclave is on round ${shown}. Rounds advance automatically, so you don't need to start them by hand.`,
+            { liveRound: shown },
+          );
+        }
+      }
+
+      if (roundNumber === 1) {
+        if (!row.schedule) throw ApiError.badRequest("No schedule has been generated. Generate one before starting round 1.");
+        // One admin can't run two rooms at once.
+        const [other] = await pgdb
+          .select({ id: conclaves.id, name: conclaves.name })
+          .from(conclaves)
+          .where(and(eq(conclaves.status, ConclaveStatus.running), eq(conclaves.startedBy, adminUid), ne(conclaves.id, id)))
+          .limit(1);
+        if (other) {
+          throw ApiError.conflict(
+            `You are already running "${other.name}". End it before starting another — you cannot be in two rooms at once.`,
+            { runningConclaveId: other.id },
+          );
+        }
+      }
+
+      return {
+        status: ConclaveStatus.running,
+        isRegistrationOpen: false,
+        currentRound: roundNumber,
+        currentRoundStartedAt: roundStartedAt,
+        isRoundPaused: false,
+        roundPausedAt: null,
+        roundElapsedMsBeforePause: null,
+        ...(roundNumber === 1 ? { startedBy: adminUid } : {}),
+      };
+    },
+    { roundNumber },
+  );
 
   try {
     const startedMsg = await resolveNotification("roundStarted", { round: roundNumber });
-    const roundData = {
-      conclaveId: id,
-      roundNumber: String(roundNumber),
-      type: "round_started",
-    };
-    await notifyConclave(id, { title: startedMsg.title, body: startedMsg.body, data: roundData });
-    // Also hit each registered member's PERSONAL topic. They subscribe to that
-    // on sign-in, whereas the conclave topic is only subscribed on the active-
-    // round screen — so a topic-only push reaches almost no one before rounds.
-    const roundRegs = await ref.collection(collections.registrations).get();
-    for (const reg of roundRegs.docs) {
-      void notifyUser(reg.id, { title: startedMsg.title, body: startedMsg.body, data: roundData }, "round_alerts").catch(() => {});
+    const data = { conclaveId: id, roundNumber: String(roundNumber), type: "round_started" };
+    await notifyConclave(id, { title: startedMsg.title, body: startedMsg.body, data });
+    // Also each registrant's PERSONAL topic (subscribed on sign-in), since the
+    // conclave topic is only subscribed on the active-round screen.
+    for (const r of await registrantsOf(id)) {
+      void notifyUser(r.userId, { title: startedMsg.title, body: startedMsg.body, data }, "round_alerts").catch(() => {});
     }
   } catch {}
 
   return roundStartedAt;
 }
 
-/**
- * Pause the active round timer.
- */
 export async function pauseRound(id: string) {
-  const { ref, data } = await getConclaveOrThrow(id);
-  if (data.status !== ConclaveStatus.running) {
-    throw ApiError.badRequest("Only a running conclave round can be paused.");
-  }
-  if (data.isRoundPaused) {
-    return { isRoundPaused: true, pausedAt: data.roundPausedAt };
-  }
-
-  const anchor = toDate(data.currentRoundStartedAt);
-  const elapsedMs = anchor ? Math.max(0, Date.now() - anchor.getTime()) : 0;
-  const pausedAt = new Date();
-
-  await ref.update({
-    isRoundPaused: true,
-    roundPausedAt: pausedAt,
-    roundElapsedMsBeforePause: elapsedMs,
+  let result: { isRoundPaused: true; pausedAt: Date | null; elapsedMs?: number } | null = null;
+  const { before } = await mutate(id, "round.pause", (row) => {
+    if (row.status !== ConclaveStatus.running) throw ApiError.badRequest("Only a running conclave round can be paused.");
+    if (row.isRoundPaused) {
+      result = { isRoundPaused: true, pausedAt: row.roundPausedAt };
+      return {};
+    }
+    const elapsedMs = row.currentRoundStartedAt ? Math.max(0, Date.now() - row.currentRoundStartedAt.getTime()) : 0;
+    const pausedAt = new Date();
+    result = { isRoundPaused: true, pausedAt, elapsedMs };
+    return { isRoundPaused: true, roundPausedAt: pausedAt, roundElapsedMsBeforePause: elapsedMs };
   });
-  conclaveDocCache.delete(id);
-  conclavesListCache = [];
-
-  try {
-    await notifyConclave(id, {
-      title: "Round Paused",
-      body: `Round ${data.currentRound || 1} has been paused by the admin.`,
-      data: { conclaveId: id, type: "round_paused" },
-    });
-  } catch {}
-
-  return { isRoundPaused: true, pausedAt, elapsedMs };
+  if (!before.isRoundPaused) {
+    try {
+      await notifyConclave(id, {
+        title: "Round Paused",
+        body: `Round ${before.currentRound || 1} has been paused by the admin.`,
+        data: { conclaveId: id, type: "round_paused" },
+      });
+    } catch {}
+  }
+  return result!;
 }
 
-/**
- * Resume the paused round timer.
- */
 export async function resumeRound(id: string) {
-  const { ref, data } = await getConclaveOrThrow(id);
-  if (data.status !== ConclaveStatus.running) {
-    throw ApiError.badRequest("Only a running conclave round can be resumed.");
-  }
-  if (!data.isRoundPaused) {
-    return { isRoundPaused: false, startedAt: data.currentRoundStartedAt };
-  }
-
-  // Calculate new anchor: current time minus elapsed time already spent before pause
-  const elapsedMs = Number(data.roundElapsedMsBeforePause) || 0;
-  const newStartedAt = new Date(Date.now() - elapsedMs);
-
-  await ref.update({
-    isRoundPaused: false,
-    roundPausedAt: null,
-    roundElapsedMsBeforePause: null,
-    currentRoundStartedAt: newStartedAt,
+  let newStartedAt: Date | null = null;
+  const { before, after } = await mutate(id, "round.resume", (row) => {
+    if (row.status !== ConclaveStatus.running) throw ApiError.badRequest("Only a running conclave round can be resumed.");
+    if (!row.isRoundPaused) return {};
+    // New anchor = now minus the time already spent before the pause.
+    newStartedAt = new Date(Date.now() - (row.roundElapsedMsBeforePause ?? 0));
+    return { isRoundPaused: false, roundPausedAt: null, roundElapsedMsBeforePause: null, currentRoundStartedAt: newStartedAt };
   });
-  conclaveDocCache.delete(id);
-  conclavesListCache = [];
-
+  if (!before.isRoundPaused) return { isRoundPaused: false, startedAt: after.currentRoundStartedAt };
   try {
-    await notifyConclave(id, {
-      title: "Round Resumed",
-      body: `Round ${data.currentRound || 1} has resumed!`,
-      data: { conclaveId: id, type: "round_resumed" },
-    });
+    await notifyConclave(id, { title: "Round Resumed", body: `Round ${before.currentRound || 1} has resumed!`, data: { conclaveId: id, type: "round_resumed" } });
   } catch {}
-
   return { isRoundPaused: false, currentRoundStartedAt: newStartedAt };
 }
 
-/**
- * Force-close the current round.
- */
+/** Force-close the current round (or complete the conclave on the last round). */
 export async function closeRound(id: string) {
-  const { ref, data } = await getConclaveOrThrow(id);
-  if (data.status !== ConclaveStatus.running) {
-    throw ApiError.badRequest("Only a running conclave round can be closed.");
-  }
+  const { row } = await getConclaveOrThrow(id);
+  if (row.status !== ConclaveStatus.running) throw ApiError.badRequest("Only a running conclave round can be closed.");
+  const curRound = row.currentRound || 1;
+  if (curRound >= (row.roundCount || 4)) return completeConclave(id);
 
-  const curRound = Number(data.currentRound) || 1;
-  const totalRounds = Number(data.roundCount) || 4;
-
-  // If on final round, complete the conclave
-  if (curRound >= totalRounds) {
-    return await completeConclave(id);
-  }
-
-  // Otherwise, fast-forward anchor to 16 minutes in past so current round is marked ended
+  // Move the anchor far enough back that the current round reads as ended.
   const endedAnchor = new Date(Date.now() - 16 * 60 * 1000);
-  await ref.update({
-    isRoundPaused: false,
-    roundPausedAt: null,
-    roundElapsedMsBeforePause: null,
-    currentRoundStartedAt: endedAnchor,
-  });
-  conclaveDocCache.delete(id);
-  conclavesListCache = [];
-
+  await mutate(
+    id,
+    "round.close",
+    (r) => {
+      if (r.status !== ConclaveStatus.running) throw ApiError.badRequest("Only a running conclave round can be closed.");
+      return { isRoundPaused: false, roundPausedAt: null, roundElapsedMsBeforePause: null, currentRoundStartedAt: endedAnchor };
+    },
+    { roundNumber: curRound },
+  );
   try {
     await notifyConclave(id, {
       title: `Round ${curRound} Closed`,
@@ -763,107 +687,180 @@ export async function closeRound(id: string) {
       data: { conclaveId: id, type: "round_ended", roundNumber: String(curRound) },
     });
   } catch {}
-
   return { closedRound: curRound, isEnded: true };
 }
 
-export async function listConclaves(region?: string) {
-  try {
-    let snap: any;
-    try {
-      snap = await db.collection(collections.conclaves).orderBy("date", "desc").get();
-    } catch {
-      snap = await db.collection(collections.conclaves).get();
+// ---------------------------------------------------------------------------
+// Listing and deletion
+// ---------------------------------------------------------------------------
+
+/** "Guntur Region" and "guntur" compare equal. */
+export const normRegion = (r: unknown) => String(r ?? "").toLowerCase().replace(/\s+region$/, "").trim();
+
+/**
+ * Every conclave (optionally one region's), newest first, with registration
+ * counts and a status recomputed from the clock.
+ */
+export async function listConclaves(region?: string): Promise<ConclaveView[]> {
+  const rows = await pgdb
+    .select({ row: conclaves, regCount: sql<number>`(SELECT count(*)::int FROM ${registrations} r WHERE r.conclave_id = ${conclaves.id})` })
+    .from(conclaves)
+    .orderBy(desc(conclaves.startDate));
+
+  const target = region ? normRegion(region) : "";
+  const out: ConclaveView[] = [];
+  const fixes: { id: string; status: string; isRegistrationOpen: boolean }[] = [];
+
+  for (const { row, regCount } of rows) {
+    if (target && normRegion(row.region) !== target) continue;
+
+    const count = regCount > 0 ? regCount : Array.isArray(row.participants) ? row.participants.length : 0;
+    let effective = row;
+
+    // Self-heal a "completed" that no admin set and no round ran (completedAt
+    // empty, currentRound 0) — recompute from the window, but never re-open a
+    // conclave whose day has genuinely passed.
+    if (row.status === ConclaveStatus.completed && !row.currentRound && !row.completedAt) {
+      const e = evaluateConclaveStatus({ ...toView(row), status: undefined });
+      if (e.status !== ConclaveStatus.completed) {
+        effective = { ...row, status: e.status, isRegistrationOpen: e.isRegistrationOpen };
+        fixes.push({ id: row.id, status: e.status, isRegistrationOpen: e.isRegistrationOpen });
+      }
+    } else if (!TERMINAL_STATUSES.has(row.status)) {
+      const e = evaluateConclaveStatus(toView(row));
+      effective = { ...row, status: e.status, isRegistrationOpen: e.isRegistrationOpen };
     }
-
-    let docs = snap.docs;
-    if (region) {
-      const targetNorm = String(region || '').toLowerCase().replace(/\s+region$/, '').trim();
-      docs = docs.filter((doc: any) => {
-        const docNorm = String(doc.data().region || '').toLowerCase().replace(/\s+region$/, '').trim();
-        return !targetNorm || docNorm === targetNorm || docNorm.includes(targetNorm) || targetNorm.includes(docNorm);
-      });
-    }
-
-    docs.sort((a: any, b: any) => {
-      const da = toDate(a.data().date)?.getTime() || 0;
-      const dbDate = toDate(b.data().date)?.getTime() || 0;
-      return dbDate - da;
-    });
-
-    const list = await Promise.all(
-      docs.map(async (doc: any) => {
-        let regCount = 0;
-        try {
-          const count = await doc.ref.collection(collections.registrations).count().get();
-          regCount = count.data().count;
-        } catch {
-          // Ignore subcollection count error
-        }
-        const d = doc.data();
-        const countFromSubcoll = regCount;
-        const countFromParticipants = Array.isArray(d.participants) ? d.participants.length : 0;
-        const actualCount = countFromSubcoll > 0 ? countFromSubcoll : countFromParticipants;
-
-        // Self-heal: a conclave marked completed before any rounds ran (currentRound==0)
-        // AND without an explicit admin completion (no completedAt) is almost always a
-        // stale/bogus status — recompute it from the time window. Two guards keep this
-        // from ever re-opening a genuinely-finished conclave (the reported bug where a
-        // deliberately-completed conclave kept coming back):
-        //   1. completedAt present  → an admin ended it on purpose; always trusted.
-        //   2. the recomputed status is itself "completed" (event day has passed) → leave it.
-        if (d.status === "completed" && (!d.currentRound || d.currentRound === 0) && !d.completedAt) {
-          const evalResult = evaluateConclaveStatus({ ...d, status: undefined });
-          if (evalResult.status !== ConclaveStatus.completed) {
-            d.status = evalResult.status;
-            d.isRegistrationOpen = evalResult.isRegistrationOpen;
-            doc.ref.update({ status: evalResult.status, isRegistrationOpen: evalResult.isRegistrationOpen }).catch(() => {});
-          }
-        } else if (d.status !== ConclaveStatus.completed && d.status !== ConclaveStatus.cancelled) {
-          const evalResult = evaluateConclaveStatus(d);
-          d.status = evalResult.status;
-          d.isRegistrationOpen = evalResult.isRegistrationOpen;
-        }
-
-        const item = {
-          id: doc.id,
-          ...d,
-          startDate: toIso(d.startDate || d.date),
-          date: toIso(d.date || d.startDate),
-          endDate: toIso(d.endDate),
-          regStartDate: toIso(d.regStartDate),
-          regEndDate: toIso(d.regEndDate),
-          startTime: normalizeTime(d.startTime),
-          endTime: normalizeTime(d.endTime),
-          createdAt: toIso(d.createdAt),
-          updatedAt: toIso(d.updatedAt),
-          registrationCount: actualCount,
-        };
-        conclaveDocCache.set(doc.id, { ref: doc.ref, data: d, doc });
-        return item;
-      }),
-    );
-
-    if (list.length > 0) {
-      conclavesListCache = list;
-    }
-    return list;
-  } catch (err: any) {
-    console.warn("listConclaves falling back to local cache:", err?.message || err);
-    return conclavesListCache;
+    out.push(toView(effective, count));
   }
+
+  // Persist self-heal corrections (audited as automatic fixes), best-effort.
+  for (const f of fixes) {
+    void mutate(f.id, "conclave.status_autofix", () => ({ status: f.status, isRegistrationOpen: f.isRegistrationOpen })).catch(() => {});
+  }
+  return out;
 }
 
 export async function deleteConclave(id: string) {
-  const ref = db.collection(collections.conclaves).doc(id);
-  const snap = await ref.get();
-  if (!snap.exists) {
-    throw ApiError.notFound(`Conclave with ID "${id}" does not exist.`);
-  }
-  await ref.delete();
-  // Without this the deleted conclave lingers in the cached list, so the admin
-  // dashboard summary and dropdowns keep showing it. Create/update/complete
-  // already clear the cache; delete was missed.
-  clearConclaveCache();
+  await pgdb.transaction(async (tx) => {
+    const [before] = await tx.select().from(conclaves).where(eq(conclaves.id, id)).for("update");
+    if (!before) throw ApiError.notFound(`Conclave with ID "${id}" does not exist.`);
+    const [{ n }] = await tx.select({ n: sql<number>`count(*)::int` }).from(registrations).where(eq(registrations.conclaveId, id));
+    // Registrations, attendance, referrals and feedback cascade with it.
+    await tx.delete(conclaves).where(eq(conclaves.id, id));
+    await audit.change(
+      { action: "conclave.delete", entityType: "conclave", entityId: id, conclaveId: id, before: auditable(before), after: null, metadata: { registrations: n } },
+      tx,
+    );
+  });
 }
 
+/** Running conclaves (for the auto-complete sweep). */
+export async function listRunning() {
+  return pgdb.select().from(conclaves).where(inArray(conclaves.status, [ConclaveStatus.running]));
+}
+export { mutate as mutateConclave };
+
+/**
+ * uids of everyone who shares a table with `uid` in any round of `schedule`
+ * (the people a member actually met — whose contact details they may see).
+ */
+function tablemateUids(schedule: any, participants: Record<string, unknown>[], uid: string): Set<string> {
+  const me = participants.find((p) => p._originalUid === uid)?.id;
+  const out = new Set<string>();
+  if (me === undefined || !Array.isArray(schedule?.rounds)) return out;
+  const uidOf = new Map(participants.map((p) => [p.id, String(p._originalUid ?? "")]));
+  for (const round of schedule.rounds) {
+    for (const t of round?.tables ?? []) {
+      const seats = [t.captainId, ...(t.memberIds ?? [])];
+      if (!seats.includes(me)) continue;
+      for (const pid of seats) if (pid !== me) out.add(uidOf.get(pid) ?? "");
+    }
+  }
+  out.delete("");
+  return out;
+}
+
+/**
+ * The member-facing conclave list: every conclave, flagged with THIS member's
+ * registration (role, table). In the seating list, phone numbers are kept only
+ * for people the member shared a table with ("People I met" → save contact);
+ * everyone else's are removed.
+ */
+export async function listForMember(uid: string, email?: string) {
+  const [all, mine] = await Promise.all([
+    listConclaves(),
+    (async () => {
+      const [u] = await pgdb.select({ email: users.email, phone: users.phone }).from(users).where(eq(users.uid, uid));
+      const e = (u?.email || email || "").toLowerCase().trim();
+      const conditions = [eq(registrations.userId, uid)];
+      if (e) conditions.push(sql`lower(${registrations.email}) = ${e}`);
+      if (u?.phone) conditions.push(eq(registrations.phone, u.phone));
+      return pgdb
+        .select({ id: registrations.conclaveId, role: registrations.role, tableNumber: registrations.tableNumber })
+        .from(registrations)
+        .where(or(...conditions));
+    })(),
+  ]);
+  const regBy = new Map(mine.map((r) => [r.id, r]));
+  return all.map((c) => {
+    const parts = Array.isArray(c.participants) ? (c.participants as Record<string, unknown>[]) : null;
+    const met = parts ? tablemateUids(c.schedule, parts, uid) : new Set<string>();
+    const reg = regBy.get(c.id);
+    return {
+      ...c,
+      participants: parts
+        ? parts.map(({ phone, ...p }) => (met.has(String(p._originalUid)) || p._originalUid === uid ? { ...p, phone } : p))
+        : c.participants,
+      isRegistered: !!reg,
+      myRole: reg?.role ?? null,
+      myTableNumber: reg?.tableNumber ?? null,
+    };
+  });
+}
+
+/**
+ * Attach (or clear) a conclave's agenda document. The file is stored first; the
+ * conclave change is then audited; the previous file is deleted afterwards.
+ */
+export async function setAgenda(
+  id: string,
+  input: { dataUrl?: string; url?: string; name?: string; rawText?: string; agendaText?: string } | null,
+) {
+  const { row } = await getConclaveOrThrow(id);
+  let record: Record<string, unknown> | null = null;
+
+  if (input) {
+    const name = String(input.name || "agenda.pdf").slice(0, 120);
+    let stored: StoredFile | null = null;
+    if (input.dataUrl?.startsWith("data:")) {
+      const { contentType, data } = decodeDataUrl(input.dataUrl);
+      stored = await uploadFile("agendas", name, contentType, data);
+    } else if (!input.url && !input.rawText && !input.agendaText) {
+      throw ApiError.badRequest("Send the agenda as a file (data URL) or as text.");
+    }
+    const text = String(input.agendaText || input.rawText || "").slice(0, 20_000);
+    record = {
+      name,
+      url: stored?.url ?? input.url ?? "",
+      storagePath: stored?.path ?? "",
+      type: stored?.contentType ?? "application/pdf",
+      bytes: stored?.bytes ?? 0,
+      agendaText: text,
+      rawText: text,
+      uploadedAt: new Date().toISOString(),
+    };
+  }
+
+  await mutate(id, record ? "conclave.agenda_set" : "conclave.agenda_clear", () => ({ agendaDocument: record }));
+  const previous = (row.agendaDocument as { storagePath?: string } | null)?.storagePath;
+  if (previous && previous !== record?.storagePath) await deleteFile(previous);
+  return record;
+}
+
+/** One conclave for a member: full detail (schedule included), contacts stripped. */
+export async function getForMember(id: string, uid: string, email?: string) {
+  const all = await listForMember(uid, email);
+  const found = all.find((c) => c.id === id);
+  if (!found) throw ApiError.notFound("Conclave not found.");
+  return found;
+}

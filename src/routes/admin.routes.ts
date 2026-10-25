@@ -1,5 +1,7 @@
 import { Router } from "express";
 import { requireAdmin, requireRole, requireSuperadmin } from "../middleware/auth.js";
+import { queryAudit } from "../audit/audit.query.js";
+import { requireConclaveAccess } from "../middleware/conclaveAccess.js";
 import { asyncHandler } from "../middleware/errors.js";
 import * as c from "../controllers/admin.controller.js";
 
@@ -28,7 +30,8 @@ router.put("/categories", asyncHandler(c.setCategories)); // replace whole list
 router.post("/categories", asyncHandler(c.addCategory)); // { name }
 router.post("/categories/remove", asyncHandler(c.removeCategory)); // { name }
 
-// Conclaves
+// Conclaves. Every /conclaves/:id/... route is region-checked here, once.
+router.use("/conclaves/:id", asyncHandler(requireConclaveAccess));
 router.get("/conclaves", asyncHandler(c.list));
 router.get("/conclaves/:id", asyncHandler(c.getOne));
 router.post("/conclaves", asyncHandler(c.create));
@@ -64,6 +67,15 @@ router.get("/conclaves/:id/feedback", asyncHandler(c.listConclaveFeedback));
 router.get("/conclaves/:id/payments", asyncHandler(c.getConclavePayments));
 
 // Revenue — platform-wide, SUPERADMIN only.
+// Audit trail — who did what, when, from where (admins and superadmins only).
+router.get(
+  "/audit",
+  requireRole("admin", "superadmin"),
+  asyncHandler(async (req, res) => {
+    res.json(await queryAudit(req.query));
+  }),
+);
+
 router.get("/revenue", requireSuperadmin, asyncHandler(c.getRevenue));
 router.get("/revenue/transactions", requireSuperadmin, asyncHandler(c.listTransactions));
 
@@ -74,7 +86,8 @@ router.get("/users", asyncHandler(c.listAllUsers));
 router.post("/users/:uid/role", asyncHandler(c.setUserRole));
 
 // Regions and admin accounts: admins and superadmins only (not coordinators).
-// Who may manage which account is checked again in the controller.
+// Who may manage which account (e.g. only a superadmin creates admins) is
+// enforced again inside admins.service — the route gate is the first line.
 const manageAccess = requireRole("admin", "superadmin");
 
 router.get("/regions", asyncHandler(c.listRegions));

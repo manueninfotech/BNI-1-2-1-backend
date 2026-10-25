@@ -1,29 +1,22 @@
-import { db, collections } from "../config/firebase.js";
+import { and, desc, eq } from "drizzle-orm";
+import { pgdb } from "../db/client.js";
+import { conclaves, feedback, registrations } from "../db/schema.js";
+import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 
 /**
- * Post-conclave feedback, one doc per member at
- * `conclaves/{id}/feedback/{uid}`. Members submit from the summary screen;
- * admins read the lot. Replaces the ad-hoc Google Form.
+ * Post-conclave feedback, one row per member per conclave. Only members who
+ * were registered for the conclave may submit; resubmitting overwrites and is
+ * audited with the change.
  */
-
-const feedbackRef = (conclaveId: string) =>
-  db.collection(collections.conclaves).doc(conclaveId).collection("feedback");
 
 const VALID_TIMING = new Set(["short", "right", "long"]);
 
 export async function submitFeedback(conclaveId: string, uid: string, body: any) {
-  const conclave = await db.collection(collections.conclaves).doc(conclaveId).get();
-  if (!conclave.exists) throw ApiError.notFound("Conclave not found.");
-
   const rating = Number(body?.rating);
-  if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
-    throw ApiError.badRequest("rating must be a number from 1 to 5.");
-  }
+  if (!Number.isFinite(rating) || rating < 1 || rating > 5) throw ApiError.badRequest("rating must be a number from 1 to 5.");
   const referralsRaw = Number(body?.referrals);
-
-  const doc = {
-    uid,
+  const values = {
     rating: Math.round(rating),
     timing: typeof body?.timing === "string" && VALID_TIMING.has(body.timing) ? body.timing : null,
     referrals: Number.isFinite(referralsRaw) && referralsRaw >= 0 ? Math.round(referralsRaw) : null,
@@ -31,27 +24,40 @@ export async function submitFeedback(conclaveId: string, uid: string, body: any)
     submittedAt: new Date(),
   };
 
-  // One submission per member; resubmitting overwrites.
-  await feedbackRef(conclaveId).doc(uid).set(doc, { merge: true });
+  await pgdb.transaction(async (tx) => {
+    const [c] = await tx.select({ id: conclaves.id }).from(conclaves).where(eq(conclaves.id, conclaveId));
+    if (!c) throw ApiError.notFound("Conclave not found.");
+    const [reg] = await tx
+      .select({ u: registrations.userId })
+      .from(registrations)
+      .where(and(eq(registrations.conclaveId, conclaveId), eq(registrations.userId, uid)));
+    if (!reg) throw ApiError.forbidden("Only members registered for this conclave can leave feedback.");
+
+    const where = and(eq(feedback.conclaveId, conclaveId), eq(feedback.userId, uid));
+    const [before] = await tx.select().from(feedback).where(where).for("update");
+    const [after] = await tx
+      .insert(feedback)
+      .values({ conclaveId, userId: uid, ...values })
+      .onConflictDoUpdate({ target: [feedback.conclaveId, feedback.userId], set: values })
+      .returning();
+    await audit.change(
+      { action: before ? "feedback.update" : "feedback.create", entityType: "feedback", entityId: `${conclaveId}:${uid}`, conclaveId, before: before ?? null, after },
+      tx,
+    );
+  });
   return { ok: true };
 }
 
 export async function listFeedback(conclaveId: string) {
-  const snap = await feedbackRef(conclaveId).orderBy("submittedAt", "desc").get().catch(() => feedbackRef(conclaveId).get());
-  const items = snap.docs.map((d) => {
-    const x: any = d.data();
-    return {
-      uid: d.id,
-      rating: x.rating ?? null,
-      timing: x.timing ?? null,
-      referrals: x.referrals ?? null,
-      comment: x.comment ?? "",
-      submittedAt: x.submittedAt?.toDate?.()?.toISOString?.() ?? null,
-    };
-  });
-  const rated = items.filter((i) => typeof i.rating === "number");
-  const avgRating = rated.length
-    ? +(rated.reduce((s, i) => s + (i.rating as number), 0) / rated.length).toFixed(2)
-    : null;
+  const rows = await pgdb.select().from(feedback).where(eq(feedback.conclaveId, conclaveId)).orderBy(desc(feedback.submittedAt));
+  const items = rows.map((x) => ({
+    uid: x.userId,
+    rating: x.rating,
+    timing: x.timing,
+    referrals: x.referrals,
+    comment: x.comment,
+    submittedAt: x.submittedAt.toISOString(),
+  }));
+  const avgRating = items.length ? +(items.reduce((s, i) => s + i.rating, 0) / items.length).toFixed(2) : null;
   return { count: items.length, avgRating, items };
 }

@@ -393,7 +393,7 @@ Response:
 
 > **Critical contract:** the client marks a record synced the moment its id appears
 > in `syncedAttendanceIds` / `syncedReferralIds`, and never retries it. The server
-> therefore **commits to Firestore first** and only then acknowledges. If the write
+> therefore **commits to the database first** and only then acknowledges. If the write
 > fails you get a `500` with **no** acknowledged ids, and the phone keeps its data.
 > Do not "optimise" this by acknowledging early.
 
@@ -430,7 +430,7 @@ offset = ((t1 - t0) + (t2 - t3)) / 2
 Then use `Date.now() + offset` everywhere instead of `Date.now()`.
 
 **Do not** just take one server timestamp and assume it was sampled at the midpoint
-of the round trip. These endpoints do real Firestore work — often **seconds** of it —
+of the round trip. These endpoints do real database work —
 and that naive estimate mistakes the processing time for network latency, pushing
 your clock seconds into the future. The `(t2 - t3)` term is what cancels it out.
 
@@ -448,14 +448,11 @@ by IP would make your own network look like an attacker.
 
 ---
 
-## 8. Firestore access from clients
+## 8. Data access from clients
 
-Clients read the `conclaves` collection directly (that's what makes the app work
-offline — the schedule is served from Firestore's local cache). But under the
-security rules:
+The backend is the **only** way to read or write data: PostgreSQL is not exposed
+to clients. (Older app versions read Firestore directly; Firestore is no longer
+written to, so those versions must be force-updated before the cut-over.)
 
-- `conclaves`, `registrations`, `settings` → **read-only**
-- `users/{uid}` → read/write **your own** only
-- `attendance`, `referrals`, `admins` → **no client access at all**
-
-Anything that isn't a plain read goes through this API.
+Every response carries an `X-Request-Id` header; every error body includes the
+same `requestId` — quote it when reporting a problem.

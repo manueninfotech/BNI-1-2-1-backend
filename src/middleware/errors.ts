@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { isProduction } from "../config/env.js";
+import { currentContext } from "../observability/context.js";
 
 /**
  * An error with an HTTP status, thrown from anywhere and turned into a response
@@ -51,6 +52,13 @@ export function asyncHandler(
   fn: (req: any, res: Response, next: NextFunction) => Promise<unknown>,
 ) {
   return (req: Request, res: Response, next: NextFunction) => {
+    // Capture the matched route and its params NOW: if the handler throws,
+    // Express unwinds req.baseUrl/req.params before the response finishes, and
+    // the audit row would lose which conclave/record the failed call was for.
+    if (!res.locals.auditRoute && (req as any).route?.path) {
+      res.locals.auditRoute = `${req.baseUrl ?? ""}${(req as any).route.path}`;
+      res.locals.auditParams = { ...(req.params as Record<string, string>) };
+    }
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 }
@@ -66,8 +74,13 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  // Every error response carries the request id, so a user's screenshot or a
+  // support ticket leads straight to the matching logs and audit rows.
+  const requestId = currentContext()?.requestId;
+  res.locals.errorMessage = err instanceof Error ? err.message : String(err);
+
   if (err instanceof ApiError) {
-    return res.status(err.status).json({ error: err.message, ...(err.details ?? {}) });
+    return res.status(err.status).json({ error: err.message, ...(err.details ?? {}), requestId });
   }
 
   const errStr = String(err && (err as any).message ? (err as any).message : err);
@@ -80,10 +93,10 @@ export function errorHandler(
     });
   }
 
-  console.error("Unhandled error:", err);
+  console.error(JSON.stringify({ level: "error", msg: "unhandled error", requestId, err: errStr, stack: (err as Error)?.stack }));
 
   // Don't leak internals to clients in production.
   const message =
     !isProduction && err instanceof Error ? err.message : "Internal server error.";
-  res.status(500).json({ error: message });
+  res.status(500).json({ error: message, requestId });
 }

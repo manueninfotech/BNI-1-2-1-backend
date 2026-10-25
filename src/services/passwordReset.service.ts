@@ -1,6 +1,7 @@
-import { auth, db, collections } from "../config/firebase.js";
+import { auth } from "../config/firebase.js";
 import { ApiError } from "../middleware/errors.js";
-import type { UserDoc } from "./user.service.js";
+import { audit } from "../audit/audit.service.js";
+import { getUser, findUsers } from "./user.service.js";
 
 /**
  * Admin-triggered password reset.
@@ -35,10 +36,8 @@ export interface ResetLinkResult {
 const LINK_TTL_HOURS = 1;
 
 export async function generateResetLink(uid: string): Promise<ResetLinkResult> {
-  const userDoc = await db.collection(collections.users).doc(uid).get();
-  if (!userDoc.exists) throw ApiError.notFound("No such user.");
-
-  const profile = userDoc.data() as UserDoc;
+  const profile = await getUser(uid);
+  if (!profile) throw ApiError.notFound("No such user.");
 
   // The account's Firebase identity, which is what the link must be generated
   // against — NOT the member's real email, which Firebase has never heard of.
@@ -66,6 +65,10 @@ export async function generateResetLink(uid: string): Promise<ResetLinkResult> {
     );
   }
 
+  // Who generated a reset link for whom is security-relevant; the link itself
+  // is a credential and is never stored.
+  await audit.change({ action: "user.reset_link", entityType: "user", entityId: uid, metadata: { isPhoneAccount } });
+
   return {
     link,
     // Deliberately the REAL contacts, not authEmail — the admin needs somewhere
@@ -80,42 +83,9 @@ export async function generateResetLink(uid: string): Promise<ResetLinkResult> {
 
 /**
  * Finds a member by email or phone, so an admin can act on "I can't get in"
- * without hunting through a conclave's roster.
- *
- * Admin-only. As a public endpoint this would be a membership-enumeration
- * oracle.
+ * without hunting through a conclave's roster. Admin-only: public, this would
+ * be a membership-enumeration oracle.
  */
 export async function findUser(query: string) {
-  const q = query.trim().toLowerCase();
-  if (q.length < 3) throw ApiError.badRequest("Enter at least 3 characters.");
-
-  const users = db.collection(collections.users);
-
-  // Exact matches first — the fields people actually search by.
-  const [byEmail, byPhone, byIdentifier] = await Promise.all([
-    users.where("email", "==", q).limit(5).get(),
-    users.where("phone", "==", query.trim()).limit(5).get(),
-    users.where("identifier", "==", query.trim()).limit(5).get(),
-  ]);
-
-  const seen = new Set<string>();
-  const results: Array<Record<string, unknown>> = [];
-
-  for (const snap of [byEmail, byPhone, byIdentifier]) {
-    for (const doc of snap.docs) {
-      if (seen.has(doc.id)) continue;
-      seen.add(doc.id);
-      const u = doc.data() as UserDoc;
-      results.push({
-        uid: doc.id,
-        name: u.name ?? "",
-        email: u.email ?? "",
-        phone: u.phone ?? "",
-        businessName: u.businessName ?? "",
-        businessCategory: u.businessCategory ?? "",
-      });
-    }
-  }
-
-  return results;
+  return findUsers(query);
 }

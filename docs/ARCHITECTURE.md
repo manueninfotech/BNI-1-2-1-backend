@@ -13,9 +13,10 @@ structural.
 routes/         URL -> handler. Auth is applied here, once, per router.
    │
 controllers/    Parse the request, call a service, shape the response.
-   │            No business logic. No Firestore.
+   │            No business logic. No database access.
    │
-services/       The actual work. Talks to Firestore. Throws ApiError.
+services/       The actual work. Talks to Postgres (Drizzle). Throws ApiError.
+   │            Every change: one transaction + an audit row.
    │            Knows nothing about Express (no req/res).
    │
 domain/         Pure rules. No I/O at all. Fully unit-tested.
@@ -92,7 +93,7 @@ The client marks a record synced the instant its id comes back, and never retrie
 it. So:
 
 ```
-commit to Firestore  →  then acknowledge the ids
+commit to Postgres  →  then acknowledge the ids
 ```
 
 Never the other way round. The original implementation echoed the ids back
@@ -125,32 +126,44 @@ device's clock. Drift didn't just skew the countdown — it skewed the **gate**,
 phone running slow would keep accepting attendance after the round had closed.
 
 The naive fix (one server timestamp, assume it came from the midpoint of the round
-trip) is *worse than nothing here*, because these endpoints do seconds of Firestore
+trip) is *worse than nothing here*, because these endpoints can do real database
 work: half the processing time gets added to the client's clock. Hence the
 four-timestamp exchange, where the `(t2 - t3)` term cancels processing time out
 exactly.
 
 ---
 
-## Why Firestore reads are batched
+## Why every change is one transaction with its audit row
 
-`for (const uid of uids) await get(uid)` is one network round trip per person. At
-300 participants, on an endpoint the dashboard polls every 10 seconds, that alone
-exceeded a serverless timeout. `getAllDocs()` batches into a single RPC.
+Two admins act at once; the venue's phones sync in bursts; a scheduled sweep runs
+on every instance. So every state change:
 
-Latency here is almost entirely Firestore round trips, not compute. When something
-is slow, count the round trips first.
+1. locks the row it changes (`SELECT … FOR UPDATE`),
+2. re-checks the rule against that locked row,
+3. writes the change **and** its `audit_log` "change" row in the same transaction.
+
+If the audit write fails, the change rolls back — nothing changes unrecorded.
+Background jobs claim work with `FOR UPDATE SKIP LOCKED` or an atomic
+`UPDATE … RETURNING`, so two instances never do the same job twice.
+
+## The audit trail
+
+`audit_log` is append-only (a trigger rejects UPDATE/DELETE/TRUNCATE). Every
+state-changing or refused API call gets a "request" row automatically from the
+`requestContext` middleware; services add "change" rows with field-level diffs;
+jobs and scripts add "system" rows. One `requestId` ties them together and is
+returned to the client in `X-Request-Id` and in every error body.
 
 ---
 
 ## What is deliberately NOT here
 
-- **No ORM / repository abstraction over Firestore.** Services use the Firestore
-  SDK directly. One database, no plans for another; an abstraction would be a
-  layer to maintain with nothing behind it.
+- **No repository layer over Drizzle.** Services use the typed query builder
+  directly; Drizzle already is the abstraction, and a second one would be a layer
+  to maintain with nothing behind it.
 - **No dependency-injection container.** Modules import what they need. The
   pure-domain split is what makes testing easy, not DI.
 - **No caching layer beyond two 60-second in-memory caches** (admin allowlist,
-  settings). They exist because those two reads happen on almost every request and
+  auto-logout setting). They exist because those two reads happen on almost every request and
   change almost never. Everything else is read fresh — a live event cannot serve
   stale round state.

@@ -115,9 +115,12 @@ export async function verifyPayment(params: {
   paymentId: string;
   signature: string;
   expectedRupees: number;
+  /** The order must have been created for THIS member and conclave (its notes). */
+  expectedUid?: string;
+  expectedConclaveId?: string;
   tolerance?: number;
 }): Promise<{ paidRupees: number }> {
-  const { orderId, paymentId, signature, expectedRupees, tolerance = 1 } = params;
+  const { orderId, paymentId, signature, expectedRupees, expectedUid, expectedConclaveId, tolerance = 1 } = params;
 
   if (!orderId || !paymentId || !signature) {
     throw ApiError.badRequest("Incomplete payment details.");
@@ -136,7 +139,7 @@ export async function verifyPayment(params: {
   }
 
   // 2. Money actually moved, and it was the right amount. Fails closed.
-  let order: { status?: string; amount_paid?: number };
+  let order: { status?: string; amount_paid?: number; notes?: Record<string, string> };
   try {
     order = (await client().orders.fetch(orderId)) as typeof order;
   } catch (err: any) {
@@ -144,6 +147,16 @@ export async function verifyPayment(params: {
       err?.error?.description || err?.description || err?.message ||
       (err?.statusCode ? `HTTP ${err.statusCode}` : "unknown error");
     throw new ApiError(502, `Could not verify payment with Razorpay: ${detail}`);
+  }
+
+  // 3. The order was opened for this member and this conclave — otherwise one
+  //    genuine payment could be replayed to register someone else, or for a
+  //    second conclave with the same fee.
+  if (expectedUid !== undefined && order.notes?.uid !== expectedUid) {
+    throw ApiError.badRequest("This payment belongs to a different member.");
+  }
+  if (expectedConclaveId !== undefined && order.notes?.conclaveId !== expectedConclaveId) {
+    throw ApiError.badRequest("This payment was made for a different conclave.");
   }
 
   if (order.status !== "paid") {

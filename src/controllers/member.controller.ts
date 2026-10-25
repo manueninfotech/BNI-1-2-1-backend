@@ -1,626 +1,75 @@
 import type { Response } from "express";
 import type { AuthedRequest } from "../middleware/auth.js";
-import { db, auth, collections } from "../config/firebase.js";
 import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
-import { listConclaves as listConclaveRecords, evaluateConclaveStatus } from "../services/conclave.service.js";
+import { getForMember, listForMember } from "../services/conclave.service.js";
+import { subscribe } from "../services/live.service.js";
+import { listCategories } from "../services/categories.service.js";
+import { getAutoLogoutHours, getRoundTiming } from "../services/settings.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
 import * as feedback from "../services/feedback.service.js";
-import {
-  notifyUser,
-  sendDataToUser,
-  recordUserNotification,
-} from "../services/notification.service.js";
 import { ApiError } from "../middleware/errors.js";
+import * as users from "../services/user.service.js";
+import * as referralsSvc from "../services/referrals.service.js";
+import * as oneToOnesSvc from "../services/oneToOnes.service.js";
+import * as notificationsSvc from "../services/notifications.service.js";
 
 export async function listNotifications(req: AuthedRequest, res: Response) {
-  const snap = await db
-    .collection(collections.users)
-    .doc(req.uid)
-    .collection("notifications")
-    .orderBy("createdAt", "desc")
-    .limit(50)
-    .get();
-  const notifications = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
-  const unreadCount = notifications.filter((n: any) => !n.read).length;
-  res.json({ notifications, unreadCount });
+  res.json(await notificationsSvc.listForUser(req.uid));
 }
 
 export async function markNotificationsRead(req: AuthedRequest, res: Response) {
-  const snap = await db
-    .collection(collections.users)
-    .doc(req.uid)
-    .collection("notifications")
-    .where("read", "==", false)
-    .get();
-  const batch = db.batch();
-  snap.forEach((d) => batch.set(d.ref, { read: true }, { merge: true }));
-  await batch.commit();
-  res.json({ ok: true, marked: snap.size });
+  const marked = await notificationsSvc.markAllRead(req.uid);
+  res.json({ ok: true, marked });
 }
 
 /**
  * Permanently deletes the caller's own account — required by App Store Guideline
- * 5.1.1(v) for any app that lets users create an account.
- *
- * Removes their personal data (the profile document and its notifications
- * subcollection) and then their Firebase Auth login. The uid is taken from the
- * verified token, never the body, so a member can only ever delete themselves.
- * Shared event records (referrals, attendance) are retained as event history but
- * no longer resolve to a live account.
+ * 5.1.1(v). The uid comes from the verified token, so a member can only ever
+ * delete themselves.
  */
 export async function deleteAccount(req: AuthedRequest, res: Response) {
-  const uid = req.uid;
-  const userRef = db.collection(collections.users).doc(uid);
-
-  // Delete the notifications subcollection first (Firestore doesn't cascade),
-  // then the profile document itself.
-  const notifs = await userRef.collection("notifications").get();
-  const batch = db.batch();
-  notifs.forEach((d) => batch.delete(d.ref));
-  batch.delete(userRef);
-  await batch.commit();
-
-  // Remove the auth account last, so a failure above never orphans the login.
-  try {
-    await auth.deleteUser(uid);
-  } catch (e) {
-    // Already gone is fine; anything else is logged but the data is cleared.
-    console.error("deleteAccount: auth.deleteUser failed", e);
-  }
-
+  await users.deleteOwnAccount(req.uid);
   res.json({ ok: true });
 }
 
-/** A member's display name, for notification copy. */
-async function displayName(uid: string): Promise<string> {
-  try {
-    const d = await db.collection(collections.users).doc(uid).get();
-    return ((d.data() as any)?.name || "A member").toString();
-  } catch {
-    return "A member";
-  }
-}
 
-function toISO(val: any): string {
-  if (!val) return new Date().toISOString();
-  if (typeof val === 'string') return val;
-  if (typeof val === 'number') return new Date(val).toISOString();
-  if (typeof val === 'object') {
-    if (typeof val.toDate === 'function') return val.toDate().toISOString();
-    if (val._seconds) return new Date(val._seconds * 1000).toISOString();
-    if (val.seconds) return new Date(val.seconds * 1000).toISOString();
-  }
-  return new Date().toISOString();
-}
 
 /**
- * The member directory: every registered member, with ONLY the fields that are
- * safe to show to other members.
- *
- * Contact details (email, phone, the synthetic sign-in identifier) are
- * deliberately never included — the app exposes this list to every signed-in
- * user, so projecting the safe fields HERE, on the server, is the only place the
- * privacy line can be enforced (Firestore rules cannot hide individual fields).
+ * The member directory — ONLY fields safe to show to other members (no email,
+ * phone or sign-in identifier). Enforced server-side in users.listMemberDirectory.
  */
 export async function listMembers(_req: AuthedRequest, res: Response) {
-  const snap = await db.collection(collections.users).get();
-  const members = snap.docs
-    .map((doc) => {
-      const d = doc.data() as any;
-      return {
-        uid: doc.id,
-        name: (d.name || "").trim(),
-        photoUrl: d.photoUrl || null,
-        businessName: (d.businessName || "").trim(),
-        businessCategory: (d.businessCategory || "").trim(),
-        location: (d.location || "").trim(),
-        chapter: d.chapter || null,
-        region: d.region || null,
-        membership: (d.membership || "").trim(),
-        // Matchmaking: what they want, and what they bring.
-        lookingFor: (d.lookingFor || "").trim(),
-        canOffer: (d.canOffer || "").trim(),
-      };
-    })
-    // Skip half-built docs (e.g. an interrupted registration that only wrote a
-    // login timestamp) — a nameless row is noise in a directory.
-    .filter((m) => m.name.length > 0)
-    .sort((a, b) => a.name.localeCompare(b.name));
-
-  res.json({ members });
+  res.json({ members: await users.listMemberDirectory() });
 }
 
 export async function me(req: AuthedRequest, res: Response) {
-  try {
-    const normalizedEmail = (req.email || '').toLowerCase().trim();
-    const nowIso = new Date().toISOString();
-
-    // Touch user activity timestamp in Firestore
-    if (req.uid) {
-      db.collection(collections.users).doc(req.uid).set({
-        lastLoginAt: nowIso,
-        lastActiveAt: nowIso,
-        isActive: true
-      }, { merge: true }).catch(() => {});
-    }
-
-    // 1. ALWAYS check admins collection FIRST
-    const adminDoc = await db.collection(collections.admins).doc(req.uid).get();
-    if (adminDoc.exists) {
-      const adminData = adminDoc.data() as any;
-      const resolvedRole = String(adminData.role || 'admin').toLowerCase();
-      return res.json({
-        uid: req.uid,
-        id: req.uid,
-        name: adminData.name || (resolvedRole === 'superadmin' ? "Superadmin" : "Admin"),
-        email: adminData.email || req.email || "",
-        phone: adminData.mobile || "",
-        region: adminData.region || "Global",
-        role: resolvedRole,
-        createdAt: toISO(adminData.grantedAt || adminData.createdAt),
-      });
-    }
-
-    // 2. Admin added by email before first sign-in — only for a Firebase-verified email.
-    if (normalizedEmail && req.emailVerified) {
-      const adminEmailSnap = await db.collection(collections.admins)
-        .where('email', '==', normalizedEmail)
-        .limit(1)
-        .get();
-      if (!adminEmailSnap.empty) {
-        const adminData = adminEmailSnap.docs[0].data() as any;
-        const resolvedRole = String(adminData.role || 'admin').toLowerCase();
-        return res.json({
-          uid: req.uid,
-          id: req.uid,
-          name: adminData.name || (resolvedRole === 'superadmin' ? "Superadmin" : "Admin"),
-          email: adminData.email || req.email,
-          phone: adminData.mobile || "",
-          region: adminData.region || "Global",
-          role: resolvedRole,
-          createdAt: toISO(adminData.grantedAt || adminData.createdAt),
-        });
-      }
-
-    }
-
-    // 3. Query users collection by UID (or verified email)
-    const userDoc = await db.collection(collections.users).doc(req.uid).get();
-    let data = (userDoc.exists ? userDoc.data() : null) as any;
-
-    // Email fallback only for a Firebase-verified email — otherwise anyone could
-    // sign up with a member's address and read that member's profile.
-    if (!data && req.email && req.emailVerified) {
-      const emailSnap = await db.collection(collections.users)
-        .where('email', '==', req.email)
-        .limit(1)
-        .get();
-      if (!emailSnap.empty) {
-        data = emailSnap.docs[0].data() as any;
-      }
-
-      if (!data) {
-        const identSnap = await db.collection(collections.users)
-          .where('identifier', '==', req.email)
-          .limit(1)
-          .get();
-        if (!identSnap.empty) {
-          data = identSnap.docs[0].data() as any;
-        }
-      }
-    }
-
-    let isCaptainRole = false;
-
-    // Captain role only applies while a conclave is actively RUNNING or ACTIVE.
-    // Once a conclave ends/completes, captains revert to regular members!
-    // No user will register as captain.
-    try {
-      const conclavesSnap = await db.collection(collections.conclaves).get();
-      for (const cDoc of conclavesSnap.docs) {
-        const cData = cDoc.data();
-        const evalResult = evaluateConclaveStatus(cData);
-        const effectiveStatus = (evalResult?.status || cData.status || '').toLowerCase();
-        const isLiveConclave = effectiveStatus === 'active' || effectiveStatus === 'running';
-
-        // Captain role only applies while a conclave is actively RUNNING or ACTIVE.
-        if (!isLiveConclave) {
-          continue;
-        }
-
-        // 1. Check registrations by UID in this active conclave
-        if (req.uid) {
-          const regDoc = await db.collection(collections.conclaves).doc(cDoc.id).collection('registrations').doc(req.uid).get();
-          if (regDoc.exists) {
-            const reg = regDoc.data();
-            if (reg?.role === 'captain' || reg?.isCaptain === true || reg?.isTableCaptain === true) {
-              isCaptainRole = true;
-              break;
-            }
-          }
-        }
-
-        // 2. Check registrations by email in this active conclave
-        if (req.email) {
-          const regSnap = await db.collection(collections.conclaves).doc(cDoc.id).collection('registrations')
-            .where('email', '==', req.email)
-            .limit(1)
-            .get();
-          if (!regSnap.empty) {
-            const reg = regSnap.docs[0].data();
-            if (reg?.role === 'captain' || reg?.isCaptain === true || reg?.isTableCaptain === true) {
-              isCaptainRole = true;
-              break;
-            }
-          }
-        }
-
-        // 3. Check participants in this active conclave document
-        const participants = Array.isArray(cData.participants) ? cData.participants : [];
-        const part = participants.find((p: any) =>
-          (req.email && p.email?.toLowerCase() === req.email.toLowerCase()) ||
-          (req.uid && (String(p.id) === String(req.uid) || p.uid === req.uid || p._originalUid === req.uid))
-        );
-        if (part && (part.role === 'captain' || part.isCaptain === true)) {
-          isCaptainRole = true;
-          break;
-        }
-
-        // 4. Check if marked isCaptain while registered in this live conclave
-        if (data?.isCaptain === true && part) {
-          isCaptainRole = true;
-          break;
-        }
-      }
-    } catch (_) {}
-
-    const dbRole = (data?.role || 'member').toLowerCase();
-    const isSpecialRole = dbRole === 'superadmin' || dbRole === 'admin' || dbRole === 'regional_admin' || dbRole === 'coordinator';
-    const finalRole = isCaptainRole ? 'captain' : (isSpecialRole ? dbRole : 'member');
-    res.json({
-      uid: req.uid,
-      id: req.uid,
-      name: data?.name || "Member",
-      email: data?.email || req.email || "",
-      phone: data?.phone || "",
-      company: data?.businessName || "",
-      category: data?.businessCategory || "",
-      chapter: data?.chapter || "",
-      location: data?.location || "",
-      createdAt: toISO(data?.createdAt || data?.registeredAt),
-      role: finalRole,
-      isCaptain: isCaptainRole,
-    });
-  } catch (err: any) {
-    console.error("GET /me failed:", err?.message ?? err);
-    res.status(500).json({ error: "Couldn't load your profile. Please try again." });
-  }
+  res.json(await users.getMe({ uid: req.uid, email: req.email, emailVerified: req.emailVerified }));
 }
 
 export async function updateMe(req: AuthedRequest, res: Response) {
-  try {
-    const { name, email, phone, mobile, company, businessName, category, businessCategory, chapter, region, designation, organization } = req.body ?? {};
-
-    const updates: any = { id: req.uid };
-    if (name !== undefined) updates.name = name;
-    if (email !== undefined) updates.email = email;
-    if (phone !== undefined || mobile !== undefined) {
-      const raw = String(phone ?? mobile ?? "").trim();
-      let digitsOnly = raw.replace(/\D/g, "");
-      if (digitsOnly.length === 10) {
-        digitsOnly = "91" + digitsOnly;
-      }
-      updates.phone = digitsOnly ? `+${digitsOnly}` : raw;
-      updates.mobile = digitsOnly.length >= 10 ? digitsOnly.slice(-10) : raw;
-      updates.identifier = digitsOnly ? `${digitsOnly}@bni121.conclave` : `${raw}@bni121.conclave`;
-    }
-    if (company !== undefined || businessName !== undefined) {
-      updates.company = company ?? businessName;
-      updates.businessName = businessName ?? company;
-    }
-    if (category !== undefined || businessCategory !== undefined) {
-      updates.category = category ?? businessCategory;
-      updates.businessCategory = businessCategory ?? category;
-    }
-    if (chapter !== undefined) updates.chapter = chapter;
-    if (region !== undefined) {
-      updates.region = region;
-      updates.location = String(region).toLowerCase();
-    }
-    if (designation !== undefined) updates.designation = designation;
-    if (organization !== undefined) updates.organization = organization;
-    updates.country = updates.country ?? "India";
-    updates.updatedAt = new Date().toISOString();
-
-    const userDocRef = db.collection(collections.users).doc(req.uid);
-    const userDoc = await userDocRef.get();
-
-    if (userDoc.exists) {
-      await userDocRef.set(updates, { merge: true });
-    } else {
-      const adminDocRef = db.collection(collections.admins).doc(req.uid);
-      const adminDoc = await adminDocRef.get();
-      if (adminDoc.exists) {
-        // Admins may edit only harmless fields here — `region` drives regional
-        // authorization and changes only through the coordinator screen.
-        const allowed: Record<string, unknown> = { updatedAt: updates.updatedAt };
-        for (const k of ["name", "phone", "mobile", "designation", "organization"]) {
-          if (updates[k] !== undefined) allowed[k] = updates[k];
-        }
-        await adminDocRef.set(allowed, { merge: true });
-      } else {
-        await userDocRef.set(updates, { merge: true });
-      }
-    }
-
-    res.json({ success: true, message: "Profile updated successfully.", profile: updates });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || "Failed to update profile." });
-  }
+  const profile = await users.updateMe(req.uid, req.body ?? {}, req.email);
+  res.json({ success: true, message: "Profile updated successfully.", profile });
 }
 
+/** Every conclave, flagged with whether the caller is registered (contacts stripped). */
 export async function listConclaves(req: AuthedRequest, res: Response) {
-  const list = await listConclaveRecords();
-  const userDoc = await db.collection(collections.users).doc(req.uid).get();
-  const userData = (userDoc.exists ? userDoc.data() : {}) as any;
-  const userEmail = (userData.email || req.email || '').toLowerCase().trim();
-  const rawPhone = String(userData.phone || userData.mobile || userData.identifier || '').replace(/\D/g, '');
-  const userPhone = rawPhone.length >= 10 ? rawPhone.slice(-10) : rawPhone;
-
-  const registeredSet = new Set<string>();
-  await Promise.all(
-    list.map(async (c: any) => {
-      // Primary: look up by Firebase UID (doc ID)
-      const regDoc = await db
-        .collection(collections.conclaves)
-        .doc(c.id)
-        .collection(collections.registrations)
-        .doc(req.uid)
-        .get();
-      if (regDoc.exists) {
-        registeredSet.add(c.id);
-        return;
-      }
-
-      // Fallback: search by email or identifier
-      if (userEmail) {
-        const byEmail = await db
-          .collection(collections.conclaves)
-          .doc(c.id)
-          .collection(collections.registrations)
-          .where('email', '==', userEmail)
-          .limit(1)
-          .get();
-        if (!byEmail.empty) {
-          registeredSet.add(c.id);
-          return;
-        }
-
-        const byIdentifier = await db
-          .collection(collections.conclaves)
-          .doc(c.id)
-          .collection(collections.registrations)
-          .where('identifier', '==', userEmail)
-          .limit(1)
-          .get();
-        if (!byIdentifier.empty) {
-          registeredSet.add(c.id);
-          return;
-        }
-      }
-
-      // Fallback: search by Phone number matching
-      if (userPhone) {
-        const regsSnap = await db
-          .collection(collections.conclaves)
-          .doc(c.id)
-          .collection(collections.registrations)
-          .get();
-        for (const doc of regsSnap.docs) {
-          const r = doc.data() as any;
-          const regPhoneRaw = String(r.phone || r.mobile || r.identifier || '').replace(/\D/g, '');
-          const regPhone = regPhoneRaw.length >= 10 ? regPhoneRaw.slice(-10) : regPhoneRaw;
-          if (regPhone && userPhone && regPhone === userPhone) {
-            registeredSet.add(c.id);
-            return;
-          }
-        }
-      }
-    }),
-  );
-
-  const out = list.map((c: any) => ({
-    ...c,
-    isRegistered: registeredSet.has(c.id),
-  }));
-
-  res.json(out);
+  res.json(await listForMember(req.uid, req.emailVerified ? req.email : undefined));
 }
 
-
+/** Referrals in this conclave that the caller gave or received — never anyone else's. */
 export async function getReferrals(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  try {
-    const snap = await db.collection(collections.conclaves).doc(id).collection(collections.referrals).get();
-    const list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    res.json(list);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || "Failed to fetch referrals." });
-  }
+  res.json(await referralsSvc.listMineInConclave(req.params.id, req.uid));
 }
 
-/**
- * This member's referrals across EVERY conclave — the ones they gave, and the
- * ones they received. Self-scoped: the uid comes from the verified token, so a
- * caller can only ever read their own network, never someone else's.
- *
- * Iterates conclaves and queries each `referrals` subcollection (equality on a
- * single field, which the automatic index covers) rather than a collectionGroup
- * query, so it needs no extra index deployed to work.
- */
+/** The caller's referral network across every conclave (self-scoped by the token). */
 export async function myReferrals(req: AuthedRequest, res: Response) {
-  const uid = req.uid;
-  const conclavesSnap = await db.collection(collections.conclaves).get();
-
-  type Row = {
-    id: string;
-    conclaveId: string;
-    conclaveName: string;
-    roundNumber: number;
-    otherUserId: string;
-    otherName: string;
-    otherBusinessName: string;
-    notes: string;
-    status: string;
-    // Business-outcome lifecycle, driven by the RECEIVER of the referral.
-    outcome: string; // 'open' | 'accepted' | 'closed' | 'not_closed'
-    closedAmount: number; // TYFCB value in rupees, when closed
-    outcomeNote: string;
-    outcomeAt: string | null;
-    createdAt: string;
-  };
-
-  const outcomeFields = (r: any) => ({
-    outcome: (r.outcome as string) || "open",
-    closedAmount: Number(r.closedAmount ?? 0),
-    outcomeNote: (r.outcomeNote as string) || "",
-    outcomeAt: r.outcomeAt ? toISO(r.outcomeAt) : null,
-  });
-
-  const given: Row[] = [];
-  const received: Row[] = [];
-
-  await Promise.all(
-    conclavesSnap.docs.map(async (c) => {
-      const conclaveName = (c.data() as any).name || "Conclave";
-      const refs = c.ref.collection(collections.referrals);
-
-      const [givenSnap, recvSnap] = await Promise.all([
-        refs.where("fromUserId", "==", uid).get(),
-        refs.where("toUserId", "==", uid).get(),
-      ]);
-
-      givenSnap.forEach((d) => {
-        const r = d.data() as any;
-        given.push({
-          id: d.id,
-          conclaveId: c.id,
-          conclaveName,
-          roundNumber: Number(r.roundNumber ?? 0),
-          otherUserId: String(r.toUserId ?? ""),
-          otherName: r.toName ?? "",
-          otherBusinessName: "",
-          notes: r.notes ?? "",
-          status: r.status || "Pending",
-          ...outcomeFields(r),
-          createdAt: toISO(r.createdAt || r.syncedAt),
-        });
-      });
-
-      recvSnap.forEach((d) => {
-        const r = d.data() as any;
-        received.push({
-          id: d.id,
-          conclaveId: c.id,
-          conclaveName,
-          roundNumber: Number(r.roundNumber ?? 0),
-          otherUserId: String(r.fromUserId ?? ""),
-          otherName: r.fromName ?? "",
-          otherBusinessName: "",
-          notes: r.notes ?? "",
-          status: r.status || "Pending",
-          ...outcomeFields(r),
-          createdAt: toISO(r.createdAt || r.syncedAt),
-        });
-      });
-    }),
-  );
-
-  // Resolve counterpart name + business from the users collection, so the list
-  // is consistent even for older referrals that didn't store a name inline.
-  const ids = [
-    ...new Set([...given, ...received].map((r) => r.otherUserId).filter(Boolean)),
-  ];
-  if (ids.length) {
-    const docs = await db.getAll(
-      ...ids.map((id) => db.collection(collections.users).doc(id)),
-    );
-    const users = new Map<string, { name: string; businessName: string }>();
-    docs.forEach((d) => {
-      if (d.exists) {
-        const u = d.data() as any;
-        users.set(d.id, {
-          name: u.name || "",
-          businessName: u.businessName || "",
-        });
-      }
-    });
-    for (const r of [...given, ...received]) {
-      const u = users.get(r.otherUserId);
-      if (u) {
-        if (!r.otherName) r.otherName = u.name;
-        r.otherBusinessName = u.businessName;
-      }
-    }
-  }
-
-  const byNewest = (a: Row, b: Row) => b.createdAt.localeCompare(a.createdAt);
-  given.sort(byNewest);
-  received.sort(byNewest);
-
-  res.json({ given, received });
+  res.json(await referralsSvc.myReferrals(req.uid));
 }
 
-/**
- * Records the business outcome of a referral: the lifecycle a RECEIVER drives —
- * accepted, closed (with a TYFCB amount), or didn't work out.
- *
- * Only the person who RECEIVED the referral may update it — the outcome is their
- * report of what happened, and it credits the giver. The uid comes from the
- * token, so a caller can never touch a referral that wasn't theirs to close.
- */
-const OUTCOMES = new Set(["open", "accepted", "closed", "not_closed"]);
-
+/** The receiver records the business outcome (accepted / closed with amount / didn't work out). */
 export async function updateReferralOutcome(req: AuthedRequest, res: Response) {
-  const { cid, rid } = req.params;
-  const outcome = String(req.body?.outcome || "").trim();
-  const amount = Number(req.body?.amount ?? 0);
-  const note = String(req.body?.note ?? "").trim();
-
-  if (!OUTCOMES.has(outcome)) {
-    throw new ApiError(400, "Invalid outcome.");
-  }
-  if (outcome === "closed" && (!Number.isFinite(amount) || amount < 0)) {
-    throw new ApiError(400, "A closed referral needs a valid amount.");
-  }
-
-  const ref = db
-    .collection(collections.conclaves)
-    .doc(cid)
-    .collection(collections.referrals)
-    .doc(rid);
-
-  const snap = await ref.get();
-  if (!snap.exists) throw new ApiError(404, "Referral not found.");
-  if ((snap.data() as any).toUserId !== req.uid) {
-    throw new ApiError(403, "Only the member who received a referral can update it.");
-  }
-
-  const newStatus = (outcome === "accepted" || outcome === "closed") ? "Completed" : ((snap.data() as any).status || "Pending");
-
-  await ref.set(
-    {
-      outcome,
-      status: newStatus,
-      closedAmount: outcome === "closed" ? amount : 0,
-      outcomeNote: note,
-      outcomeAt: new Date().toISOString(),
-    },
-    { merge: true },
-  );
-
-  res.json({ ok: true, outcome, status: newStatus, closedAmount: outcome === "closed" ? amount : 0 });
+  res.json(await referralsSvc.updateOutcome(req.params.cid, req.params.rid, req.uid, req.body ?? {}));
 }
 
 // ---------------------------------------------------------------------------
@@ -630,188 +79,16 @@ export async function updateReferralOutcome(req: AuthedRequest, res: Response) {
 // accepts or declines. Stored in a top-level `oneToOnes` collection. The uid
 // always comes from the verified token — you can only act on your own.
 // ---------------------------------------------------------------------------
-const ONE_TO_ONES = "oneToOnes";
-
 export async function createOneToOne(req: AuthedRequest, res: Response) {
-  const uid = req.uid;
-  const toUserId = String(req.body?.toUserId || "").trim();
-  const proposedAt = String(req.body?.proposedAt || "").trim();
-  const location = String(req.body?.location || "").trim();
-  const note = String(req.body?.note || "").trim();
-
-  if (!toUserId) throw new ApiError(400, "Choose a member.");
-  if (toUserId === uid) throw new ApiError(400, "You can't book a 1-2-1 with yourself.");
-  if (!proposedAt || Number.isNaN(Date.parse(proposedAt))) {
-    throw new ApiError(400, "Pick a valid date and time.");
-  }
-  const toDoc = await db.collection(collections.users).doc(toUserId).get();
-  if (!toDoc.exists) throw new ApiError(404, "Member not found.");
-
-  // Guard against spamming the same member. Two equality filters need no
-  // composite index.
-  const priorSnap = await db
-    .collection(ONE_TO_ONES)
-    .where("fromUserId", "==", uid)
-    .where("toUserId", "==", toUserId)
-    .get();
-
-  const hasPending = priorSnap.docs.some(
-    (d) => (d.data() as any).status === "pending",
-  );
-  if (hasPending) {
-    throw new ApiError(
-      409,
-      "You already have a pending 1-2-1 request with this member.",
-    );
-  }
-
-  const monthAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  const recent = priorSnap.docs.filter((d) => {
-    const t = Date.parse((d.data() as any).createdAt || "");
-    return !Number.isNaN(t) && t >= monthAgo;
-  }).length;
-  if (recent >= 2) {
-    throw new ApiError(
-      429,
-      "You can request a 1-2-1 with the same member at most twice a month.",
-    );
-  }
-
-  const now = new Date().toISOString();
-  const ref = await db.collection(ONE_TO_ONES).add({
-    fromUserId: uid,
-    toUserId,
-    proposedAt,
-    location,
-    note,
-    status: "pending",
-    createdAt: now,
-    updatedAt: now,
-  });
-
-  // Data-only push so the app raises a notification with Accept / Decline
-  // actions the invited member can tap from the tray.
-  const fromName = await displayName(uid);
-  void sendDataToUser(toUserId, {
-    type: "one_to_one_request",
-    id: ref.id,
-    fromName,
-  });
-  void recordUserNotification(toUserId, {
-    title: "New 1-2-1 request",
-    body: `${fromName} wants a one-to-one with you.`,
-    type: "one_to_one_request",
-    data: { id: ref.id },
-  });
-
-  res.json({ id: ref.id });
+  res.json(await oneToOnesSvc.create(req.uid, req.body ?? {}));
 }
 
 export async function listOneToOnes(req: AuthedRequest, res: Response) {
-  const uid = req.uid;
-  const col = db.collection(ONE_TO_ONES);
-  const [sentSnap, recvSnap] = await Promise.all([
-    col.where("fromUserId", "==", uid).get(),
-    col.where("toUserId", "==", uid).get(),
-  ]);
-
-  const raw: {
-    id: string;
-    direction: "sent" | "received";
-    otherUserId: string;
-    data: any;
-  }[] = [];
-  sentSnap.forEach((d) =>
-    raw.push({ id: d.id, direction: "sent", otherUserId: (d.data() as any).toUserId, data: d.data() }),
-  );
-  recvSnap.forEach((d) =>
-    raw.push({ id: d.id, direction: "received", otherUserId: (d.data() as any).fromUserId, data: d.data() }),
-  );
-
-  const ids = [...new Set(raw.map((r) => r.otherUserId).filter(Boolean))];
-  const users = new Map<string, { name: string; businessName: string; photoUrl: string | null }>();
-  if (ids.length) {
-    const docs = await db.getAll(...ids.map((id) => db.collection(collections.users).doc(id)));
-    docs.forEach((d) => {
-      if (d.exists) {
-        const u = d.data() as any;
-        users.set(d.id, {
-          name: u.name || "",
-          businessName: u.businessName || "",
-          photoUrl: u.photoUrl || null,
-        });
-      }
-    });
-  }
-
-  const oneToOnes = raw
-    .map((r) => {
-      const u = users.get(r.otherUserId);
-      return {
-        id: r.id,
-        direction: r.direction,
-        otherUserId: r.otherUserId,
-        otherName: u?.name || "",
-        otherBusinessName: u?.businessName || "",
-        otherPhotoUrl: u?.photoUrl || null,
-        proposedAt: r.data.proposedAt || "",
-        location: r.data.location || "",
-        note: r.data.note || "",
-        status: r.data.status || "pending",
-        createdAt: r.data.createdAt || null,
-      };
-    })
-    .sort((a, b) => (a.proposedAt || "").localeCompare(b.proposedAt || ""));
-
-  res.json({ oneToOnes });
+  res.json(await oneToOnesSvc.listMine(req.uid));
 }
 
 export async function updateOneToOne(req: AuthedRequest, res: Response) {
-  const uid = req.uid;
-  const { id } = req.params;
-  const status = String(req.body?.status || "").trim();
-
-  if (!["accepted", "declined", "cancelled"].includes(status)) {
-    throw new ApiError(400, "Invalid status.");
-  }
-
-  const ref = db.collection(ONE_TO_ONES).doc(id);
-  const snap = await ref.get();
-  if (!snap.exists) throw new ApiError(404, "1-2-1 not found.");
-  const m = snap.data() as any;
-
-  const isReceiver = m.toUserId === uid;
-  const isSender = m.fromUserId === uid;
-  if (!isReceiver && !isSender) throw new ApiError(403, "Not your 1-2-1.");
-  // Only the invited member accepts/declines; either party may cancel.
-  if ((status === "accepted" || status === "declined") && !isReceiver) {
-    throw new ApiError(403, "Only the invited member can respond.");
-  }
-
-  await ref.set({ status, updatedAt: new Date().toISOString() }, { merge: true });
-
-  // Notify the OTHER party of the change.
-  const actorName = await displayName(uid);
-  if (status === "accepted" || status === "declined") {
-    const msg = {
-      title: `1-2-1 ${status}`,
-      body: `${actorName} ${status} your 1-2-1 request.`,
-      data: { type: "one_to_one", id },
-    };
-    void notifyUser(m.fromUserId, msg, "one_to_ones");
-    void recordUserNotification(m.fromUserId, { ...msg, type: "one_to_one" });
-  } else if (status === "cancelled") {
-    const target = isSender ? m.toUserId : m.fromUserId;
-    const msg = {
-      title: "1-2-1 cancelled",
-      body: `${actorName} cancelled a 1-2-1.`,
-      data: { type: "one_to_one", id },
-    };
-    void notifyUser(target, msg, "one_to_ones");
-    void recordUserNotification(target, { ...msg, type: "one_to_one" });
-  }
-
-  res.json({ ok: true, status });
+  res.json(await oneToOnesSvc.respond(req.uid, req.params.id, req.body?.status));
 }
 
 export async function register(req: AuthedRequest, res: Response) {
@@ -856,22 +133,10 @@ export async function createPaymentOrder(req: AuthedRequest, res: Response) {
   res.json(order);
 }
 
+/** Withdraw — only before a schedule exists and never once paid (see registration.service). */
 export async function deregister(req: AuthedRequest, res: Response) {
-  const conclaveId = req.params.id;
-  const uid = req.uid;
-
-  try {
-    await db
-      .collection(collections.conclaves)
-      .doc(conclaveId)
-      .collection(collections.registrations)
-      .doc(uid)
-      .delete();
-
-    res.json({ message: "Registration cancelled." });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || "Failed to cancel registration." });
-  }
+  await registration.deregister(req.params.id, req.uid);
+  res.json({ message: "Registration cancelled." });
 }
 
 export async function syncConclave(req: AuthedRequest, res: Response) {
@@ -884,71 +149,47 @@ export async function syncConclave(req: AuthedRequest, res: Response) {
   res.json(result);
 }
 
-export async function resolveIdentifier(req: any, res: Response) {
-  try {
-    const rawInput = String(req.body?.identifier || '').trim().toLowerCase();
-    if (!rawInput) {
-      return res.status(400).json({ error: "Identifier is required." });
-    }
-
-    const digitsOnly = rawInput.replace(/\D/g, '');
-    const isPhoneNumber = digitsOnly.length >= 10 && digitsOnly.length <= 12;
-    const tenDigit = isPhoneNumber ? digitsOnly.slice(-10) : '';
-
-    let foundUser: any = null;
-
-    // 1. Search users collection by email
-    const emailSnap = await db.collection(collections.users)
-      .where('email', '==', rawInput)
-      .limit(1)
-      .get();
-    if (!emailSnap.empty) {
-      foundUser = emailSnap.docs[0].data();
-    }
-
-    // 2. Search users collection by mobile / phone if not found yet
-    if (!foundUser && tenDigit) {
-      const mobileSnap = await db.collection(collections.users)
-        .where('mobile', '==', tenDigit)
-        .limit(1)
-        .get();
-      if (!mobileSnap.empty) {
-        foundUser = mobileSnap.docs[0].data();
-      } else {
-        const phoneSnap = await db.collection(collections.users)
-          .where('phone', '==', `+91${tenDigit}`)
-          .limit(1)
-          .get();
-        if (!phoneSnap.empty) {
-          foundUser = phoneSnap.docs[0].data();
-        }
-      }
-    }
-
-    // 3. Search users collection by identifier field
-    if (!foundUser && (rawInput || tenDigit)) {
-      const idSnap = await db.collection(collections.users)
-        .where('identifier', '==', rawInput)
-        .limit(1)
-        .get();
-      if (!idSnap.empty) {
-        foundUser = idSnap.docs[0].data();
-      }
-    }
-
-    // 4. Resolve exact auth email string for Firebase Auth login
-    let authEmail = rawInput;
-    if (foundUser) {
-      authEmail = foundUser.identifier || foundUser.email || (tenDigit ? `91${tenDigit}@bni121.conclave` : rawInput);
-    } else if (isPhoneNumber) {
-      authEmail = `91${tenDigit}@bni121.conclave`;
-    }
-
-    // PUBLIC endpoint: return ONLY the sign-in address — no profile fields and
-    // no "found" flag, so it can't be used to look members up.
-    return res.json({ authEmail });
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message || "Failed to resolve identifier." });
-  }
+/**
+ * PUBLIC: maps an email/phone to the Firebase sign-in address. Returns only
+ * that address — no profile fields and no "found" flag (anti-enumeration).
+ */
+export async function resolveIdentifier(req: AuthedRequest, res: Response) {
+  res.json({ authEmail: await users.resolveSignInAddress(req.body?.identifier) });
 }
 
+
+// ---- App data (replaces the app's direct Firestore reads) -----------------
+
+/** Everything the app used to live-read from Firestore `settings/*`. */
+export async function appConfig(_req: AuthedRequest, res: Response) {
+  const [categories, roundTiming, autoLogoutHours] = await Promise.all([
+    listCategories(),
+    getRoundTiming(),
+    getAutoLogoutHours(),
+  ]);
+  res.json({ categories, roundTiming, autoLogoutHours });
+}
+
+export async function getConclave(req: AuthedRequest, res: Response) {
+  res.json(await getForMember(req.params.id, req.uid, req.emailVerified ? req.email : undefined));
+}
+
+/** Server-Sent Events: the conclave's live round state, pushed on every change. */
+export async function conclaveLive(req: AuthedRequest, res: Response) {
+  await subscribe(req.params.id, res as any);
+}
+
+export async function myProfile(req: AuthedRequest, res: Response) {
+  const profile = await users.getOwnProfile(req.uid);
+  if (!profile) throw ApiError.notFound("No profile yet.");
+  res.json(profile);
+}
+
+export async function setMyPhoto(req: AuthedRequest, res: Response) {
+  res.json(await users.setPhoto(req.uid, req.body?.dataUrl));
+}
+
+export async function removeMyPhoto(req: AuthedRequest, res: Response) {
+  await users.removePhoto(req.uid);
+  res.json({ ok: true });
+}

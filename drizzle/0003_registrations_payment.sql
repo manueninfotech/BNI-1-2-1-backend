@@ -1,0 +1,2 @@
+ALTER TABLE "registrations" ADD COLUMN "special_instructions" text;--> statement-breakpoint
+CREATE UNIQUE INDEX "registrations_payment_id_uq" ON "registrations" USING btree (("payment"->>'paymentId')) WHERE "registrations"."payment"->>'paymentId' IS NOT NULL;

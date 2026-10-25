@@ -1,19 +1,14 @@
-import { db } from "../config/firebase.js";
 import { ApiError } from "../middleware/errors.js";
+import { readSetting, writeSetting } from "../repositories/settings.repo.js";
 
 /**
  * Business categories, managed from the admin panel and read live by the app.
  *
- * Stored at `settings/businessCategories` (field `categories: string[]`).
- * `settings/*` is already readable by any signed-in user (firestore.rules), so
- * the app reads it directly in real time — editing here reflects in the app with
- * no release. Writes go only through the Admin SDK (here).
+ * Stored in the `businessCategories` settings row (`categories: string[]`).
+ * Every edit is audited with the before/after list.
  */
 
-const SETTINGS = "settings";
-const DOC = "businessCategories";
-
-const ref = () => db.collection(SETTINGS).doc(DOC);
+const KEY = "businessCategories";
 
 /** Clean + de-dupe (case-insensitively), sort A–Z, pin "Other" last. */
 function normalize(list: unknown): string[] {
@@ -35,8 +30,7 @@ function normalize(list: unknown): string[] {
 }
 
 export async function listCategories(): Promise<string[]> {
-  const doc = await ref().get();
-  return normalize(doc.exists ? (doc.data() as any)?.categories : null);
+  return normalize((await readSetting(KEY)).categories);
 }
 
 /** Replace the whole list (the primary admin edit). */
@@ -45,7 +39,7 @@ export async function setCategories(list: unknown): Promise<string[]> {
   if (cleaned.length === 0) {
     throw ApiError.badRequest("The category list cannot be empty.");
   }
-  await ref().set({ categories: cleaned, updatedAt: new Date() }, { merge: true });
+  await writeSetting(KEY, { categories: cleaned });
   return cleaned;
 }
 

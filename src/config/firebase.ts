@@ -1,8 +1,6 @@
 import { initializeApp, cert, getApps, applicationDefault } from "firebase-admin/app";
-import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import { getAuth, type Auth } from "firebase-admin/auth";
 import { getMessaging, type Messaging } from "firebase-admin/messaging";
-import { getStorage, type Storage } from "firebase-admin/storage";
 import { env } from "./env.js";
 
 /**
@@ -26,30 +24,8 @@ function credential() {
 }
 
 if (getApps().length === 0) {
-  initializeApp({
-    credential: credential(),
-    storageBucket: env.firebaseStorageBucket,
-  });
+  initializeApp({ credential: credential() });
 }
 
-export const db: Firestore = getFirestore();
 export const auth: Auth = getAuth();
 export const messaging: Messaging = getMessaging();
-export const storage: Storage = getStorage();
-
-/** Firestore collection names, so a typo can't silently create a new one. */
-export const collections = {
-  conclaves: "conclaves",
-  users: "users",
-  admins: "admins",
-  settings: "settings",
-  regions: "regions",
-  // Top-level ledger of Razorpay payment events (captured / failed / refunded),
-  // written by the webhook. One doc per Razorpay payment id so revenue can be
-  // aggregated without walking every conclave's registrations.
-  payments: "payments",
-  // subcollections of a conclave
-  registrations: "registrations",
-  attendance: "attendance",
-  referrals: "referrals",
-} as const;

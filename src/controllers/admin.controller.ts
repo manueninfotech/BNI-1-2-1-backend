@@ -1,21 +1,19 @@
-import fs from "fs";
-import path from "path";
+import * as referralsSvc from "../services/referrals.service.js";
+import { assertRegion, regionScope } from "../middleware/conclaveAccess.js";
+import * as adminsService from "../services/admins.service.js";
+import * as usersService from "../services/user.service.js";
+import * as regionsService from "../services/regions.service.js";
 import type { Response } from "express";
-import { adminRoleOf, canManage, type AuthedRequest } from "../middleware/auth.js";
-import { db, auth, collections } from "../config/firebase.js";
+import type { AuthedRequest } from "../middleware/auth.js";
 import * as conclaves from "../services/conclave.service.js";
-import { toDate } from "../utils/firestore.js";
 import * as schedule from "../services/schedule.service.js";
 import * as roles from "../services/role.service.js";
 import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
-import { fetchUsers } from "../services/user.service.js";
-import { uploadBufferToStorage } from "../services/storage.service.js";
 import * as categories from "../services/categories.service.js";
 import * as settings from "../services/settings.service.js";
 import * as feedback from "../services/feedback.service.js";
 import * as payments from "../services/payments.service.js";
-import { ApiError } from "../middleware/errors.js";
 
 // --- Payments / revenue ------------------------------------------------------
 
@@ -79,117 +77,38 @@ export async function removeCategory(req: AuthedRequest, res: Response) {
   res.json({ categories: await categories.removeCategory(req.body?.name) });
 }
 
-/** Fetch the admin doc for the caller — used to scope by region. */
-async function getAdminDoc(uid: string, email?: string) {
-  try {
-    const doc = await db.collection(collections.admins).doc(uid).get();
-    if (doc.exists) return doc.data() as Record<string, string>;
 
-    if (email) {
-      const normalizedEmail = email.toLowerCase().trim();
-      const byEmail = await db
-        .collection(collections.admins)
-        .where("email", "==", normalizedEmail)
-        .limit(1)
-        .get();
-      if (!byEmail.empty) return byEmail.docs[0].data() as Record<string, string>;
-
-      if (normalizedEmail.includes("superadmin") || normalizedEmail.includes("admin")) {
-        return {
-          name: normalizedEmail.includes("superadmin") ? "Superadmin" : "Admin",
-          email: normalizedEmail,
-          role: normalizedEmail.includes("superadmin") ? "superadmin" : "admin",
-          region: "Global",
-          uid,
-        };
-      }
-    }
-    return null;
-  } catch (err: any) {
-    console.warn("Failed to fetch admin doc for uid:", uid, err?.message || err);
-    return null;
-  }
-}
 
 export async function list(req: AuthedRequest, res: Response) {
-  try {
-    const admin = await getAdminDoc(req.uid, req.email);
-    const requestGlobal = req.query.global === 'true';
-    // Superadmin (role=superadmin OR region=Global) OR ?global=true sees every conclave.
-    // Any other coordinator sees only their own region.
-    const region =
-      !admin || admin.role === "superadmin" || admin.region === "Global" || requestGlobal
-        ? undefined   // no filter → all
-        : admin.region;
-    const items = await conclaves.listConclaves(region);
-    res.json(items);
-  } catch (err: any) {
-    console.error("Failed to list conclaves:", err?.message || err);
-    res.json([]);
-  }
+  // Superadmins and Global-region admins see every conclave; everyone else only
+  // their region. (?global=true no longer widens a regional admin's view.)
+  const scope = regionScope(req.admin);
+  if (scope === "__none__") return res.json([]);
+  res.json(await conclaves.listConclaves(scope ?? undefined));
 }
 
 export async function getOne(req: AuthedRequest, res: Response) {
-  const { data, doc } = await conclaves.getConclaveOrThrow(req.params.id);
-  const d = data as any;
-  res.json({
-    id: doc.id,
-    ...d,
-    date: toDate(d.date)?.toISOString() ?? null,
-    startDate: toDate(d.startDate || d.date)?.toISOString() ?? null,
-    endDate: toDate(d.endDate)?.toISOString() ?? null,
-    regStartDate: toDate(d.regStartDate)?.toISOString() ?? null,
-    regEndDate: toDate(d.regEndDate)?.toISOString() ?? null,
-    startTime: conclaves.normalizeTime(d.startTime),
-    endTime: conclaves.normalizeTime(d.endTime),
-    currentRoundStartedAt: toDate(d.currentRoundStartedAt)?.toISOString() ?? null,
-    roundPausedAt: toDate(d.roundPausedAt)?.toISOString() ?? null,
-  });
+  const { data } = await conclaves.getConclaveOrThrow(req.params.id);
+  res.json(data);
 }
 
-
 export async function create(req: AuthedRequest, res: Response) {
-  const admin = await getAdminDoc(req.uid, req.email);
-  const isSuperadmin = admin?.role === "superadmin" || admin?.region === "Global" || (req.email || "").toLowerCase().includes("superadmin");
-  const body = req.body ?? {};
-
-  if (!isSuperadmin) {
-    const adminRegion = admin?.region || admin?.scope;
-    if (!adminRegion) {
-      throw ApiError.forbidden("You must be assigned to an official region to create a conclave.");
-    }
-    if (body.region && body.region.trim().toLowerCase() !== adminRegion.trim().toLowerCase()) {
-      throw ApiError.forbidden(`You are only authorized to create conclaves within your assigned region: "${adminRegion}".`);
-    }
-    body.region = adminRegion;
+  const body = { ...(req.body ?? {}) };
+  const scope = regionScope(req.admin);
+  if (scope !== null) {
+    // Regional admins create only in their own region.
+    assertRegion(req.admin, body.region ?? scope);
+    body.region = scope;
   }
-
   const conclaveId = await conclaves.createConclave(body);
-  res.status(201).json({
-    message: "Conclave created. Registration is closed until you open it.",
-    conclaveId,
-  });
+  res.status(201).json({ message: "Conclave created. Registration is closed until you open it.", conclaveId });
 }
 
 export async function update(req: AuthedRequest, res: Response) {
-  const admin = await getAdminDoc(req.uid, req.email);
-  const isSuperadmin = admin?.role === "superadmin" || admin?.region === "Global" || (req.email || "").toLowerCase().includes("superadmin");
-  const body = req.body ?? {};
-
-  if (!isSuperadmin) {
-    const { data: existingConclave } = await conclaves.getConclaveOrThrow(req.params.id);
-    const adminRegion = admin?.region || admin?.scope;
-    if (adminRegion && existingConclave.region && existingConclave.region.trim().toLowerCase() !== adminRegion.trim().toLowerCase()) {
-      throw ApiError.forbidden(`You are only authorized to manage conclaves in your assigned region: "${adminRegion}".`);
-    }
-    if (body.region && adminRegion && body.region.trim().toLowerCase() !== adminRegion.trim().toLowerCase()) {
-      throw ApiError.forbidden(`You cannot change the conclave's region away from your assigned region: "${adminRegion}".`);
-    }
-    if (adminRegion) {
-      body.region = adminRegion;
-    }
-  }
-
+  const body = { ...(req.body ?? {}) };
+  // The route guard already checked the conclave is in the caller's region;
+  // a regional admin also can't move it out.
+  if (regionScope(req.admin) !== null && body.region !== undefined) assertRegion(req.admin, body.region);
   const updated = await conclaves.updateConclave(req.params.id, body);
   res.json({ message: "Conclave updated.", updated });
 }
@@ -214,77 +133,12 @@ export async function lockSchedule(req: AuthedRequest, res: Response) {
 }
 
 export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  const agendaDoc = req.body?.agendaDocument;
-
-  if (!agendaDoc) {
-    const ref = conclaves.conclaveRef(id);
-    await ref.set({
-      agendaDocument: null,
-      updatedAt: new Date().toISOString()
-    }, { merge: true });
-    return res.json({ message: "Agenda document cleared.", agendaDocument: null });
-  }
-
-  let fileUrl = agendaDoc.dataUrl || agendaDoc.url || "";
-  let savedFileName = agendaDoc.name || "agenda.pdf";
-  // Object path in Firebase Storage — kept so the file can be deleted later.
-  let storagePath = "";
-
-  // Upload to Firebase Storage when a base64 data URL is provided.
-  if (agendaDoc.dataUrl && agendaDoc.dataUrl.startsWith("data:")) {
-    try {
-      // data:<contentType>;base64,<data>
-      const match = agendaDoc.dataUrl.match(/^data:([^;]+);base64,(.*)$/s);
-      const contentType = match?.[1] || agendaDoc.type || "application/pdf";
-      const base64Data = match?.[2] ?? agendaDoc.dataUrl.split(";base64,")[1] ?? "";
-      const buffer = Buffer.from(base64Data, "base64");
-
-      const result = await uploadBufferToStorage(buffer, savedFileName, contentType, "agendas");
-      if (result) {
-        fileUrl = result.url;
-        storagePath = result.path;
-        console.log(`[Storage] Uploaded agenda to Firebase Storage: ${result.path}`);
-      } else {
-        // Fallback to local disk if Storage is unreachable.
-        const uploadsDir = path.join(process.cwd(), "uploads", "agendas");
-        if (!fs.existsSync(uploadsDir)) {
-          fs.mkdirSync(uploadsDir, { recursive: true });
-        }
-        const cleanName = savedFileName.replace(/[^a-zA-Z0-9_.-]/g, "_");
-        const fileNameOnDisk = `${id}_${Date.now()}_${cleanName}`;
-        fs.writeFileSync(path.join(uploadsDir, fileNameOnDisk), buffer);
-        fileUrl = `/uploads/agendas/${fileNameOnDisk}`;
-      }
-    } catch (err: any) {
-      console.error("Failed to process agenda document upload:", err);
-    }
-  }
-
-  const finalDocRecord = {
-    name: savedFileName,
-    url: fileUrl,
-    dataUrl: fileUrl,
-    // Storage object path (was Cloudinary public_id). `publicId` kept as an alias
-    // so any existing admin-panel code reading that field still works.
-    storagePath,
-    publicId: storagePath,
-    rawText: agendaDoc.rawText || agendaDoc.agendaText || "",
-    agendaText: agendaDoc.agendaText || agendaDoc.rawText || "",
-    type: agendaDoc.type || "application/pdf",
-    size: agendaDoc.size || "1.0 MB",
-    uploadedAt: new Date().toISOString()
-  };
-
-  const ref = conclaves.conclaveRef(id);
-  await ref.set({
-    agendaDocument: finalDocRecord,
-    updatedAt: new Date().toISOString()
-  }, { merge: true });
-
-  res.json({ message: "Agenda document uploaded and saved to server successfully.", agendaDocument: finalDocRecord });
+  const agendaDocument = await conclaves.setAgenda(req.params.id, req.body?.agendaDocument ?? null);
+  res.json({
+    message: agendaDocument ? "Agenda document uploaded and saved." : "Agenda document cleared.",
+    agendaDocument,
+  });
 }
-
 
 export async function complete(req: AuthedRequest, res: Response) {
   const result = await conclaves.completeConclave(req.params.id);
@@ -375,406 +229,62 @@ export async function findUser(req: AuthedRequest, res: Response) {
 }
 
 export async function referrals(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  const ref = conclaves.conclaveRef(id);
-  const snap = await ref.collection(collections.referrals).get();
-
-  const cDoc = await ref.get();
-  const cData = cDoc.data() || {};
-  const participants = Array.isArray(cData.participants) ? cData.participants : [];
-
-  const usersMap = new Map<string, { name: string; businessCategory: string }>();
-
-  // 1. Populate from conclave participants
-  participants.forEach((p: any) => {
-    if (!p) return;
-    const info = {
-      name: p.name || p.fullName || p.memberName,
-      businessCategory: p.businessCategory || p.businessType || p.category || "BNI Member"
-    };
-    if (info.name && info.name !== "Member" && info.name !== "Unknown Member") {
-      if (p.id) usersMap.set(p.id, info);
-      if (p.uid) usersMap.set(p.uid, info);
-      if (p.userId) usersMap.set(p.userId, info);
-      if (p.name) usersMap.set(p.name.toLowerCase().trim(), info);
-    }
-  });
-
-  // 2. Populate from registrations subcollection
-  try {
-    const regsSnap = await ref.collection(collections.registrations).get();
-    regsSnap.forEach(doc => {
-      const data = doc.data();
-      const info = {
-        name: data.name || data.fullName || data.memberName,
-        businessCategory: data.businessCategory || data.businessType || data.category || "BNI Member"
-      };
-      if (info.name && info.name !== "Member" && info.name !== "Unknown Member") {
-        usersMap.set(doc.id, info);
-        if (data.uid) usersMap.set(data.uid, info);
-        if (data.userId) usersMap.set(data.userId, info);
-        if (data.memberId) usersMap.set(data.memberId, info);
-        if (data.id) usersMap.set(data.id, info);
-        if (data.name) usersMap.set(data.name.toLowerCase().trim(), info);
-      }
-    });
-  } catch {
-    // Ignore registrations fetch error
-  }
-
-  // 3. Find any unmapped user IDs and fetch directly from root users collection
-  const missingUids = new Set<string>();
-  snap.docs.forEach(doc => {
-    const data = doc.data();
-    const fromId = data.fromUserId || data.fromMemberId || data.giverId || data.fromUid;
-    const toId = data.toUserId || data.toMemberId || data.receiverId || data.toUid;
-    if (fromId && !usersMap.has(fromId)) missingUids.add(fromId);
-    if (toId && !usersMap.has(toId)) missingUids.add(toId);
-  });
-
-  if (missingUids.size > 0) {
-    await Promise.all(
-      Array.from(missingUids).map(async (uid) => {
-        try {
-          const uDoc = await db.collection(collections.users).doc(uid).get();
-          if (uDoc.exists) {
-            const uData = uDoc.data()!;
-            const info = {
-              name: uData.name || uData.fullName || uData.memberName || "BNI Member",
-              businessCategory: uData.businessCategory || uData.businessType || uData.businessName || "BNI Member"
-            };
-            usersMap.set(uid, info);
-            usersMap.set(uDoc.id, info);
-          }
-        } catch {
-          // Ignore individual user fetch error
-        }
-      })
-    );
-  }
-
-  const list = snap.docs.map(doc => {
-    const data = doc.data();
-    const fromId = data.fromUserId || data.fromMemberId || data.giverId || data.fromUid;
-    const toId = data.toUserId || data.toMemberId || data.receiverId || data.toUid;
-
-    const fromNameFallback = data.fromName || data.giverName || data.fromMemberName || "BNI Member";
-    const toNameFallback = data.toName || data.receiverName || data.toMemberName || "BNI Member";
-
-    const fromUser = usersMap.get(fromId) || usersMap.get(fromNameFallback.toLowerCase().trim()) || { name: fromNameFallback, businessCategory: data.fromCategory || "BNI Member" };
-    const toUser = usersMap.get(toId) || usersMap.get(toNameFallback.toLowerCase().trim()) || { name: toNameFallback, businessCategory: data.toCategory || "BNI Member" };
-
-    const finalFromName = (fromUser.name && fromUser.name !== "Member" && fromUser.name !== "Unknown Member") ? fromUser.name : (fromNameFallback !== "Member" ? fromNameFallback : "BNI Member");
-    const finalToName = (toUser.name && toUser.name !== "Member" && toUser.name !== "Unknown Member") ? toUser.name : (toNameFallback !== "Member" ? toNameFallback : "BNI Member");
-
-    return {
-      id: doc.id,
-      conclaveId: id,
-      fromMemberId: fromId || doc.id,
-      fromName: finalFromName,
-      fromCategory: fromUser.businessCategory,
-      toMemberId: toId || doc.id,
-      toName: finalToName,
-      toCategory: toUser.businessCategory,
-      roundNumber: data.roundNumber || 1,
-      notes: data.notes || data.description || "",
-      status: data.status || "Pending",
-      createdAt: data.createdAt ? toDate(data.createdAt)?.toISOString() : null
-    };
-  });
-
-  res.json(list);
+  res.json(await referralsSvc.listForAdmin(req.params.id));
 }
 
 export async function attendance(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  const snap = await db
-    .collection(collections.conclaves)
-    .doc(id)
-    .collection(collections.attendance)
-    .get();
-
-  const userIds = [...new Set(snap.docs.map(d => d.data().userId).filter(Boolean))];
-  const users = await fetchUsers(userIds);
-
-  const list = snap.docs.map(doc => {
-    const data = doc.data();
-    const user = users.get(data.userId);
-    return {
-      id: doc.id,
-      userId: data.userId,
-      userName: user?.name || data.name || "Member",
-      userCategory: user?.businessCategory || "BNI Member",
-      roundNumber: data.roundNumber || 1,
-      tableNumber: data.tableNumber || null,
-      isPresent: !!data.isPresent,
-      source: data.source || "self",
-      markedBy: data.markedBy || data.userId,
-      markedAt: data.markedAt ? toDate(data.markedAt)?.toISOString() : null,
-    };
-  });
-
-  res.json(list);
+  res.json(await referralsSvc.listAttendanceForAdmin(req.params.id));
 }
 
 // ---- Superadmin Regions CRUD ----------------------------------------------
 
 export async function listRegions(_req: AuthedRequest, res: Response) {
-  const snap = await db.collection(collections.regions).get();
-  let regionsList = snap.docs.map(doc => ({ id: doc.id, ...doc.data() as any }));
-
-  if (snap.empty) {
-    const defaults = ["Guntur Region", "Vijayawada Region", "Visakhapatnam Region", "Singapore Metro"];
-    const batch = db.batch();
-    for (const name of defaults) {
-      const ref = db.collection(collections.regions).doc();
-      batch.set(ref, {
-        name,
-        status: "Active",
-        createdAt: new Date(),
-        membersCount: 0,
-        conclavesCount: 0
-      });
-    }
-    await batch.commit();
-    const newSnap = await db.collection(collections.regions).get();
-    regionsList = newSnap.docs.map(doc => ({ id: doc.id, ...doc.data() as any }));
-  }
-
-  // Fetch conclaves & users to calculate counts dynamically
-  const [conclavesSnap, usersSnap] = await Promise.all([
-    db.collection(collections.conclaves).get(),
-    db.collection(collections.users).get()
-  ]);
-
-  // Map of region name -> conclaves count
-  const conclaveCounts: Record<string, number> = {};
-  conclavesSnap.docs.forEach(doc => {
-    const data = doc.data();
-    const reg = data.region || "Global";
-    conclaveCounts[reg] = (conclaveCounts[reg] || 0) + 1;
-  });
-
-  // Map of region name -> members count
-  const memberCounts: Record<string, number> = {};
-  usersSnap.docs.forEach(doc => {
-    const data = doc.data();
-    const loc = data.location;
-    const reg = data.region || (loc ? (typeof loc === "object" ? loc.place : loc) : undefined) || "Global";
-    memberCounts[reg] = (memberCounts[reg] || 0) + 1;
-  });
-
-  // Attach counts to regions list
-  const list = regionsList.map(r => ({
-    ...r,
-    conclavesCount: conclaveCounts[r.name] || 0,
-    membersCount: memberCounts[r.name] || 0
-  }));
-
-  res.json(list);
+  res.json(await regionsService.listRegions());
 }
 
 export async function createRegion(req: AuthedRequest, res: Response) {
-  const { name, status } = req.body ?? {};
-  if (!name) {
-    return res.status(400).json({ error: "Region name is required." });
-  }
-  const docRef = await db.collection(collections.regions).add({
-    name,
-    status: status || "Active",
-    createdAt: new Date(),
-    membersCount: 0,
-    conclavesCount: 0
-  });
-  res.status(201).json({ id: docRef.id, message: "Region created successfully." });
+  const { id } = await regionsService.createRegion(req.body ?? {});
+  res.status(201).json({ id, message: "Region created successfully." });
 }
 
 export async function updateRegion(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  const { name, status } = req.body ?? {};
-  const updateData: any = {};
-  if (name !== undefined) updateData.name = name;
-  if (status !== undefined) updateData.status = status;
-  await db.collection(collections.regions).doc(id).update(updateData);
+  await regionsService.updateRegion(req.params.id, req.body ?? {});
   res.json({ message: "Region updated successfully." });
 }
 
 export async function deleteRegion(req: AuthedRequest, res: Response) {
-  const { id } = req.params;
-  await db.collection(collections.regions).doc(id).delete();
+  await regionsService.deleteRegion(req.params.id);
   res.json({ message: "Region deleted successfully." });
-}
-
-
-// ---- Who may manage which admin account ------------------------------------
-const ADMIN_ROLES = new Set(["coordinator", "admin", "superadmin"]);
-
-/** Throws 403 unless the caller may manage an account with `targetRole`. */
-async function assertCanManage(req: AuthedRequest, targetRole: string) {
-  const actorRole = await adminRoleOf(req.uid);
-  if (!canManage(actorRole, targetRole)) {
-    throw ApiError.forbidden(`A ${actorRole ?? "non-admin"} can't manage ${targetRole} accounts.`);
-  }
-}
-async function targetRoleOf(uid: string): Promise<string> {
-  const doc = await db.collection(collections.admins).doc(uid).get();
-  if (!doc.exists) throw ApiError.notFound("Admin account not found.");
-  return String(doc.data()?.role ?? "coordinator").toLowerCase();
 }
 
 // ---- Superadmin Coordinators CRUD -----------------------------------------
 
-export async function listCoordinators(_req: AuthedRequest, res: Response) {
-  const snap = await db.collection(collections.admins).get();
-  const list = snap.docs
-    .map(doc => {
-      const data = doc.data() as any;
-      return {
-        uid: doc.id,
-        ...data,
-        grantedAt: data.grantedAt ? toDate(data.grantedAt)?.toISOString() : null
-      };
-    })
-    .filter(admin => admin.role !== "superadmin" && admin.email !== "superadmin@bni.com");
-  res.json(list);
+export async function listCoordinators(req: AuthedRequest, res: Response) {
+  res.json(await adminsService.listAdmins(req.admin!));
 }
 
 export async function createCoordinator(req: AuthedRequest, res: Response) {
-  const { email, password, name, mobile, region, status, role } = req.body ?? {};
-  if (!email || !password || !name) {
-    return res.status(400).json({ error: "Email, password, and name are required." });
-  }
-  const newRole = String(role || "coordinator").toLowerCase();
-  if (!ADMIN_ROLES.has(newRole)) throw ApiError.badRequest("role must be coordinator, admin or superadmin.");
-  await assertCanManage(req, newRole);
-
-  let formattedPhone = mobile ? mobile.trim() : "";
-  if (formattedPhone) {
-    if (!formattedPhone.startsWith("+")) {
-      if (formattedPhone.length === 10 && /^\d+$/.test(formattedPhone)) {
-        formattedPhone = `+91${formattedPhone}`;
-      }
-    }
-  }
-
-  let uid: string;
-  try {
-    const user = await auth.createUser({
-      email,
-      password,
-      displayName: name,
-      emailVerified: true,
-      ...(formattedPhone ? { phoneNumber: formattedPhone } : {})
-    });
-    uid = user.uid;
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message || "Failed to create Auth user." });
-  }
-
-  await db.collection(collections.admins).doc(uid).set({
-    email,
-    name,
-    mobile: mobile || "",
-    region: region || "Guntur Region",
-    status: status || "Active",
-    role: newRole,
-    grantedAt: new Date()
-  });
+  const { uid } = await adminsService.createAdmin(req.admin!, req.body ?? {});
   res.status(201).json({ uid, message: "Coordinator created successfully." });
 }
 
 export async function updateCoordinator(req: AuthedRequest, res: Response) {
-  const { uid } = req.params;
-  const { name, mobile, region, status, role } = req.body ?? {};
-  await assertCanManage(req, await targetRoleOf(uid));
-  if (role !== undefined) {
-    const r = String(role).toLowerCase();
-    if (!ADMIN_ROLES.has(r)) throw ApiError.badRequest("role must be coordinator, admin or superadmin.");
-    await assertCanManage(req, r);
-    if (uid === req.uid) throw ApiError.badRequest("You can't change your own role.");
-  }
-  const updateData: any = {};
-  if (name !== undefined) updateData.name = name;
-  if (mobile !== undefined) updateData.mobile = mobile;
-  if (region !== undefined) updateData.region = region;
-  if (status !== undefined) updateData.status = status;
-  if (role !== undefined) updateData.role = role;
-
-  await db.collection(collections.admins).doc(uid).update(updateData);
-  
-  const authUpdates: any = {};
-  if (name) authUpdates.displayName = name;
-  
-  if (mobile !== undefined) {
-    let formattedPhone = mobile.trim();
-    if (formattedPhone) {
-      if (!formattedPhone.startsWith("+")) {
-        if (formattedPhone.length === 10 && /^\d+$/.test(formattedPhone)) {
-          formattedPhone = `+91${formattedPhone}`;
-        }
-      }
-      authUpdates.phoneNumber = formattedPhone;
-    } else {
-      authUpdates.phoneNumber = null;
-    }
-  }
-
-  if (Object.keys(authUpdates).length > 0) {
-    try {
-      await auth.updateUser(uid, authUpdates);
-    } catch (err: any) {
-      console.warn("Failed to update user profile in Firebase Auth:", err.message);
-    }
-  }
-  
+  await adminsService.updateAdmin(req.admin!, req.params.uid, req.body ?? {});
   res.json({ message: "Coordinator updated successfully." });
 }
 
 export async function resetCoordinatorPassword(req: AuthedRequest, res: Response) {
-  const { uid } = req.params;
-  const { password } = req.body ?? {};
-  if (!password || String(password).length < 8) {
-    return res.status(400).json({ error: "Password must be at least 8 characters." });
-  }
-  await assertCanManage(req, await targetRoleOf(uid));
-  await auth.updateUser(uid, { password });
+  await adminsService.resetAdminPassword(req.admin!, req.params.uid, req.body?.password);
   res.json({ message: "Password reset successfully." });
 }
 
 export async function deleteCoordinator(req: AuthedRequest, res: Response) {
-  const { uid } = req.params;
-  if (uid === req.uid) throw ApiError.badRequest("You can't remove your own access.");
-  await assertCanManage(req, await targetRoleOf(uid));
-  await db.collection(collections.admins).doc(uid).delete();
-  try {
-    await auth.deleteUser(uid);
-  } catch (err) {
-    console.warn("Failed to delete Auth user:", err);
-  }
+  await adminsService.deleteAdmin(req.admin!, req.params.uid);
   res.json({ message: "Coordinator access revoked successfully." });
 }
 
 export async function listAllUsers(_req: AuthedRequest, res: Response) {
-  const snap = await db.collection(collections.users).get();
-  const list = snap.docs
-    .map(doc => {
-      const data = doc.data();
-      const loc = data.location;
-      const regionStr = data.region || (loc ? (typeof loc === "object" ? loc.place : loc) : undefined) || "Global";
-      return {
-        id: doc.id,
-        name: data.name || "Unknown Member",
-        company: data.businessName || data.company || "",
-        category: data.businessCategory || data.category || "",
-        region: regionStr,
-        chapter: data.chapter || "",
-        status: data.lastLoginAt ? "Active" : "Inactive",
-        email: data.email || "",
-        mobile: data.phone || data.mobile || ""
-      };
-    })
-    .filter(u => u.email !== "superadmin@bni.com");
-  res.json(list);
+  res.json(await usersService.listAllMembersForAdmin());
 }
 
 export async function deleteConclave(req: AuthedRequest, res: Response) {
@@ -783,14 +293,7 @@ export async function deleteConclave(req: AuthedRequest, res: Response) {
 }
 
 export async function setUserRole(req: AuthedRequest, res: Response) {
-  const { uid } = req.params;
-  const { role } = req.body ?? {};
-  if (!role) {
-    return res.status(400).json({ error: "Role is required." });
-  }
-  await db.collection(collections.users).doc(uid).set({ role }, { merge: true });
+  await usersService.setUserRole(req.params.uid, req.body?.role);
   res.json({ message: "User role updated successfully." });
 }
-
-
 

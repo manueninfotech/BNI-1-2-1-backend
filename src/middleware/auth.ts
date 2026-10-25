@@ -1,8 +1,10 @@
 import type { NextFunction, Request, Response } from "express";
 import type { DecodedIdToken } from "firebase-admin/auth";
-import { auth, db, collections } from "../config/firebase.js";
+import { auth } from "../config/firebase.js";
+import { findActiveAdmin, type AdminRecord } from "../services/admins.service.js";
 import { env } from "../config/env.js";
 import { ApiError } from "./errors.js";
+import { setActor } from "../observability/context.js";
 
 /**
  * A request that has passed through requireUser / requireAdmin.
@@ -18,6 +20,8 @@ export interface AuthedRequest extends Omit<Request, "params"> {
   email?: string;
   /** Whether Firebase has verified that email (false/undefined for unverified sign-ups). */
   emailVerified?: boolean;
+  /** Set by requireAdmin: the caller's allowlist record (role, region, …). */
+  admin?: AdminRecord;
   params: Record<string, string>;
 }
 
@@ -72,13 +76,16 @@ async function insecureDevIdentity(req: Request): Promise<{ uid: string; email?:
  */
 export async function requireUser(req: Request, _res: Response, next: NextFunction) {
   if (env.allowInsecureAdmin) {
-    Object.assign(req, await insecureDevIdentity(req));
+    const dev = await insecureDevIdentity(req);
+    Object.assign(req, dev);
+    setActor({ uid: dev.uid, role: "member", email: dev.email ?? null });
     return next();
   }
   const decoded = await verify(bearerToken(req));
   (req as AuthedRequest).uid = decoded.uid;
   (req as AuthedRequest).email = decoded.email;
   (req as AuthedRequest).emailVerified = decoded.email_verified;
+  setActor({ uid: decoded.uid, role: "member", email: decoded.email ?? null, name: decoded.name ?? null });
   next();
 }
 
@@ -97,43 +104,27 @@ export async function requireUser(req: Request, _res: Response, next: NextFuncti
  * Throws (→ 503) if the lookup itself fails: an outage must deny access, never
  * grant it.
  */
-type AdminRecord = { role: string };
-
 const adminCache = new Map<string, { until: number; record: AdminRecord }>();
 const ADMIN_TTL_MS = 60_000;
+
+/** Test hook: forget cached allowlist lookups. */
+export function clearAdminCache() {
+  adminCache.clear();
+}
 
 async function adminRecord(uid: string, email?: string, emailVerified?: boolean): Promise<AdminRecord | null> {
   const cached = adminCache.get(uid);
   if (cached && Date.now() < cached.until) return cached.record;
-
   try {
-    const byUid = await db.collection(collections.admins).doc(uid).get();
-    let data = byUid.exists ? byUid.data() : undefined;
-
-    if (!data && email && emailVerified) {
-      const byEmail = await db
-        .collection(collections.admins)
-        .where("email", "==", email.toLowerCase().trim())
-        .limit(1)
-        .get();
-      if (!byEmail.empty) {
-        data = byEmail.docs[0].data();
-        // Link the record to this uid so later lookups hit the fast path.
-        await db.collection(collections.admins).doc(uid)
-          .set({ ...data, uid, updatedAt: new Date() }, { merge: true })
-          .catch(() => {});
-      }
-    }
-
-    if (!data) {
+    const record = await findActiveAdmin(uid, email, emailVerified);
+    if (!record) {
       adminCache.delete(uid);
       return null;
     }
-    const record = { role: String(data.role ?? "admin").toLowerCase() };
     adminCache.set(uid, { until: Date.now() + ADMIN_TTL_MS, record });
     return record;
   } catch (err) {
-    console.error("Admin allowlist lookup failed:", (err as Error)?.message ?? err);
+    console.error(JSON.stringify({ level: "error", msg: "admin allowlist lookup failed", err: (err as Error)?.message }));
     throw new ApiError(503, "Couldn't verify admin access right now. Please try again.");
   }
 }
@@ -150,13 +141,21 @@ export async function isAdmin(uid: string, email?: string, emailVerified?: boole
  */
 export async function requireAdmin(req: Request, _res: Response, next: NextFunction) {
   if (env.allowInsecureAdmin) {
-    Object.assign(req, await insecureDevIdentity(req));
+    const dev = await insecureDevIdentity(req);
+    Object.assign(req, dev);
+    setActor({ uid: dev.uid, role: "superadmin", email: dev.email ?? null, name: "insecure-dev" });
+    (req as AuthedRequest).admin = { uid: dev.uid, role: "superadmin", email: dev.email ?? "", name: "insecure-dev", region: null, status: "Active" };
     return next();
   }
   const decoded = await verify(bearerToken(req));
-  if (!(await adminRecord(decoded.uid, decoded.email, decoded.email_verified))) {
+  // Record who is trying before deciding, so a refused attempt is attributed.
+  setActor({ uid: decoded.uid, role: "member", email: decoded.email ?? null, name: decoded.name ?? null });
+  const record = await adminRecord(decoded.uid, decoded.email, decoded.email_verified);
+  if (!record) {
     throw ApiError.forbidden("You are not an administrator.");
   }
+  setActor({ uid: decoded.uid, role: record.role, email: record.email, name: record.name });
+  (req as AuthedRequest).admin = record;
   (req as AuthedRequest).uid = decoded.uid;
   (req as AuthedRequest).email = decoded.email;
   next();
@@ -168,34 +167,25 @@ export async function requireAdmin(req: Request, _res: Response, next: NextFunct
  */
 export async function requireSuperadmin(req: Request, _res: Response, next: NextFunction) {
   if (env.allowInsecureAdmin) return next();
-  const { uid } = req as AuthedRequest;
-  const record = await adminRecord(uid);
+  const record = (req as AuthedRequest).admin ?? (await adminRecord((req as AuthedRequest).uid));
   if (record?.role !== "superadmin") {
     throw ApiError.forbidden("This area is restricted to the platform superadmin.");
   }
   next();
 }
 
-/** The caller's stored admin role ("superadmin" | "admin" | "coordinator"), or null. */
-export async function adminRoleOf(uid: string): Promise<string | null> {
-  if (env.allowInsecureAdmin) return "superadmin";
-  return (await adminRecord(uid))?.role ?? null;
-}
-
-/** May an account with role `actor` manage (create/edit/reset/delete) one with role `target`? */
-export function canManage(actor: string | null, target: string): boolean {
-  return actor === "superadmin" || (actor === "admin" && target === "coordinator");
-}
-
 /**
- * Gates a route to specific admin roles (e.g. keep coordinators out of account
- * and region management). Mounted AFTER requireAdmin.
+ * Gates a route to specific admin roles (e.g. keep coordinators out of the
+ * platform-wide audit log). Mounted AFTER requireAdmin.
  */
 export function requireRole(...roles: string[]) {
   const allowed = new Set(roles.map((r) => r.toLowerCase()));
   return async (req: Request, _res: Response, next: NextFunction) => {
-    const role = await adminRoleOf((req as AuthedRequest).uid);
-    if (!role || !allowed.has(role)) throw ApiError.forbidden("You don't have access to this area.");
+    if (env.allowInsecureAdmin) return next();
+    const record = (req as AuthedRequest).admin ?? (await adminRecord((req as AuthedRequest).uid));
+    if (!record || !allowed.has(record.role)) {
+      throw ApiError.forbidden("You don't have access to this area.");
+    }
     next();
   };
 }
