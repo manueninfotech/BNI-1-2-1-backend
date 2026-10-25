@@ -187,6 +187,6 @@ describe("payment ledger (webhook)", () => {
     await pgdb.insert(registrations).values({ conclaveId: id, userId: "m1", paymentStatus: "paid", payment: { method: "online", amount: 500 } });
     await pgdb.insert(payments).values({ paymentId: "pf", conclaveId: id, uid: "m2", status: "failed", amount: 500 });
     const v = await pay.getConclavePayments(id);
-    expect(v.counts).toEqual({ paid: 1, pending: 0, failed: 1, total: 1 });
+    expect(v.counts).toEqual({ paid: 1, free: 0, pending: 0, failed: 1, total: 1 });
   });
 });
