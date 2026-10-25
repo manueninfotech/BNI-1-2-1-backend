@@ -480,6 +480,8 @@ export async function getOwnProfile(uid: string) {
   return {
     uid: u.uid,
     name: u.name,
+    /** Their own sign-in address (synthetic for phone accounts). */
+    identifier: u.identifier ?? "",
     email: u.email ?? "",
     phone: u.phone ?? "",
     mobile: u.phone?.slice(-10) ?? "",

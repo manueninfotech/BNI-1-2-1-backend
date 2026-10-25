@@ -33,7 +33,7 @@ const send = (method: string, path: string, body: unknown, uid = "m1") =>
 
 beforeAll(async () => {
   await pgdb.execute(sql`TRUNCATE conclaves, users, settings CASCADE`);
-  await pgdb.insert(users).values({ uid: "m1", name: "Asha", phone: "+919000000001" });
+  await pgdb.insert(users).values({ uid: "m1", name: "Asha", phone: "+919000000001", identifier: "919000000001@bni121.conclave" });
   const [c] = await pgdb
     .insert(conclaves)
     .values({ name: "Live", startDate: new Date(), status: "running", currentRound: 1, currentRoundStartedAt: new Date(), participants: [{ id: 1, name: "B", phone: "+919999999999", _originalUid: "b" }] })
@@ -68,7 +68,7 @@ describe("app data endpoints", () => {
   it("profile: full own profile, extended fields editable, photo set and removed", async () => {
     await send("PUT", "/me", { lookingFor: "Exporters", canOffer: "Glass", membership: "Gold" });
     const p = await (await get("/me/profile")).json();
-    expect(p).toMatchObject({ name: "Asha", phone: "+919000000001", lookingFor: "Exporters", canOffer: "Glass", membership: "Gold" });
+    expect(p).toMatchObject({ name: "Asha", phone: "+919000000001", identifier: "919000000001@bni121.conclave", lookingFor: "Exporters", canOffer: "Glass", membership: "Gold" });
 
     const png = `data:image/png;base64,${Buffer.from("png").toString("base64")}`;
     const set: any = await (await send("PUT", "/me/photo", { dataUrl: png })).json();
