@@ -56,6 +56,12 @@ router.post("/conclaves/:id/generate-schedule", asyncHandler(c.generate));
 // People
 router.get("/conclaves/:id/registrations", asyncHandler(c.registrations));
 router.post("/conclaves/:id/registrations/:uid/role", asyncHandler(c.setRole));
+router.get("/conclaves/:id/permissions", asyncHandler(c.getMemberPermissions));
+router.put("/conclaves/:id/permissions", requireSuperadmin, asyncHandler(c.setMemberPermissions));
+router.post("/conclaves/:id/members", asyncHandler(c.addConclaveMember));
+router.put("/conclaves/:id/members/:uid", asyncHandler(c.updateConclaveMember));
+router.patch("/conclaves/:id/members/:uid", asyncHandler(c.updateConclaveMember));
+router.delete("/conclaves/:id/members/:uid", asyncHandler(c.removeConclaveMember));
 
 // Dashboard
 router.get("/conclaves/:id/stats", asyncHandler(c.statistics));

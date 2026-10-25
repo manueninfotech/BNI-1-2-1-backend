@@ -14,6 +14,27 @@ import * as categories from "../services/categories.service.js";
 import * as settings from "../services/settings.service.js";
 import * as feedback from "../services/feedback.service.js";
 import * as payments from "../services/payments.service.js";
+import * as members from "../services/conclaveMembers.service.js";
+
+// --- Conclave members (admin add / edit / remove) -----------------------------
+
+export async function getMemberPermissions(req: AuthedRequest, res: Response) {
+  res.json(await members.getPermissions(req.params.id, req.admin?.role));
+}
+export async function setMemberPermissions(req: AuthedRequest, res: Response) {
+  res.json(await members.setPermissions(req.params.id, req.body?.allowAdminAddMembers, req.admin?.role));
+}
+export async function addConclaveMember(req: AuthedRequest, res: Response) {
+  const result = await members.addMember(req.params.id, req.body ?? {}, { uid: req.uid, role: req.admin?.role, email: req.email });
+  res.status(201).json(result);
+}
+export async function updateConclaveMember(req: AuthedRequest, res: Response) {
+  res.json({ member: await members.updateMember(req.params.id, req.params.uid, req.body ?? {}, req.admin?.role) });
+}
+export async function removeConclaveMember(req: AuthedRequest, res: Response) {
+  await members.removeMember(req.params.id, req.params.uid, req.admin?.role);
+  res.json({ message: "Member removed from the conclave." });
+}
 
 // --- Payments / revenue ------------------------------------------------------
 

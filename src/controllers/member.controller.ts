@@ -4,7 +4,7 @@ import * as registration from "../services/registration.service.js";
 import * as sync from "../services/sync.service.js";
 import { getForMember, listForMember } from "../services/conclave.service.js";
 import { subscribe } from "../services/live.service.js";
-import { listCategories } from "../services/categories.service.js";
+import * as categoriesSvc from "../services/categories.service.js";
 import { getAutoLogoutHours, getRoundTiming } from "../services/settings.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
 import * as feedback from "../services/feedback.service.js";
@@ -163,7 +163,7 @@ export async function resolveIdentifier(req: AuthedRequest, res: Response) {
 /** Everything the app used to live-read from Firestore `settings/*`. */
 export async function appConfig(_req: AuthedRequest, res: Response) {
   const [categories, roundTiming, autoLogoutHours] = await Promise.all([
-    listCategories(),
+    categoriesSvc.listCategories(),
     getRoundTiming(),
     getAutoLogoutHours(),
   ]);
@@ -192,4 +192,9 @@ export async function setMyPhoto(req: AuthedRequest, res: Response) {
 export async function removeMyPhoto(req: AuthedRequest, res: Response) {
   await users.removePhoto(req.uid);
   res.json({ ok: true });
+}
+
+/** The business categories a member can pick from (web sign-up and profile). */
+export async function listCategories(_req: AuthedRequest, res: Response) {
+  res.json({ categories: await categoriesSvc.listCategories() });
 }

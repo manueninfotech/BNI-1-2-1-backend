@@ -339,13 +339,26 @@ export async function resolveSignInAddress(rawInput: unknown): Promise<string> {
 
 /** Every member for the admin Members page. */
 export async function listAllMembersForAdmin() {
-  const rows = await pgdb.select().from(users).orderBy(asc(users.name));
-  return rows.map((d) => ({
+  const [rows, adminRows, regRegions] = await Promise.all([
+    pgdb.select().from(users).orderBy(asc(users.name)),
+    pgdb.select({ uid: admins.uid }).from(admins),
+    // A member with no region of their own belongs to the region of the
+    // conclave they last registered for.
+    pgdb
+      .select({ uid: registrations.userId, region: conclaves.region })
+      .from(registrations)
+      .innerJoin(conclaves, eq(conclaves.id, registrations.conclaveId))
+      .orderBy(asc(registrations.registeredAt)),
+  ]);
+  // Admin accounts get a profile row when they sign in; they are not members.
+  const adminUids = new Set(adminRows.map((a) => a.uid));
+  const regionByUid = new Map(regRegions.filter((r) => r.region).map((r) => [r.uid, r.region!]));
+  return rows.filter((d) => !adminUids.has(d.uid)).map((d) => ({
     id: d.uid,
-    name: d.name || "Unknown Member",
+    name: d.name || "Sign-up not finished",
     company: d.company ?? "",
     category: d.category ?? "",
-    region: d.region || d.location || "Global",
+    region: d.region || regionByUid.get(d.uid) || d.location || "",
     chapter: d.chapter ?? "",
     status: d.lastLoginAt ? "Active" : "Inactive",
     email: d.email ?? "",
@@ -425,15 +438,20 @@ export interface Registrant {
   state?: string;
   country?: string;
   location?: unknown;
+  tableNumber?: number | null;
+  status?: string | null;
+  paymentStatus?: string | null;
+  payment?: Record<string, unknown> | null;
   createdAt?: string | null;
   isActive: boolean;
   lastLoginAt: string | null;
 }
 
 export async function listRegistrants(conclaveId: string): Promise<Registrant[]> {
-  const [regs, autoLogoutHours] = await Promise.all([
+  const [regs, autoLogoutHours, [conclave]] = await Promise.all([
     pgdb.select().from(registrations).where(eq(registrations.conclaveId, conclaveId)),
     getAutoLogoutHours(),
+    pgdb.select({ region: conclaves.region }).from(conclaves).where(eq(conclaves.id, conclaveId)),
   ]);
   const profiles = await fetchUsers(regs.map((r) => r.userId));
   const now = new Date();
@@ -457,7 +475,11 @@ export async function listRegistrants(conclaveId: string): Promise<Registrant[]>
         category,
         businessCategory: category,
         chapter: u?.chapter ?? reg.chapter ?? "",
-        region: u?.region ?? reg.region ?? "",
+        region: u?.region || reg.region || conclave?.region || "",
+        tableNumber: reg.tableNumber ?? null,
+        status: reg.status ?? null,
+        paymentStatus: reg.paymentStatus ?? null,
+        payment: reg.payment ?? null,
         state: u?.state ?? reg.state ?? "",
         country: u?.country ?? reg.country ?? "",
         location: u?.location ?? "",
