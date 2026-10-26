@@ -52,10 +52,18 @@ export const paymentOrderLimiter = rateLimit({
   message: { error: "Too many payment attempts. Please wait a few minutes." },
 });
 
-/** Everything else: comfortably above real use, low enough to stop a script. */
+/**
+ * Everything else: comfortably above real use, low enough to stop a script.
+ *
+ * This runs before sign-in is checked, so it counts per network address — and
+ * a whole venue (one Wi-Fi, or a mobile carrier's shared address) can be one
+ * address. 300 phones each syncing every 30s, checking in every 2 minutes and
+ * opening screens is ~1,500 requests a minute; the per-member limits on the
+ * expensive routes (sync, payments) still apply on top.
+ */
 export const generalLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 1_000,
+  limit: 6_000,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   keyGenerator: keyByUser,

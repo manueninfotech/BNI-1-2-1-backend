@@ -198,3 +198,10 @@ export async function removeMyPhoto(req: AuthedRequest, res: Response) {
 export async function listCategories(_req: AuthedRequest, res: Response) {
   res.json({ categories: await categoriesSvc.listCategories() });
 }
+
+/** The app is open / closed on this member's phone (presence, not a login). */
+export async function presence(req: AuthedRequest, res: Response) {
+  res.locals.skipRequestAudit = true;
+  await users.setPresence(req.uid, req.body?.state);
+  res.status(204).end();
+}

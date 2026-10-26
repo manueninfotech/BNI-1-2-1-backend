@@ -60,9 +60,41 @@ export async function displayName(uid: string): Promise<string> {
  * rather than phones reporting in, because at the venue the phones may not be
  * able to reach anything.
  */
-export function isActiveUser(user: Pick<UserRow, "lastLoginAt"> | undefined | null, autoLogoutHours: number, now: Date): boolean {
-  if (!user?.lastLoginAt) return false;
-  return now.getTime() - user.lastLoginAt.getTime() < autoLogoutHours * 3_600_000;
+/**
+ * "Present": opened the app within the active window (the `autoLogoutHours`
+ * setting, default 5). This is who the table generator seats when the admin
+ * asks for active members only — the people actually at the venue today, even
+ * with the phone in their pocket. Nobody is logged out for it any more.
+ */
+export function isActiveUser(
+  user: Pick<UserRow, "lastLoginAt"> & Partial<Pick<UserRow, "lastActiveAt">> | undefined | null,
+  autoLogoutHours: number,
+  now: Date,
+): boolean {
+  const seen = Math.max(user?.lastLoginAt?.getTime() ?? 0, user?.lastActiveAt?.getTime() ?? 0);
+  if (!seen) return false;
+  return now.getTime() - seen < autoLogoutHours * 3_600_000;
+}
+
+/** The app checks in every 2 minutes while open; silence beyond this = closed. */
+export const ONLINE_WINDOW_MS = 5 * 60_000;
+
+/** "Online now": the app is open on their phone right now. */
+export function isOnlineNow(user: Pick<UserRow, "isActive" | "lastActiveAt"> | undefined | null, now: Date): boolean {
+  if (!user?.isActive || !user.lastActiveAt) return false;
+  return now.getTime() - user.lastActiveAt.getTime() < ONLINE_WINDOW_MS;
+}
+
+/**
+ * The app reports itself open ("foreground", repeated every 2 minutes) or
+ * closed ("background"). No audit row: this is presence, not a change.
+ */
+export async function setPresence(uid: string, state: unknown) {
+  if (state !== "foreground" && state !== "background") throw ApiError.badRequest('state must be "foreground" or "background".');
+  await pgdb
+    .update(users)
+    .set({ lastActiveAt: new Date(), isActive: state === "foreground" })
+    .where(eq(users.uid, uid));
 }
 
 // ---------------------------------------------------------------------------
@@ -100,7 +132,7 @@ export async function touchActivity(uid: string) {
   const now = new Date();
   await pgdb
     .update(users)
-    .set({ lastLoginAt: now, lastActiveAt: now, isActive: true })
+    .set({ lastLoginAt: now, lastActiveAt: now })
     .where(eq(users.uid, uid))
     .catch(() => {});
 }
@@ -339,6 +371,7 @@ export async function resolveSignInAddress(rawInput: unknown): Promise<string> {
 
 /** Every member for the admin Members page. */
 export async function listAllMembersForAdmin() {
+  const now = new Date();
   const [rows, adminRows, regRegions] = await Promise.all([
     pgdb.select().from(users).orderBy(asc(users.name)),
     pgdb.select({ uid: admins.uid }).from(admins),
@@ -360,7 +393,9 @@ export async function listAllMembersForAdmin() {
     category: d.category ?? "",
     region: d.region || regionByUid.get(d.uid) || d.location || "",
     chapter: d.chapter ?? "",
-    status: d.lastLoginAt ? "Active" : "Inactive",
+    status: isOnlineNow(d, now) ? "Active" : "Inactive",
+    isOnline: isOnlineNow(d, now),
+    lastSeenAt: (d.lastActiveAt ?? d.lastLoginAt)?.toISOString() ?? null,
     email: d.email ?? "",
     mobile: d.phone ?? "",
     createdAt: d.createdAt?.toISOString() ?? null,
@@ -448,6 +483,8 @@ export interface Registrant {
   payment?: Record<string, unknown> | null;
   createdAt?: string | null;
   isActive: boolean;
+  isOnline: boolean;
+  lastSeenAt: string | null;
   lastLoginAt: string | null;
 }
 
@@ -490,6 +527,8 @@ export async function listRegistrants(conclaveId: string): Promise<Registrant[]>
         location: u?.location ?? "",
         createdAt: (u?.createdAt ?? reg.registeredAt)?.toISOString() ?? null,
         isActive: isActiveUser(u, autoLogoutHours, now),
+        isOnline: isOnlineNow(u, now),
+        lastSeenAt: (u?.lastActiveAt ?? u?.lastLoginAt)?.toISOString() ?? null,
         lastLoginAt: u?.lastLoginAt?.toISOString() ?? null,
       };
     })
