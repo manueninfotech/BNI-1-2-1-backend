@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { requireAdmin, requireRole, requireSuperadmin } from "../middleware/auth.js";
 import { queryAudit } from "../audit/audit.query.js";
+import { listActivity } from "../audit/activity.service.js";
+import type { AuthedRequest } from "../middleware/auth.js";
 import { requireConclaveAccess } from "../middleware/conclaveAccess.js";
 import { asyncHandler } from "../middleware/errors.js";
 import * as c from "../controllers/admin.controller.js";
@@ -74,11 +76,19 @@ router.get("/conclaves/:id/payments", asyncHandler(c.getConclavePayments));
 
 // Revenue — platform-wide, SUPERADMIN only.
 // Audit trail — who did what, when, from where (admins and superadmins only).
+// Raw audit rows (IPs, devices, every request) — superadmin only.
 router.get(
   "/audit",
-  requireRole("admin", "superadmin"),
+  requireSuperadmin,
   asyncHandler(async (req, res) => {
     res.json(await queryAudit(req.query));
+  }),
+);
+// The Activity page: changes only, region-scoped, with readable names.
+router.get(
+  "/activity",
+  asyncHandler(async (req, res) => {
+    res.json(await listActivity((req as AuthedRequest).admin, req.query as Record<string, string>));
   }),
 );
 
