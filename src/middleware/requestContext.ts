@@ -46,6 +46,8 @@ export function requestContext(req: Request, res: Response, next: NextFunction) 
     const status = res.statusCode;
     const denied = status === 401 || status === 403;
     if (!MUTATING.has(req.method) && !denied) return;
+    // Presence check-ins arrive every 2 minutes from every open app: not worth a row each.
+    if (res.locals.skipRequestAudit && status < 400) return;
     // Route PATTERN (/api/admin/conclaves/:id), not the raw URL, so rows group.
     const route = (res.locals.auditRoute as string | undefined) ?? (`${req.baseUrl ?? ""}${(req as any).route?.path ?? ""}` || req.path);
     const params = ((res.locals.auditParams as Record<string, string> | undefined) ?? req.params ?? {}) as Record<string, string>;

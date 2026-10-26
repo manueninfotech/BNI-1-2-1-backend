@@ -15,6 +15,7 @@ router.post("/auth/resolve-identifier", asyncHandler(c.resolveIdentifier));
 router.use(requireUser);
 
 router.get("/me", asyncHandler(c.me));
+router.post("/me/presence", asyncHandler(c.presence));
 router.put("/me", asyncHandler(c.updateMe));
 router.patch("/me", asyncHandler(c.updateMe));
 router.delete("/me/account", asyncHandler(c.deleteAccount));
