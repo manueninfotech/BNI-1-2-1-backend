@@ -171,6 +171,7 @@ describe("member lists", () => {
     const list = await usersSvc.listAllMembersForAdmin();
     expect(list.map((m) => m.id)).toEqual(["m1"]);
     expect(list[0].region).toBe("Guntur");
+    expect(list[0].createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
     const [r] = await usersSvc.listRegistrants(id);
     expect(r).toMatchObject({ uid: "m1", region: "Guntur", tableNumber: 3, role: "captain" });
