@@ -191,7 +191,7 @@ export async function listTransactions(limit = 50): Promise<any> {
 export async function getConclavePayments(conclaveId: string): Promise<any> {
   const [rows, ledger, [conclave]] = await Promise.all([
     pgdb
-      .select({ r: registrations, u: { name: users.name, email: users.email, phone: users.phone } })
+      .select({ r: registrations, u: { name: users.name, email: users.email, phone: users.phone, photoUrl: users.photoUrl } })
       .from(registrations)
       .leftJoin(users, eq(users.uid, registrations.userId))
       .where(eq(registrations.conclaveId, conclaveId)),
@@ -209,6 +209,7 @@ export async function getConclavePayments(conclaveId: string): Promise<any> {
       name: r.name || u?.name || null,
       email: r.email || u?.email || null,
       phone: r.phone || u?.phone || null,
+      photoUrl: u?.photoUrl ?? null,
       registrationStatus: r.status ?? "pending",
       paymentStatus: r.paymentStatus ?? pay.status ?? (registrationFee === 0 ? "free" : r.status === "confirmed" ? "paid" : "pending"),
       paymentMethod: pay.method ?? null,

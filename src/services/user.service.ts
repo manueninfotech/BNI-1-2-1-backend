@@ -365,6 +365,7 @@ export async function listAllMembersForAdmin() {
     mobile: d.phone ?? "",
     createdAt: d.createdAt?.toISOString() ?? null,
     lastLoginAt: d.lastLoginAt?.toISOString() ?? null,
+    photoUrl: d.photoUrl ?? null,
   }));
 }
 
@@ -441,6 +442,7 @@ export interface Registrant {
   country?: string;
   location?: unknown;
   tableNumber?: number | null;
+  photoUrl?: string | null;
   status?: string | null;
   paymentStatus?: string | null;
   payment?: Record<string, unknown> | null;
@@ -479,6 +481,7 @@ export async function listRegistrants(conclaveId: string): Promise<Registrant[]>
         chapter: u?.chapter ?? reg.chapter ?? "",
         region: u?.region || reg.region || conclave?.region || "",
         tableNumber: reg.tableNumber ?? null,
+        photoUrl: u?.photoUrl ?? null,
         status: reg.status ?? null,
         paymentStatus: reg.paymentStatus ?? null,
         payment: reg.payment ?? null,
