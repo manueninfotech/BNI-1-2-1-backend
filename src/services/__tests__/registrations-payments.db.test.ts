@@ -190,3 +190,11 @@ describe("payment ledger (webhook)", () => {
     expect(v.counts).toEqual({ paid: 1, free: 0, pending: 0, failed: 1, total: 1 });
   });
 });
+
+describe("member limit", () => {
+  it("self-registration stops at the conclave's member limit", async () => {
+    const id = await conclave({ memberLimit: 1 });
+    await as("m1", () => reg.register(id, "m1"));
+    await expect(as("m2", () => reg.register(id, "m2"))).rejects.toThrow(/full/);
+  });
+});

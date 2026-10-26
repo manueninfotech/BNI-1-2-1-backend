@@ -137,9 +137,15 @@ export async function register(conclaveId: string, uid: string, details: Record<
   try {
     return await pgdb.transaction(async (tx) => {
       // Re-check under a lock: registration may have closed since the first check.
-      const [row] = await tx.select().from(conclaves).where(eq(conclaves.id, conclaveId)).for("share");
+      // Lock the conclave row (not just share it) so two last-seat
+      // registrations can't both pass the member-limit check.
+      const [row] = await tx.select().from(conclaves).where(eq(conclaves.id, conclaveId)).for("update");
       if (!row) throw ApiError.notFound("Conclave not found.");
       assertOpen(row);
+      if (row.memberLimit) {
+        const [{ n }] = await tx.select({ n: sql<number>`count(*)::int` }).from(registrations).where(eq(registrations.conclaveId, conclaveId));
+        if (n >= row.memberLimit) throw ApiError.conflict(`Sorry, this conclave is full (${row.memberLimit} members).`, { full: true });
+      }
 
       const [reg] = await tx
         .insert(registrations)

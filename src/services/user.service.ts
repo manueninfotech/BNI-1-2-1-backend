@@ -363,6 +363,8 @@ export async function listAllMembersForAdmin() {
     status: d.lastLoginAt ? "Active" : "Inactive",
     email: d.email ?? "",
     mobile: d.phone ?? "",
+    createdAt: d.createdAt?.toISOString() ?? null,
+    lastLoginAt: d.lastLoginAt?.toISOString() ?? null,
   }));
 }
 
