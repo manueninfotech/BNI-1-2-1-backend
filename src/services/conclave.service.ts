@@ -9,10 +9,10 @@ import {
   MIN_PERSONS_PER_TABLE,
   TERMINAL_STATUSES,
 } from "../domain/conclave.js";
-import { notifyConclave, notifyUser } from "./notification.service.js";
+import { notifyConclave, notifyUser, recordUserNotification } from "./notification.service.js";
 import { notifyConclaveChanged } from "./live.service.js";
 import { decodeDataUrl, deleteFile, uploadFile, type StoredFile } from "./storage.service.js";
-import { resolveNotification, getConclaveDefaults, getRoundTiming, type RoundTiming } from "./settings.service.js";
+import { resolveNotification, getConclaveDefaults, getRoundTiming, getCachedRoundTiming, getCachedConclaveDefaults, type RoundTiming } from "./settings.service.js";
 
 /**
  * Conclaves: lifecycle, registration window, and live rounds.
@@ -65,8 +65,8 @@ export function toView(row: ConclaveRow, registrationCount?: number) {
     chiefGuests: row.chiefGuests,
     agendaDocument: row.agendaDocument,
     allowAdminAddMembers: row.allowAdminAddMembers,
-    personsPerTable: row.personsPerTable,
-    roundCount: row.roundCount,
+    personsPerTable: row.personsPerTable ?? getCachedConclaveDefaults().personsPerTable,
+    roundCount: row.roundCount ?? getCachedConclaveDefaults().roundCount,
     seed: row.seed,
     schedule: row.schedule,
     participants: row.participants,
@@ -74,6 +74,10 @@ export function toView(row: ConclaveRow, registrationCount?: number) {
     warnings: row.warnings,
     snapshot: row.snapshot,
     isScheduleLocked: row.isScheduleLocked,
+    roundProgressionMode: row.roundProgressionMode ?? "manual",
+    roundDurationMinutes: row.roundDurationMinutes ?? getCachedConclaveDefaults().roundDurationMinutes,
+    roundExtensionSeconds: row.roundExtensionSeconds ?? 0,
+    roundTiming: getCachedRoundTiming(),
     currentRound: row.currentRound,
     currentRoundStartedAt: iso(row.currentRoundStartedAt),
     isRoundPaused: row.isRoundPaused,
@@ -222,30 +226,51 @@ export function validateConclaveDates(d: DateFields, opts: { isNew: boolean }) {
  */
 export function evaluateConclaveStatus(data: any): { status: string; isRegistrationOpen: boolean } {
   try {
-    const now = new Date();
-    if (data?.status && TERMINAL_STATUSES.has(data.status)) {
-      return { status: data.status, isRegistrationOpen: false };
+    const rawStatus = String(data?.status || "").trim();
+    const statusLower = rawStatus.toLowerCase();
+
+    // 1. Preserve terminal statuses (completed or cancelled) - never auto-reopen
+    if (statusLower === "completed" || statusLower === "cancelled") {
+      return {
+        status: statusLower === "completed" ? ConclaveStatus.completed : ConclaveStatus.cancelled,
+        isRegistrationOpen: false,
+      };
     }
-    const eventStart = toDate(data?.date) ?? toDate(data?.startDate);
-    const eventEnd = toDate(data?.endDate) ?? eventStart;
-    const startDateTime = combineDateTime(eventStart, data?.startTime, "start");
-    const endDateTime = combineDateTime(eventEnd, data?.endTime, "end");
-    const regStartDateTime = combineDateTime(toDate(data?.regStartDate), data?.regStartTime, "start");
-    const regEndDateTime = combineDateTime(toDate(data?.regEndDate), data?.regEndTime, "end");
 
-    if (endDateTime && now > endDateTime) return { status: ConclaveStatus.completed, isRegistrationOpen: false };
-    const hasLiveRounds = Number(data?.currentRound) > 0;
-    if (startDateTime && (now >= startDateTime || hasLiveRounds)) return { status: ConclaveStatus.running, isRegistrationOpen: false };
+    // 2. An admin-started conclave stays running until an admin explicitly finishes it!
+    if (statusLower === "running") {
+      return { status: ConclaveStatus.running, isRegistrationOpen: false };
+    }
 
-    const override = String(data?.registrationOverride ?? "").toLowerCase();
-    if (override === "open") return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
-    if (override === "closed") return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    // 3. Registrations are strictly closed once the conclave schedule is marked as locked!
+    if (data?.isScheduleLocked || statusLower === "locked") {
+      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    }
 
-    if (regStartDateTime && now < regStartDateTime) return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
-    if (regEndDateTime && now > regEndDateTime) return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    // 4. Admin registration override (Open / Closed)
+    const registrationOverride = String(data?.registrationOverride ?? "").toLowerCase();
+    if (registrationOverride === "open") {
+      return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
+    }
+    if (registrationOverride === "closed") {
+      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    }
+
+    // 5. If registration start date is in the future and not overridden:
+    const now = new Date();
+    const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
+    const regStartDateTime = combineDateTime(regStart, data?.regStartTime, "start");
+    if (regStartDateTime && now < regStartDateTime) {
+      return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
+    }
+
+    // 6. Registrations remain open up to the conclave status being marked as locked!
     return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
   } catch {
-    return { status: data?.status || ConclaveStatus.registrationOpen, isRegistrationOpen: data?.isRegistrationOpen ?? true };
+    return {
+      status: data?.status || ConclaveStatus.registrationOpen,
+      isRegistrationOpen: data?.isRegistrationOpen ?? true,
+    };
   }
 }
 
@@ -261,13 +286,27 @@ export function normalizeTime(val: unknown): string | null {
   return typeof val === "string" ? val.trim() : null;
 }
 
-/** Round length: admin-tuned talking cadence × table size, plus the transition. */
-export function roundDurationMs(personsPerTable: number | null | undefined, timing: RoundTiming, blockMinutes?: unknown): number {
+/** Round length: admin-tuned talking cadence × table size.
+ * If blockMinutes is configured in settings, round duration is blockMinutes (move timing = blockMinutes - speaking - referral).
+ * Otherwise, round duration is (speaking + referral) × seats + move buffer from settings.
+ */
+export function roundDurationMs(
+  personsPerTable: number | null | undefined,
+  timing: RoundTiming,
+  blockMinutes?: unknown,
+  extensionSeconds?: number | null,
+): number {
   const p = Math.max(1, Number(personsPerTable) || 1);
   const active = (timing.bioSeconds + timing.referralSeconds) * 1000 * p;
-  const block = Number(blockMinutes);
-  if (Number.isFinite(block) && block > 0) return active + Math.max(0, block * 60 * 1000 - active);
-  return active + timing.bufferSeconds * 1000;
+  const extMs = Math.max(0, (Number(extensionSeconds) || 0) * 1000);
+  const numBlock = Number(blockMinutes);
+
+  if (Number.isFinite(numBlock) && numBlock > 0) {
+    const baseBlockMs = numBlock * 60 * 1000;
+    return baseBlockMs + extMs;
+  }
+  const bufferMs = (timing.bufferSeconds || 0) * 1000;
+  return active + bufferMs + extMs;
 }
 
 const ALL_STATUSES = new Set<string>(Object.values(ConclaveStatus));
@@ -312,6 +351,7 @@ export interface CreateInput {
   chiefGuests?: unknown;
   personsPerTable?: number;
   roundCount?: number;
+  roundDurationMinutes?: number;
   memberLimit?: number;
   captainLimit?: number;
   region?: string;
@@ -326,6 +366,7 @@ export async function createConclave(input: CreateInput): Promise<string> {
   const defaults = await getConclaveDefaults();
   const personsPerTable = intInput(input.personsPerTable, defaults.personsPerTable, "personsPerTable");
   const roundCount = intInput(input.roundCount, defaults.roundCount, "roundCount");
+  const roundDurationMinutes = intInput(input.roundDurationMinutes, defaults.roundDurationMinutes || 15, "roundDurationMinutes");
   validateConfig(personsPerTable, roundCount);
   validateConclaveDates(input, { isNew: true });
 
@@ -353,6 +394,8 @@ export async function createConclave(input: CreateInput): Promise<string> {
     chiefGuests: Array.isArray(input.chiefGuests) ? input.chiefGuests : [],
     personsPerTable,
     roundCount,
+    roundDurationMinutes,
+    roundExtensionSeconds: 0,
     memberLimit: intInput(input.memberLimit, 100, "memberLimit") || 100,
     captainLimit: intInput(input.captainLimit, 12, "captainLimit") || 12,
     paymentDetails: input.paymentDetails ?? null,
@@ -423,6 +466,12 @@ export async function updateConclave(id: string, body: Record<string, any>): Pro
       u.personsPerTable = p;
       u.roundCount = r;
     }
+    if (body.roundDurationMinutes !== undefined) {
+      u.roundDurationMinutes = Math.max(5, Math.min(60, Number(body.roundDurationMinutes) || 15));
+    }
+    if (body.roundProgressionMode !== undefined) {
+      u.roundProgressionMode = body.roundProgressionMode === "automatic" ? "automatic" : "manual";
+    }
     if (!Object.keys(u).length) throw ApiError.badRequest("Nothing to update.");
 
     // Validate and evaluate the RESULT of the edit, so a partial change that
@@ -434,6 +483,7 @@ export async function updateConclave(id: string, body: Record<string, any>): Pro
     u.isRegistrationOpen = evaluated.isRegistrationOpen;
     return u;
   });
+  void notifyConclaveDetailsUpdated(id, before, after).catch(() => {});
   return Object.keys(auditChanges(before, after));
 }
 
@@ -444,6 +494,122 @@ function auditChanges(before: ConclaveRow, after: ConclaveRow) {
     if (JSON.stringify(before[k]) !== JSON.stringify(after[k])) out[k] = true;
   }
   return out;
+}
+
+/**
+ * Detects changes to key conclave details (name, date/postponed, time, venue, status)
+ * and notifies all registered members via FCM push + in-app inbox.
+ */
+export async function notifyConclaveDetailsUpdated(
+  conclaveId: string,
+  oldData: any,
+  updates: Record<string, unknown>
+): Promise<void> {
+  try {
+    const changes: string[] = [];
+    const conclaveName = String(updates.name || oldData.name || "BNI Conclave").trim();
+
+    // 1. Name change
+    if (updates.name !== undefined && String(updates.name).trim() !== String(oldData.name || "").trim()) {
+      changes.push(`Name changed to "${updates.name}"`);
+    }
+
+    // 2. Date change / Postponed
+    const oldDateObj = oldData.startDate || oldData.date ? new Date(oldData.startDate || oldData.date) : null;
+    const newDateObj = (updates.startDate || updates.date) ? new Date((updates.startDate || updates.date) as string | Date) : null;
+    if (newDateObj && oldDateObj && !isNaN(newDateObj.getTime()) && !isNaN(oldDateObj.getTime())) {
+      const oldDateStr = oldDateObj.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      const newDateStr = newDateObj.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      if (oldDateStr !== newDateStr) {
+        if (newDateObj.getTime() > oldDateObj.getTime()) {
+          changes.push(`Event Postponed: Rescheduled to ${newDateStr}`);
+        } else {
+          changes.push(`Date changed to ${newDateStr}`);
+        }
+      }
+    } else if (newDateObj && !oldDateObj && !isNaN(newDateObj.getTime())) {
+      const newDateStr = newDateObj.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      changes.push(`Date set to ${newDateStr}`);
+    }
+
+    // 3. Timing change
+    const oldStartTime = String(oldData.startTime || "").trim();
+    const newStartTime = updates.startTime !== undefined ? String(updates.startTime || "").trim() : oldStartTime;
+    const oldEndTime = String(oldData.endTime || "").trim();
+    const newEndTime = updates.endTime !== undefined ? String(updates.endTime || "").trim() : oldEndTime;
+
+    if ((updates.startTime !== undefined && newStartTime !== oldStartTime) ||
+      (updates.endTime !== undefined && newEndTime !== oldEndTime)) {
+      const formatTime = (t: string) => {
+        if (!t) return "";
+        const m = t.match(/^(\d{1,2}):(\d{2})/);
+        if (m) {
+          let h = parseInt(m[1], 10);
+          const mins = m[2];
+          const meridian = h >= 12 ? "PM" : "AM";
+          if (h > 12) h -= 12;
+          if (h === 0) h = 12;
+          return `${h}:${mins} ${meridian}`;
+        }
+        return t;
+      };
+      changes.push(`Time updated to ${formatTime(newStartTime || "TBD")} - ${formatTime(newEndTime || "TBD")}`);
+    }
+
+    // 4. Venue change
+    const oldVenue = String(oldData.venueLocation || oldData.venue || "").trim();
+    const newVenue = updates.venueLocation !== undefined ? String(updates.venueLocation || "").trim() : (updates.venue !== undefined ? String(updates.venue || "").trim() : oldVenue);
+    if ((updates.venueLocation !== undefined || updates.venue !== undefined) && newVenue !== oldVenue && newVenue) {
+      changes.push(`Venue moved to ${newVenue}`);
+    }
+
+    // 5. Status change
+    if (updates.status !== undefined && String(updates.status).toLowerCase() !== String(oldData.status || "").toLowerCase()) {
+      const s = String(updates.status).toLowerCase();
+      if (s === "cancelled") {
+        changes.push("Event has been CANCELLED");
+      } else if (s === "postponed") {
+        changes.push("Event has been marked as POSTPONED");
+      }
+    }
+
+    // If no attendee-facing details changed, do nothing
+    if (changes.length === 0) return;
+
+    const isPostponedOrCancelled = changes.some(c =>
+      c.toLowerCase().includes("postpone") || c.toLowerCase().includes("cancelled") || c.toLowerCase().includes("reschedule")
+    );
+    const title = isPostponedOrCancelled
+      ? `Important Update: ${conclaveName}`
+      : `Conclave Details Updated: ${conclaveName}`;
+    const body = changes.join(". ") + ".";
+
+    const payload = {
+      title,
+      body,
+      type: "conclave_updated",
+      data: {
+        conclaveId,
+        type: "conclave_updated",
+        name: conclaveName,
+        changes: changes.join("; "),
+        updatedAt: new Date().toISOString()
+      }
+    };
+
+    // 1. Broadcast to conclave FCM topic
+    void notifyConclave(conclaveId, payload).catch(() => { });
+
+    // 2. Notify all registered attendees
+    const attendees = await registrantsOf(conclaveId);
+    for (const att of attendees) {
+      const uid = att.userId;
+      void notifyUser(uid, payload, "general").catch(() => { });
+      void recordUserNotification(uid, payload).catch(() => { });
+    }
+  } catch (err) {
+    console.error(`Failed to notify attendees for conclave ${conclaveId} updates:`, err);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +630,7 @@ export async function setRegistrationOpen(id: string, open: boolean) {
 
 /** Call a conclave off before it starts. */
 export async function cancelConclave(id: string) {
-  await mutate(id, "conclave.cancel", (row) => {
+  const { before } = await mutate(id, "conclave.cancel", (row) => {
     if (row.status === ConclaveStatus.completed) throw ApiError.conflict("A completed conclave cannot be cancelled.");
     if (row.status === ConclaveStatus.running) {
       throw ApiError.conflict(
@@ -474,16 +640,18 @@ export async function cancelConclave(id: string) {
     if (row.status === ConclaveStatus.cancelled) throw ApiError.conflict("This conclave is already cancelled.");
     return { status: ConclaveStatus.cancelled, isRegistrationOpen: false, cancelledAt: new Date() };
   });
+  void notifyConclaveDetailsUpdated(id, before, { status: "cancelled" }).catch(() => {});
 }
 
 /** Publish (lock) the schedule, then tell everyone. */
 export async function lockConclaveSchedule(id: string) {
   await mutate(id, "conclave.lock_schedule", (row) => {
     if (!row.schedule) throw ApiError.badRequest("Generate a schedule before publishing it.");
-    const evaluated = evaluateConclaveStatus(toView(row));
     return {
       isScheduleLocked: true,
-      status: row.status === ConclaveStatus.completed ? ConclaveStatus.completed : evaluated.status,
+      isRegistrationOpen: false,
+      registrationOverride: "closed",
+      status: row.status === ConclaveStatus.completed ? ConclaveStatus.completed : ConclaveStatus.registrationClosed,
     };
   });
   // Best-effort: publishing is when members learn their schedule is ready and
@@ -563,10 +731,10 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
       if (roundNumber > (row.roundCount ?? 0)) throw ApiError.badRequest(`This conclave has only ${row.roundCount} rounds.`);
       if (TERMINAL_STATUSES.has(row.status)) throw ApiError.conflict(`This conclave is ${row.status}.`);
 
-      // Rounds auto-advance on the clock. Re-starting a round that has already
-      // begun or elapsed would reset the anchor and yank everyone back.
-      if (roundNumber > 1 && row.status === ConclaveStatus.running && row.currentRoundStartedAt && row.currentRound >= 1) {
-        const roundMs = roundDurationMs(row.personsPerTable, timing, row.legacy?.roundBlockMinutes);
+      // In automatic mode, rounds auto-advance on the clock.
+      // In manual mode, every round is explicitly started by the admin.
+      if (row.roundProgressionMode === "automatic" && roundNumber > 1 && row.status === ConclaveStatus.running && row.currentRoundStartedAt && row.currentRound >= 1) {
+        const roundMs = roundDurationMs(row.personsPerTable, timing, row.roundDurationMinutes ?? row.legacy?.roundBlockMinutes, row.roundExtensionSeconds);
         const liveRound = row.currentRound + Math.floor((Date.now() - row.currentRoundStartedAt.getTime()) / roundMs);
         if (roundNumber <= liveRound) {
           const shown = Math.min(liveRound, row.roundCount || liveRound);
@@ -601,6 +769,7 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
         isRoundPaused: false,
         roundPausedAt: null,
         roundElapsedMsBeforePause: null,
+        roundExtensionSeconds: 0,
         ...(roundNumber === 1 ? { startedBy: adminUid } : {}),
       };
     },
@@ -688,6 +857,59 @@ export async function closeRound(id: string) {
     });
   } catch {}
   return { closedRound: curRound, isEnded: true };
+}
+
+export async function setProgressionMode(id: string, mode: string): Promise<string> {
+  const normMode = mode === "automatic" ? "automatic" : "manual";
+  await mutate(
+    id,
+    "conclave.set_progression_mode",
+    async () => ({
+      roundProgressionMode: normMode,
+    }),
+    { mode: normMode },
+  );
+  return normMode;
+}
+
+/** Live extend active round time (e.g. +5 mins, +10 mins, +15 mins). */
+export async function extendRound(id: string, additionalSeconds: number, _adminUid: string): Promise<{ ok: boolean; roundExtensionSeconds: number }> {
+  if (!Number.isFinite(additionalSeconds) || additionalSeconds <= 0) {
+    throw ApiError.badRequest("additionalSeconds must be a positive number.");
+  }
+
+  const { row: before } = await getConclaveOrThrow(id);
+  if (before.status !== ConclaveStatus.running) {
+    throw ApiError.conflict(`Cannot extend a round when conclave is ${before.status}.`);
+  }
+
+  const currentExt = Number(before.roundExtensionSeconds) || 0;
+  const nextExt = currentExt + additionalSeconds;
+
+  await mutate(
+    id,
+    "round.extend",
+    async () => ({
+      roundExtensionSeconds: nextExt,
+    }),
+    { addedSeconds: additionalSeconds, totalExtensionSeconds: nextExt }
+  );
+
+  return { ok: true, roundExtensionSeconds: nextExt };
+}
+
+/** Set base round duration in minutes (e.g. 10m - 45m). */
+export async function setRoundDuration(id: string, durationMinutes: number): Promise<{ ok: boolean; roundDurationMinutes: number }> {
+  const mins = Math.max(5, Math.min(60, Math.round(Number(durationMinutes) || 15)));
+  await mutate(
+    id,
+    "conclave.set_round_duration",
+    async () => ({
+      roundDurationMinutes: mins,
+    }),
+    { roundDurationMinutes: mins }
+  );
+  return { ok: true, roundDurationMinutes: mins };
 }
 
 // ---------------------------------------------------------------------------

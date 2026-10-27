@@ -50,7 +50,8 @@ export class ScheduleIndex {
   constructor(schedule: StoredSchedule, participants: StoredParticipant[]) {
     const uidOf = new Map<number, string>();
     for (const p of participants) {
-      if (p?._originalUid) uidOf.set(p.id, p._originalUid);
+      const uid = p?._originalUid || (p as any)?.uid || (p as any)?.userId || (p?.id != null ? String(p.id) : null);
+      if (uid) uidOf.set(p.id, uid);
     }
 
     for (const round of schedule.rounds ?? []) {

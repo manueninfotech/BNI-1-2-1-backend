@@ -24,26 +24,68 @@ type Row = typeof conclaves.$inferSelect;
 
 /** Is this running conclave finished (all rounds elapsed, or its day has passed)? */
 export function isFinished(
-  row: Pick<Row, "currentRoundStartedAt" | "currentRound" | "roundCount" | "personsPerTable" | "startDate" | "endDate" | "legacy">,
+  row: Pick<
+    Row,
+    | "currentRoundStartedAt"
+    | "currentRound"
+    | "roundCount"
+    | "personsPerTable"
+    | "startDate"
+    | "endDate"
+    | "legacy"
+  > &
+    Partial<
+      Pick<
+        Row,
+        | "isRoundPaused"
+        | "roundProgressionMode"
+        | "roundDurationMinutes"
+        | "roundExtensionSeconds"
+      >
+    >,
   timing: Awaited<ReturnType<typeof getRoundTiming>>,
   now = Date.now(),
 ): boolean {
+  // 1. A paused conclave/round must NEVER be auto-completed by the sweep!
+  if (row.isRoundPaused) return false;
+
+  // 2. In manual progression mode, intermediate rounds do not auto-advance to next round.
+  // But if all rounds have been reached (baseRound >= roundCount), complete it once final round ends!
   const roundCount = row.roundCount ?? 0;
+  const baseRound = Math.max(1, row.currentRound || 1);
+  if (row.roundProgressionMode === "manual" && baseRound < roundCount) return false;
   if (row.currentRoundStartedAt && roundCount > 0) {
     // The anchor is the start of the last-started round; count rounds remaining from it.
     const baseRound = Math.max(1, row.currentRound || 1);
     const remaining = Math.max(1, roundCount - baseRound + 1);
-    const endsAt =
-      row.currentRoundStartedAt.getTime() + remaining * roundDurationMs(row.personsPerTable, timing, row.legacy?.roundBlockMinutes);
+    const roundMs = roundDurationMs(
+      row.personsPerTable,
+      timing,
+      row.roundDurationMinutes ?? (row.legacy as any)?.roundBlockMinutes,
+      row.roundExtensionSeconds,
+    );
+    // Add a 5-minute safety buffer past the nominal end time before auto-completing
+    const endsAt = row.currentRoundStartedAt.getTime() + remaining * roundMs + 5 * 60 * 1000;
     if (now > endsAt) return true;
   }
-  // Belt and braces: an event whose whole day has passed is over.
-  const day = row.endDate ?? row.startDate;
-  if (day) {
-    const endOfDay = new Date(day);
-    endOfDay.setHours(23, 59, 59, 999);
-    if (now > endOfDay.getTime()) return true;
+
+  // 3. For conclaves that were never started (no currentRoundStartedAt):
+  // If the scheduled day has passed, it is considered over.
+  if (!row.currentRoundStartedAt) {
+    const day = row.endDate ?? row.startDate;
+    if (day) {
+      const endOfDay = new Date(day);
+      endOfDay.setHours(23, 59, 59, 999);
+      if (now > endOfDay.getTime()) return true;
+    }
+  } else {
+    // If it was started, only consider it abandoned if started more than 24 hours ago
+    const startedMs = row.currentRoundStartedAt.getTime();
+    if (now - startedMs > 24 * 60 * 60 * 1000) {
+      return true;
+    }
   }
+
   return false;
 }
 

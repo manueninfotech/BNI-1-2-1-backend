@@ -5,7 +5,7 @@ import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import { conclaveWindow, windowsOverlap } from "../domain/schedulingRules.js";
 import { ROLE_LOCKED_STATUSES, TERMINAL_STATUSES } from "../domain/conclave.js";
-import { getConclaveOrThrow, toView, type ConclaveRow } from "./conclave.service.js";
+import { getConclaveOrThrow, toView, evaluateConclaveStatus, type ConclaveRow } from "./conclave.service.js";
 import { normalizePhone } from "./user.service.js";
 import { verifyPayment } from "./razorpay.service.js";
 
@@ -29,7 +29,12 @@ export function registrationFeeOf(conclave: { paymentDetails?: any; registration
 }
 
 function assertOpen(row: ConclaveRow) {
-  if (!row.isRegistrationOpen || TERMINAL_STATUSES.has(row.status) || row.status === "ended" || row.status === "running") {
+  const statusLower = String(row.status || "").toLowerCase();
+  if (row.isScheduleLocked || statusLower === "locked") {
+    throw ApiError.conflict("Registration is closed because the conclave schedule is locked.");
+  }
+  const evalResult = evaluateConclaveStatus(toView(row));
+  if (!evalResult.isRegistrationOpen) {
     throw ApiError.conflict("Registration is not open for this conclave.");
   }
 }
@@ -55,7 +60,10 @@ async function assertNoClash(conclave: ConclaveRow, uid: string) {
 
   for (const { c } of others) {
     const w = conclaveWindow(toView(c));
-    if (!w || !windowsOverlap(target, w)) continue;
+    if (!w) continue;
+    // Conclaves that concluded in the past (e.g. earlier morning session) never clash!
+    if (w.end <= new Date()) continue;
+    if (!windowsOverlap(target, w)) continue;
     throw ApiError.conflict(
       `This clashes with "${c.name}", which you are already registered for. ` +
         `Two conclaves at the same time cannot both be attended, and registrations cannot be withdrawn.`,

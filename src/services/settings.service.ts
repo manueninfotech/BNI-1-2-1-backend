@@ -48,13 +48,20 @@ export interface RoundTiming {
 }
 const ROUND_TIMING_DEFAULTS: RoundTiming = { bioSeconds: 60, referralSeconds: 30, bufferSeconds: 120 };
 
+let cachedRoundTiming: RoundTiming = { ...ROUND_TIMING_DEFAULTS };
+
+export function getCachedRoundTiming(): RoundTiming {
+  return cachedRoundTiming;
+}
+
 export async function getRoundTiming(): Promise<RoundTiming> {
   const d = await readSettings("roundTiming");
-  return {
+  cachedRoundTiming = {
     bioSeconds: posInt(d.bioSeconds, ROUND_TIMING_DEFAULTS.bioSeconds),
     referralSeconds: posInt(d.referralSeconds, ROUND_TIMING_DEFAULTS.referralSeconds),
     bufferSeconds: posInt(d.bufferSeconds, ROUND_TIMING_DEFAULTS.bufferSeconds),
   };
+  return cachedRoundTiming;
 }
 export async function setRoundTiming(input: Partial<RoundTiming>): Promise<RoundTiming> {
   const current = await getRoundTiming();
@@ -64,6 +71,7 @@ export async function setRoundTiming(input: Partial<RoundTiming>): Promise<Round
     bufferSeconds: posInt(input.bufferSeconds, current.bufferSeconds),
   };
   await writeSettings("roundTiming", next);
+  cachedRoundTiming = next;
   return next;
 }
 
@@ -71,23 +79,34 @@ export async function setRoundTiming(input: Partial<RoundTiming>): Promise<Round
 export interface ConclaveDefaults {
   personsPerTable: number;
   roundCount: number;
+  roundDurationMinutes: number;
 }
-const CONCLAVE_DEFAULTS: ConclaveDefaults = { personsPerTable: 7, roundCount: 6 };
+const CONCLAVE_DEFAULTS: ConclaveDefaults = { personsPerTable: 7, roundCount: 6, roundDurationMinutes: 15 };
+
+let cachedConclaveDefaults: ConclaveDefaults = { ...CONCLAVE_DEFAULTS };
+
+export function getCachedConclaveDefaults(): ConclaveDefaults {
+  return cachedConclaveDefaults;
+}
 
 export async function getConclaveDefaults(): Promise<ConclaveDefaults> {
   const d = await readSettings("conclaveDefaults");
-  return {
+  cachedConclaveDefaults = {
     personsPerTable: posInt(d.personsPerTable, CONCLAVE_DEFAULTS.personsPerTable),
     roundCount: posInt(d.roundCount, CONCLAVE_DEFAULTS.roundCount),
+    roundDurationMinutes: posInt(d.roundDurationMinutes, CONCLAVE_DEFAULTS.roundDurationMinutes),
   };
+  return cachedConclaveDefaults;
 }
 export async function setConclaveDefaults(input: Partial<ConclaveDefaults>): Promise<ConclaveDefaults> {
   const current = await getConclaveDefaults();
   const next: ConclaveDefaults = {
     personsPerTable: posInt(input.personsPerTable, current.personsPerTable),
     roundCount: posInt(input.roundCount, current.roundCount),
+    roundDurationMinutes: posInt(input.roundDurationMinutes, current.roundDurationMinutes),
   };
   await writeSettings("conclaveDefaults", next);
+  cachedConclaveDefaults = next;
   return next;
 }
 

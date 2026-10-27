@@ -1,6 +1,6 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { pgdb } from "../db/client.js";
-import { attendance, referrals } from "../db/schema.js";
+import { attendance, referrals, registrations } from "../db/schema.js";
 import { env } from "../config/env.js";
 import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
@@ -67,15 +67,20 @@ const REFERRAL_STATUSES = new Set(["Pending", "Accepted", "Completed", "Declined
  * earlier turns.)
  */
 export function referralWindow(
-  row: Pick<ConclaveRow, "currentRound" | "currentRoundStartedAt" | "personsPerTable" | "legacy">,
+  row: Pick<ConclaveRow, "currentRound" | "currentRoundStartedAt" | "personsPerTable" | "roundDurationMinutes" | "roundExtensionSeconds" | "legacy">,
   timing: RoundTiming,
   roundNumber: number,
 ): { opens: number; closes: number } | null {
   if (!row.currentRoundStartedAt || !row.currentRound) return null;
-  const roundMs = roundDurationMs(row.personsPerTable, timing, row.legacy?.roundBlockMinutes);
-  const opens = row.currentRoundStartedAt.getTime() + (roundNumber - row.currentRound) * roundMs;
+  const roundMs = roundDurationMs(row.personsPerTable, timing, row.roundDurationMinutes ?? row.legacy?.roundBlockMinutes, row.roundExtensionSeconds);
+  const roundStartMs = row.currentRoundStartedAt.getTime() + (roundNumber - row.currentRound) * roundMs;
   const p = Math.max(1, row.personsPerTable ?? 1);
-  const closes = opens + (timing.bioSeconds + timing.referralSeconds) * 1000 * p;
+  const speakingMs = timing.bioSeconds * 1000 * p;
+  const referralMs = timing.referralSeconds * 1000 * p;
+  // Referral window opens immediately after speaking time concludes, and closes when referral exchange concludes.
+  // The remainder of the round duration is the move timing for table rotation.
+  const opens = roundStartMs + speakingMs;
+  const closes = opens + referralMs;
   return { opens, closes };
 }
 
@@ -107,7 +112,10 @@ export async function syncConclave(conclaveId: string, callerUid: string, payloa
       if (id) acceptedAttendance.push(id);
     };
     if (!id || !a.userId || a.roundNumber === undefined) { reject("malformed record."); continue; }
-    if (!insecure && a.markedBy !== callerUid) { reject("you can only submit marks you made."); continue; }
+    if (!a.markedBy) a.markedBy = callerUid;
+    if (!insecure && a.markedBy !== callerUid) {
+      a.markedBy = callerUid;
+    }
     if (!insecure && !index) { reject("this conclave has no schedule."); continue; }
     if (!insecure && index && !index.canMarkAttendance(Number(a.roundNumber), callerUid, String(a.userId))) {
       reject(`you may only mark yourself, or a member of the table you captain in round ${a.roundNumber}.`);
@@ -294,7 +302,7 @@ async function buildState(
   const schedule = conclave.schedule as any;
   const getUid = (p: any) => p?._originalUid || p?.uid || p?.userId || String(p?.id);
   const isLive = conclave.status === "running" || conclave.status === "active";
-  const roundMs = roundDurationMs(conclave.personsPerTable, ctx.timing, conclave.legacy?.roundBlockMinutes);
+  const roundMs = roundDurationMs(conclave.personsPerTable, ctx.timing, conclave.roundDurationMinutes ?? conclave.legacy?.roundBlockMinutes, conclave.roundExtensionSeconds);
 
   // Referrals given TO this member.
   const received = await pgdb.select().from(referrals).where(and(eq(referrals.conclaveId, conclaveId), eq(referrals.toUserId, callerUid)));
@@ -332,19 +340,28 @@ async function buildState(
   const me = participants.find((p) => getUid(p) === callerUid);
   if (me && schedule?.rounds) {
     const presence = new Map<string, boolean>();
+    const marked = new Set<string>();
     for (const a of await pgdb.select().from(attendance).where(eq(attendance.conclaveId, conclaveId))) {
       presence.set(`${a.roundNumber}-${a.userId}`, a.isPresent);
+      marked.add(`${a.roundNumber}-${a.userId}`);
     }
     const current = conclave.currentRound || 1;
-    const person = (p: any, isCaptain: boolean, round: number) => ({
-      uid: getUid(p),
-      name: p.name,
-      company: p.businessName || p.company || "Member",
-      category: p.businessCategory || p.category || "BNI Member",
-      chapter: p.chapter || "BNI",
-      isCaptain,
-      isPresent: presence.get(`${round}-${getUid(p)}`) ?? isCaptain,
-    });
+    const person = (p: any, isCaptain: boolean, round: number) => {
+      const key = `${round}-${getUid(p)}`;
+      const hasRecord = marked.has(key);
+      const isPresent = hasRecord ? (presence.get(key) ?? false) : isCaptain;
+      return {
+        uid: getUid(p),
+        id: p.id,
+        name: p.name,
+        company: p.businessName || p.company || "Member",
+        category: p.businessCategory || p.category || "BNI Member",
+        chapter: p.chapter || "BNI",
+        isCaptain,
+        isPresent,
+        isAttendanceMarked: hasRecord || isCaptain,
+      };
+    };
 
     mySchedule = schedule.rounds
       .map((r: any) => {
@@ -381,8 +398,9 @@ async function buildState(
     status,
     currentRound: conclave.currentRound,
     currentRoundStartedAt: view.currentRoundStartedAt,
-    isRoundPaused: conclave.isRoundPaused,
+    isRoundPaused: Boolean(conclave.isRoundPaused),
     roundPausedAt: view.roundPausedAt,
+    roundElapsedMsBeforePause: conclave.roundElapsedMsBeforePause,
     serverSentAt: new Date().toISOString(),
     title: conclave.name,
     date: view.date,
@@ -391,7 +409,27 @@ async function buildState(
     startTime: conclave.startTime,
     endTime: conclave.endTime,
     agendaDocument: conclave.agendaDocument ?? null,
+    roundTiming: ctx.timing,
+    roundDurationMinutes: conclave.roundDurationMinutes ?? 15,
+    roundExtensionSeconds: conclave.roundExtensionSeconds ?? 0,
   };
+
+  const [captainReg] = await pgdb
+    .select({ n: sql<number>`count(*)::int` })
+    .from(registrations)
+    .where(
+      and(
+        eq(registrations.conclaveId, conclaveId),
+        eq(registrations.userId, callerUid),
+        eq(registrations.role, "captain")
+      )
+    );
+  const conclaveStatusLower = (conclaveStatus?.status || conclave.status || '').toLowerCase();
+  const isConclaveFinished = conclaveStatusLower === 'completed' || conclaveStatusLower === 'finished' || conclaveStatusLower === 'ended';
+  const isCallerCaptain = !isConclaveFinished && Boolean(
+    (captainReg?.n ?? 0) > 0 ||
+    mySchedule.some((s: any) => s.participants?.some((p: any) => p.uid === callerUid && p.isCaptain))
+  );
 
   return {
     serverReceivedAt: new Date(ctx.serverReceivedAt).toISOString(),
@@ -399,12 +437,20 @@ async function buildState(
     syncedAttendanceIds: [...new Set(ctx.acceptedAttendance)],
     syncedReferralIds: [...new Set(ctx.acceptedReferrals)],
     newReferralsReceived,
+    roundTiming: ctx.timing,
+    roundDurationMinutes: conclave.roundDurationMinutes ?? 15,
+    roundExtensionSeconds: conclave.roundExtensionSeconds ?? 0,
+    isRoundPaused: Boolean(conclave.isRoundPaused),
+    roundPausedAt: view.roundPausedAt,
+    roundElapsedMsBeforePause: conclave.roundElapsedMsBeforePause,
     conclaveStatus,
     agendaDocument: conclave.agendaDocument ?? null,
     tableNumber,
     captainName,
     tableOccupants,
     mySchedule,
+    isCaptain: isCallerCaptain,
+    myRole: isCallerCaptain ? "captain" : "member",
     errors: ctx.errors,
   };
 }

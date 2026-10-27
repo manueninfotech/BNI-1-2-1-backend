@@ -17,6 +17,26 @@ function asDate(v: MaybeTime): Date | null {
   return typeof maybe.toDate === "function" ? maybe.toDate() : null;
 }
 
+function parseTimeParts(val: unknown): { hours: number; minutes: number } | null {
+  if (!val) return null;
+  if (typeof val === "string") {
+    const match = val.trim().match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?$/i);
+    if (match) {
+      let h = parseInt(match[1], 10);
+      const m = parseInt(match[2], 10);
+      const meridian = match[3]?.toUpperCase();
+      if (meridian === "PM" && h < 12) h += 12;
+      if (meridian === "AM" && h === 12) h = 0;
+      return { hours: h, minutes: m };
+    }
+  }
+  const d = asDate(val as MaybeTime);
+  if (d && !isNaN(d.getTime())) {
+    return { hours: d.getHours(), minutes: d.getMinutes() };
+  }
+  return null;
+}
+
 export interface TimeWindow {
   start: Date;
   end: Date;
@@ -25,37 +45,47 @@ export interface TimeWindow {
 /**
  * The window a conclave occupies.
  *
- * start/end are optional by design — the spec calls them "flexible". When they
- * are missing we cannot PROVE two conclaves don't overlap, so the conclave is
- * treated as occupying its whole day. That is deliberately conservative: it can
- * block a same-day registration that would in fact have been fine, which is far
- * better than letting someone commit to two events they cannot both attend.
+ * Correctly combines event date with startTime and endTime if provided,
+ * allowing non-overlapping same-day conclaves (e.g. morning and afternoon).
+ * Falls back to whole-day boundaries only when times are unspecified.
  */
 export function conclaveWindow(c: {
   date?: MaybeTime;
   startDate?: MaybeTime;
+  endDate?: MaybeTime;
   regStartDate?: MaybeTime;
   regEndDate?: MaybeTime;
-  startTime?: MaybeTime;
-  endTime?: MaybeTime;
+  startTime?: unknown;
+  endTime?: unknown;
 }): TimeWindow | null {
-  const start = asDate(c.startTime) ?? asDate(c.startDate);
-  const end = asDate(c.endTime);
+  const directStart = asDate(c.startDate) ?? asDate(c.date);
+  const directEnd = asDate(c.endDate) ?? directStart;
 
-  if (start && end) return { start, end };
+  const baseDate = directStart ?? asDate(c.date) ?? asDate(c.regEndDate) ?? asDate(c.regStartDate);
+  if (!baseDate) return null;
 
-  const date = asDate(c.date) ?? start ?? asDate(c.regEndDate) ?? asDate(c.regStartDate);
-  if (!date) return null;
+  const startParts = parseTimeParts(c.startTime);
+  const endParts = parseTimeParts(c.endTime);
 
-  const dayEnd = new Date(date);
-  dayEnd.setHours(23, 59, 59, 999);
+  const start = new Date(directStart ?? baseDate);
+  if (startParts) {
+    start.setHours(startParts.hours, startParts.minutes, 0, 0);
+  } else {
+    start.setHours(0, 0, 0, 0);
+  }
 
-  // Only a start is known: from then until the end of that day.
-  if (start && !end) return { start, end: dayEnd };
+  const end = new Date(directEnd ?? baseDate);
+  if (endParts) {
+    end.setHours(endParts.hours, endParts.minutes, 0, 0);
+  } else {
+    end.setHours(23, 59, 59, 999);
+  }
 
-  const dayStart = new Date(date);
-  dayStart.setHours(0, 0, 0, 0);
-  return { start: dayStart, end: dayEnd };
+  if (end <= start) {
+    end.setTime(start.getTime() + 2 * 60 * 60 * 1000);
+  }
+
+  return { start, end };
 }
 
 /**
