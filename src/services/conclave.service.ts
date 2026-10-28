@@ -791,10 +791,14 @@ export async function pauseRound(id: string) {
       result = { isRoundPaused: true, pausedAt: row.roundPausedAt };
       return {};
     }
-    const elapsedMs = row.currentRoundStartedAt ? Math.max(0, Date.now() - row.currentRoundStartedAt.getTime()) : 0;
+    // Pin the round the clock is on first (automatic mode may have moved on),
+    // so the frozen point is measured from that round's real start.
+    const m = materialize(row);
+    const anchor = m.currentRoundStartedAt ?? row.currentRoundStartedAt;
+    const elapsedMs = anchor ? Math.max(0, Date.now() - anchor.getTime()) : 0;
     const pausedAt = new Date();
     result = { isRoundPaused: true, pausedAt, elapsedMs };
-    return { isRoundPaused: true, roundPausedAt: pausedAt, roundElapsedMsBeforePause: elapsedMs };
+    return { ...m, isRoundPaused: true, roundPausedAt: pausedAt, roundElapsedMsBeforePause: elapsedMs };
   });
   if (!before.isRoundPaused) {
     try {
