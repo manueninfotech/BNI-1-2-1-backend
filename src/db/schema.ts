@@ -159,6 +159,10 @@ export const conclaves = pgTable(
     isScheduleLocked: boolean("is_schedule_locked").notNull().default(false),
 
     // Live round state.
+    roundProgressionMode: text("round_progression_mode").notNull().default("manual"), // "manual" | "automatic"
+    // Automatic mode only: break between rounds for walking to the next table (60 / 120 / 300 s).
+    moveSeconds: integer("move_seconds").notNull().default(120),
+    roundExtensionSeconds: integer("round_extension_seconds").notNull().default(0),
     currentRound: integer("current_round").notNull().default(0),
     currentRoundStartedAt: ts("current_round_started_at"),
     isRoundPaused: boolean("is_round_paused").notNull().default(false),

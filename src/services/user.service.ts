@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { auth } from "../config/firebase.js";
 import { pgdb } from "../db/client.js";
 import { admins, conclaves, registrations, users } from "../db/schema.js";
@@ -24,8 +24,9 @@ const isSynthetic = (v?: string | null) => !!v && v.toLowerCase().endsWith(PHONE
 /** "+919515409973" from "9515409973" / "919515409973" / "+91 95154 09973". */
 export function normalizePhone(raw: unknown): { phone: string; tenDigit: string; identifier: string } | null {
   const s = String(raw ?? "").trim();
-  if (!s) return null;
+  if (!s || s.toLowerCase() === "n/a" || s.toLowerCase() === "null") return null;
   let digits = s.replace(/\D/g, "");
+  if (!digits) return null;
   if (digits.length === 10) digits = `91${digits}`;
   if (digits.length < 11 || digits.length > 15) throw ApiError.badRequest("Enter a valid phone number.");
   return { phone: `+${digits}`, tenDigit: digits.slice(-10), identifier: `${digits}${PHONE_ACCOUNT_DOMAIN}` };
@@ -137,13 +138,22 @@ export async function touchActivity(uid: string) {
     .catch(() => {});
 }
 
-/** True while the user is a table captain in a conclave that is currently running. */
+/** True while the user is a table captain in an active or scheduled conclave. */
 async function isLiveCaptain(uid: string): Promise<boolean> {
   const [row] = await pgdb
     .select({ n: sql<number>`count(*)::int` })
     .from(registrations)
     .innerJoin(conclaves, eq(conclaves.id, registrations.conclaveId))
-    .where(and(eq(registrations.userId, uid), eq(registrations.role, "captain"), inArray(conclaves.status, ["running", "active"])));
+    .where(
+      and(
+        eq(registrations.userId, uid),
+        eq(registrations.role, "captain"),
+        ne(conclaves.status, "completed"),
+        ne(conclaves.status, "finished"),
+        ne(conclaves.status, "ended"),
+        ne(conclaves.status, "cancelled")
+      )
+    );
   return (row?.n ?? 0) > 0;
 }
 
@@ -168,8 +178,11 @@ export async function getMe({ uid, email, emailVerified }: MeInput) {
       name: admin.name || (admin.role === "superadmin" ? "Superadmin" : "Admin"),
       email: admin.email || email || "",
       phone: admin.phone ?? "",
+      mobile: admin.phone ?? "",
       region: admin.region ?? "Global",
       role: admin.role,
+      designation: admin.designation || (admin.role === "superadmin" ? "Global Administrator" : "Regional Administrator"),
+      organization: admin.organization || (admin.role === "superadmin" ? "BNI Global LLC" : "BNI Regional Office"),
       createdAt: admin.grantedAt.toISOString(),
     };
   }
@@ -193,10 +206,15 @@ export async function getMe({ uid, email, emailVerified }: MeInput) {
     name: user?.name || "Member",
     email: user?.email || email || "",
     phone: user?.phone ?? "",
+    mobile: user?.phone?.slice(-10) ?? user?.phone ?? "",
     company: user?.company ?? "",
+    businessName: user?.company ?? "",
     category: user?.category ?? "",
+    businessCategory: user?.category ?? "",
     chapter: user?.chapter ?? "",
+    region: user?.region ?? "",
     location: user?.location ?? "",
+    designation: user?.designation || (captain ? "Table Captain" : "BNI Member"),
     createdAt: (user?.createdAt ?? new Date()).toISOString(),
     role: captain ? "captain" : "member",
     isCaptain: captain,
@@ -243,15 +261,48 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
       patch.name = str(input.name);
       if (!patch.name) throw ApiError.badRequest("Name can't be empty.");
     }
-    if (input.phone !== undefined || input.mobile !== undefined) patch.phone = normalizePhone(input.phone ?? input.mobile)?.phone ?? null;
+    if (input.email !== undefined) {
+      const e = str(input.email).toLowerCase();
+      if (e && e !== "n/a" && e !== "null") {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw ApiError.badRequest("Enter a valid email.");
+        patch.email = e;
+      }
+    }
+    if (input.phone !== undefined || input.mobile !== undefined) {
+      const rawP = input.phone ?? input.mobile;
+      patch.phone = normalizePhone(rawP)?.phone ?? null;
+    }
     if (input.designation !== undefined) patch.designation = str(input.designation);
     if (input.organization !== undefined) patch.organization = str(input.organization);
     if (!Object.keys(patch).length) throw ApiError.badRequest("Nothing to update.");
-    await pgdb.transaction(async (tx) => {
-      const [after] = await tx.update(admins).set({ ...patch, updatedAt: new Date() }).where(eq(admins.uid, uid)).returning();
-      await audit.change({ action: "admin.update_self", entityType: "admin", entityId: uid, before: admin, after }, tx);
+
+    const [after] = await pgdb.transaction(async (tx) => {
+      const [updated] = await tx.update(admins).set({ ...patch, updatedAt: new Date() }).where(eq(admins.uid, uid)).returning();
+      await audit.change({ action: "admin.update_self", entityType: "admin", entityId: uid, before: admin, after: updated }, tx);
+      // Keep users table in sync if admin also has a user row
+      await tx.update(users).set({
+        ...(patch.name ? { name: patch.name } : {}),
+        ...(patch.email ? { email: patch.email } : {}),
+        ...(patch.phone !== undefined ? { phone: patch.phone } : {}),
+        ...(patch.designation !== undefined ? { designation: patch.designation } : {}),
+        updatedAt: new Date()
+      }).where(eq(users.uid, uid));
+      return [updated];
     });
-    return { id: uid, ...patch };
+
+    return {
+      id: uid,
+      uid,
+      name: after.name,
+      email: after.email,
+      phone: after.phone ?? "",
+      mobile: after.phone ?? "",
+      region: after.region ?? "Global",
+      role: after.role,
+      designation: after.designation || (after.role === "superadmin" ? "Global Administrator" : "Regional Administrator"),
+      organization: after.organization || (after.role === "superadmin" ? "BNI Global LLC" : "BNI Regional Office"),
+      createdAt: after.grantedAt.toISOString(),
+    };
   }
 
   const patch: Partial<typeof users.$inferInsert> = {};
@@ -261,11 +312,16 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
   }
   if (input.email !== undefined) {
     const e = str(input.email).toLowerCase();
-    if (e && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw ApiError.badRequest("Enter a valid email.");
-    patch.email = e || null;
+    if (e && e !== "n/a" && e !== "null") {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw ApiError.badRequest("Enter a valid email.");
+      patch.email = e;
+    } else {
+      patch.email = null;
+    }
   }
   if (input.phone !== undefined || input.mobile !== undefined) {
-    const p = normalizePhone(input.phone ?? input.mobile);
+    const rawP = input.phone ?? input.mobile;
+    const p = normalizePhone(rawP);
     patch.phone = p?.phone ?? null;
     // `identifier` is the Firebase sign-in for phone accounts; it follows the phone.
     if (p) patch.identifier = p.identifier;
@@ -297,19 +353,40 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
           .values({ uid, country: "India", identifier: signInEmail?.toLowerCase() ?? patch.identifier ?? null, ...patch })
           .returning();
     await audit.change({ action: before ? "user.update" : "user.create", entityType: "user", entityId: uid, before: before ?? null, after }, tx);
+
+    // Keep registrations up to date with name/company/category/phone/email changes
+    if (patch.name || patch.company || patch.category || patch.phone || patch.email) {
+      await tx.update(registrations).set({
+        ...(patch.name ? { name: patch.name } : {}),
+        ...(patch.company ? { company: patch.company } : {}),
+        ...(patch.category ? { category: patch.category } : {}),
+        ...(patch.phone !== undefined ? { phone: patch.phone } : {}),
+        ...(patch.email !== undefined ? { email: patch.email } : {}),
+      }).where(eq(registrations.userId, uid));
+    }
+
     return {
       id: uid,
+      uid,
       name: after.name,
-      email: after.email,
-      phone: after.phone,
-      mobile: after.phone?.slice(-10) ?? "",
-      company: after.company,
-      businessName: after.company,
-      category: after.category,
-      businessCategory: after.category,
-      chapter: after.chapter,
-      region: after.region,
-      designation: after.designation,
+      email: after.email ?? "",
+      phone: after.phone ?? "",
+      mobile: after.phone?.slice(-10) ?? after.phone ?? "",
+      company: after.company ?? "",
+      businessName: after.company ?? "",
+      category: after.category ?? "",
+      businessCategory: after.category ?? "",
+      chapter: after.chapter ?? "",
+      region: after.region ?? "",
+      designation: after.designation ?? "",
+      location: after.location ?? "",
+      state: after.state ?? "",
+      country: after.country ?? "",
+      membership: after.membership ?? "",
+      lookingFor: after.lookingFor ?? "",
+      canOffer: after.canOffer ?? "",
+      createdAt: after.createdAt?.toISOString(),
+      updatedAt: after.updatedAt?.toISOString(),
     };
   });
 }

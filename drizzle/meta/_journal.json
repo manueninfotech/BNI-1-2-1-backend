@@ -29,6 +29,13 @@
       "when": 1792845370413,
       "tag": "0003_registrations_payment",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793205279289,
+      "tag": "0004_round_controls",
+      "breakpoints": true
     }
   ]
 }

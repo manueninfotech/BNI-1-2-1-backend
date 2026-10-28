@@ -5,7 +5,7 @@ import * as sync from "../services/sync.service.js";
 import { getForMember, listForMember } from "../services/conclave.service.js";
 import { subscribe } from "../services/live.service.js";
 import * as categoriesSvc from "../services/categories.service.js";
-import { getAutoLogoutHours, getRoundTiming } from "../services/settings.service.js";
+import { getAutoLogoutHours, getRoundTiming, getConclaveDefaults } from "../services/settings.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
 import * as feedback from "../services/feedback.service.js";
 import { ApiError } from "../middleware/errors.js";
@@ -162,12 +162,13 @@ export async function resolveIdentifier(req: AuthedRequest, res: Response) {
 
 /** Everything the app used to live-read from Firestore `settings/*`. */
 export async function appConfig(_req: AuthedRequest, res: Response) {
-  const [categories, roundTiming, autoLogoutHours] = await Promise.all([
+  const [categories, roundTiming, conclaveDefaults, autoLogoutHours] = await Promise.all([
     categoriesSvc.listCategories(),
     getRoundTiming(),
+    getConclaveDefaults(),
     getAutoLogoutHours(),
   ]);
-  res.json({ categories, roundTiming, autoLogoutHours });
+  res.json({ categories, roundTiming, conclaveDefaults, autoLogoutHours });
 }
 
 export async function getConclave(req: AuthedRequest, res: Response) {

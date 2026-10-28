@@ -54,10 +54,10 @@ describe("categories", () => {
 });
 
 describe("settings", () => {
-  it("returns defaults when unset and keeps valid values when partially updated", async () => {
+  it("bio (1 min) and referral (30 s) times are fixed", async () => {
     expect(await settingsSvc.getRoundTiming()).toEqual({ bioSeconds: 60, referralSeconds: 30, bufferSeconds: 120 });
-    await asAdmin(() => settingsSvc.setRoundTiming({ bioSeconds: 90, referralSeconds: -5 as any }));
-    expect(await settingsSvc.getRoundTiming()).toEqual({ bioSeconds: 90, referralSeconds: 30, bufferSeconds: 120 });
+    await expect(asAdmin(() => settingsSvc.setRoundTiming({ bioSeconds: 90 }))).rejects.toThrow(/fixed/);
+    expect(await settingsSvc.getRoundTiming()).toEqual({ bioSeconds: 60, referralSeconds: 30, bufferSeconds: 120 });
   });
 
   it("fills notification templates", async () => {

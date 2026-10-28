@@ -5,10 +5,10 @@ import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import { generateSchedule, validate, tableCountFor, type ConclaveConfig } from "../engine/index.js";
 import { resolveCaptains, type ServerParticipant } from "../domain/captains.js";
-import { ROLE_LOCKED_STATUSES } from "../domain/conclave.js";
-import { validateConfig, evaluateConclaveStatus, toView } from "./conclave.service.js";
+import { ConclaveStatus, ROLE_LOCKED_STATUSES } from "../domain/conclave.js";
+import { validateConfig } from "./conclave.service.js";
 import { fetchUsers, isActiveUser } from "./user.service.js";
-import { getAutoLogoutHours } from "./settings.service.js";
+import { getAutoLogoutHours, getConclaveDefaults } from "./settings.service.js";
 import { notifyConclaveChanged } from "./live.service.js";
 
 export interface GenerateOptions {
@@ -78,8 +78,9 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
       );
     }
 
-    let personsPerTable = conclave.personsPerTable || 7;
-    let roundCount = conclave.roundCount || 4;
+    const defaults = await getConclaveDefaults();
+    let personsPerTable = conclave.personsPerTable || defaults.personsPerTable;
+    let roundCount = conclave.roundCount || defaults.roundCount;
     if (opts.personsPerTable !== undefined || opts.roundCount !== undefined) {
       personsPerTable = Number(opts.personsPerTable ?? personsPerTable);
       roundCount = Number(opts.roundCount ?? roundCount);
@@ -88,15 +89,12 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
 
     const tablesRequired = tableCountFor(participants.length, personsPerTable);
     const skipCaptainCheck = opts.autoFillCaptains && designatedCaptainIds.length === 0;
-    if (!skipCaptainCheck && designatedCaptainIds.length !== tablesRequired) {
-      const diff = Math.abs(designatedCaptainIds.length - tablesRequired);
-      const fix =
-        designatedCaptainIds.length < tablesRequired
-          ? `Promote ${diff} more member(s) to Table Captain in the Members page.`
-          : `Demote ${diff} captain(s) to member, or increase persons-per-table.`;
+    if (!skipCaptainCheck && designatedCaptainIds.length < tablesRequired) {
+      const diff = tablesRequired - designatedCaptainIds.length;
+      const fix = `Promote ${diff} more member(s) to Table Captain in the Members page.`;
       throw ApiError.badRequest(
-        `This conclave needs exactly ${tablesRequired} table captains (one per table for ${participants.length} members @ ${personsPerTable}/table) ` +
-          `but ${designatedCaptainIds.length} are currently designated. ${fix}`,
+        `This conclave needs at least ${tablesRequired} table captains (one per table for ${participants.length} members @ ${personsPerTable}/table) ` +
+          `but only ${designatedCaptainIds.length} are currently designated. ${fix}`,
         {
           captainsRequired: tablesRequired,
           captainsDesignated: designatedCaptainIds.length,
@@ -135,7 +133,6 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
       throw e;
     }
 
-    const evaluated = evaluateConclaveStatus(toView(conclave));
     const scheduleSummary = {
       tableCount: schedule.tableCount,
       coverage: schedule.stats.coverage,
@@ -149,8 +146,10 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
         seed,
         schedule: schedule as unknown as Record<string, unknown>,
         participants,
-        status: evaluated.status,
-        isRegistrationOpen: evaluated.isRegistrationOpen,
+        // Generating the tables closes registration (organisers' rule).
+        status: ConclaveStatus.registrationClosed,
+        isRegistrationOpen: false,
+        registrationOverride: "closed",
         scheduleSummary,
         warnings: validation.warnings,
         snapshot: { activeOnly, takenAt: new Date().toISOString(), participantCount: participants.length, skippedInactiveCount: skippedInactive },

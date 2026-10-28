@@ -1,3 +1,4 @@
+import { liveClock } from "../domain/roundClock.js";
 import type { Response } from "express";
 import pg from "pg";
 import { eq, sql } from "drizzle-orm";
@@ -34,6 +35,11 @@ export async function liveState(id: string) {
       isRoundPaused: conclaves.isRoundPaused,
       roundPausedAt: conclaves.roundPausedAt,
       roundElapsedMsBeforePause: conclaves.roundElapsedMsBeforePause,
+      // Round clock inputs, so phones run exactly the server's clock.
+      personsPerTable: conclaves.personsPerTable,
+      roundProgressionMode: conclaves.roundProgressionMode,
+      roundExtensionSeconds: conclaves.roundExtensionSeconds,
+      moveSeconds: conclaves.moveSeconds,
       isScheduleLocked: conclaves.isScheduleLocked,
       isRegistrationOpen: conclaves.isRegistrationOpen,
       updatedAt: conclaves.updatedAt,
@@ -41,8 +47,18 @@ export async function liveState(id: string) {
     .from(conclaves)
     .where(eq(conclaves.id, id));
   if (!c) return null;
+  const clock = liveClock(c);
   return {
     ...c,
+    // The server's round clock (see domain/roundClock.ts): which round, which
+    // part (bio / referral / extension / move / waiting / done) and until when.
+    clock: {
+      round: clock.round,
+      phase: clock.phase,
+      roundStartedAt: clock.roundStartMs !== null ? new Date(clock.roundStartMs).toISOString() : null,
+      phaseEndsAt: clock.phaseEndsMs !== null ? new Date(clock.phaseEndsMs).toISOString() : null,
+      extensionSeconds: clock.round === c.currentRound ? c.roundExtensionSeconds : 0,
+    },
     currentRoundStartedAt: c.currentRoundStartedAt?.toISOString() ?? null,
     roundPausedAt: c.roundPausedAt?.toISOString() ?? null,
     updatedAt: c.updatedAt.toISOString(),

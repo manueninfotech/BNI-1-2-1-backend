@@ -202,6 +202,30 @@ export async function closeRound(req: AuthedRequest, res: Response) {
   });
 }
 
+export async function setProgressionMode(req: AuthedRequest, res: Response) {
+  const mode = req.body?.mode === "automatic" ? "automatic" : "manual";
+  const updatedMode = await conclaves.setProgressionMode(req.params.id, mode);
+  res.json({
+    message: `Round progression mode set to ${updatedMode}.`,
+    roundProgressionMode: updatedMode,
+  });
+}
+
+export async function extendRound(req: AuthedRequest, res: Response) {
+  const secs = req.body?.additionalSeconds !== undefined ? Number(req.body.additionalSeconds) : Number(req.body?.additionalMinutes) * 60;
+  const result = await conclaves.extendRound(req.params.id, secs);
+  res.json({
+    message: `Round extended by ${Math.round(secs / 60)} minutes.`,
+    ...result,
+  });
+}
+
+export async function setMoveTime(req: AuthedRequest, res: Response) {
+  const secs = req.body?.moveSeconds !== undefined ? Number(req.body.moveSeconds) : Number(req.body?.moveMinutes) * 60;
+  const result = await conclaves.setMoveSeconds(req.params.id, secs);
+  res.json({ message: `Move time set to ${result.moveSeconds / 60} min.`, ...result });
+}
+
 export async function generate(req: AuthedRequest, res: Response) {
   const result = await schedule.generateForConclave(req.params.id, {
     activeOnly: req.body?.activeOnly === true,
