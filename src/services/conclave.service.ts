@@ -88,6 +88,9 @@ export function toView(row: ConclaveRow, registrationCount?: number) {
     moveSeconds: row.moveSeconds ?? DEFAULT_MOVE_SECONDS,
     roundExtensionSeconds: row.roundExtensionSeconds ?? 0,
     roundTiming: getCachedRoundTiming(),
+    // The server's round clock (automatic mode moves on without a stored
+    // update), so every screen shows the same round and phase.
+    clock: clockView(row),
     currentRound: row.currentRound,
     currentRoundStartedAt: iso(row.currentRoundStartedAt),
     isRoundPaused: row.isRoundPaused,
@@ -101,6 +104,20 @@ export function toView(row: ConclaveRow, registrationCount?: number) {
     ...(registrationCount !== undefined ? { registrationCount } : {}),
   };
 }
+function clockView(row: ConclaveRow) {
+  const c = liveClock(row);
+  const cur = Number(row.currentRound) || 0;
+  return {
+    round: c.round,
+    phase: c.phase,
+    roundStartedAt: c.roundStartMs !== null ? new Date(c.roundStartMs).toISOString() : null,
+    phaseEndsAt: c.phaseEndsMs !== null ? new Date(c.phaseEndsMs).toISOString() : null,
+    // Extra time applies to the stored current round only.
+    extensionSeconds: c.round === cur ? Number(row.roundExtensionSeconds) || 0 : 0,
+    serverTime: new Date().toISOString(),
+  };
+}
+
 export type ConclaveView = ReturnType<typeof toView>;
 
 /** The conclave row and its API shape; 404 if it doesn't exist. */
