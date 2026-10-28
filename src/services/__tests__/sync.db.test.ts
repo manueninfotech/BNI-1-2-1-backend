@@ -72,8 +72,11 @@ describe("attendance", () => {
     const saved = await pgdb.select().from(attendance);
     expect(saved.map((a) => a.id).sort()).toEqual(["a1", "a2"]);
 
-    const forged = await as(mate, () => syncConclave(conclaveId, mate, { attendance: [att("a4", mate, cap)] }));
-    expect(forged.errors.join(" ")).toMatch(/marks you made/);
+    // A mark claiming to be from someone else is recorded as the caller's own
+    // mark — it never gains the captain's authority.
+    await as(mate, () => syncConclave(conclaveId, mate, { attendance: [att("a4", mate, cap)] }));
+    const [a4] = await pgdb.select().from(attendance).where(eq(attendance.id, "a4"));
+    expect(a4).toMatchObject({ markedBy: mate, source: "self" });
   });
 
   it("a captain's mark beats a later self-mark", async () => {
@@ -104,19 +107,19 @@ describe("referrals", () => {
     expect(await pgdb.select().from(referrals)).toHaveLength(0);
   });
 
-  it("current round: whole active phase allowed, after it refused; late past-round syncs kept; future refused", async () => {
-    // Early in the round (someone's bio turn) is allowed — the app shows the
-    // Refer button for the whole active phase.
-    const early = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r4", mate, cap, new Date(roundStart + 10_000))] }));
-    expect(early.errors).toEqual([]);
-    // After the round's talking time (4 people × 90s = 6 min, +2 min slack) it's refused.
-    const after = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r4b", mate, cap, new Date(roundStart + 9 * 60_000))] }));
-    expect(after.errors.join(" ")).toMatch(/talking time ended/);
+  it("current round: only the referral slot after all bios; late past-round syncs kept; future refused", async () => {
+    // Table of 4: bios 0:00–4:00, referral slot 4:00–6:00 (30 s clock slack).
+    const duringBios = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r4", mate, cap, new Date(roundStart + 2 * 60_000))] }));
+    expect(duringBios.errors.join(" ")).toMatch(/after everyone's bio/);
+    const inSlot = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r4a", mate, cap, new Date(roundStart + 4.5 * 60_000))] }));
+    expect(inSlot.errors).toEqual([]);
+    const afterSlot = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r4b", mate, cap, new Date(roundStart + 7 * 60_000))] }));
+    expect(afterSlot.errors.join(" ")).toMatch(/referral time had ended/);
 
     // The conclave moves on to round 3; a round-1 referral arrives late → kept.
     await pgdb.update(conclaves).set({ currentRound: 3, currentRoundStartedAt: new Date() }).where(eq(conclaves.id, conclaveId));
     try {
-      const late = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r5", mate, cap, new Date(roundStart + 10_000))] }));
+      const late = await as(mate, () => syncConclave(conclaveId, mate, { referrals: [ref("r5", mate, cap, new Date(roundStart + 4.5 * 60_000))] }));
       expect(late.errors).toEqual([]);
       expect(await pgdb.select().from(referrals).where(eq(referrals.id, "r5"))).toHaveLength(1);
     } finally {

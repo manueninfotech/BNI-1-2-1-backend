@@ -11,8 +11,18 @@ import {
 } from "../domain/conclave.js";
 import { notifyConclave, notifyUser, recordUserNotification } from "./notification.service.js";
 import { notifyConclaveChanged } from "./live.service.js";
+import {
+  DEFAULT_MOVE_SECONDS,
+  EXTEND_SECONDS_OPTIONS,
+  MAX_EXTENSION_SECONDS,
+  MAX_PERSONS_PER_TABLE,
+  MOVE_SECONDS_OPTIONS,
+  liveClock,
+  materialize,
+  phases,
+} from "../domain/roundClock.js";
 import { decodeDataUrl, deleteFile, uploadFile, type StoredFile } from "./storage.service.js";
-import { resolveNotification, getConclaveDefaults, getRoundTiming, getCachedRoundTiming, getCachedConclaveDefaults, type RoundTiming } from "./settings.service.js";
+import { resolveNotification, getConclaveDefaults, getCachedRoundTiming, getCachedConclaveDefaults } from "./settings.service.js";
 
 /**
  * Conclaves: lifecycle, registration window, and live rounds.
@@ -75,7 +85,7 @@ export function toView(row: ConclaveRow, registrationCount?: number) {
     snapshot: row.snapshot,
     isScheduleLocked: row.isScheduleLocked,
     roundProgressionMode: row.roundProgressionMode ?? "manual",
-    roundDurationMinutes: row.roundDurationMinutes ?? getCachedConclaveDefaults().roundDurationMinutes,
+    moveSeconds: row.moveSeconds ?? DEFAULT_MOVE_SECONDS,
     roundExtensionSeconds: row.roundExtensionSeconds ?? 0,
     roundTiming: getCachedRoundTiming(),
     currentRound: row.currentRound,
@@ -144,6 +154,9 @@ async function mutate(
 export function validateConfig(personsPerTable: number, roundCount: number) {
   if (!Number.isInteger(personsPerTable) || personsPerTable < MIN_PERSONS_PER_TABLE) {
     throw ApiError.badRequest(`personsPerTable must be a whole number of at least ${MIN_PERSONS_PER_TABLE}.`);
+  }
+  if (personsPerTable > MAX_PERSONS_PER_TABLE) {
+    throw ApiError.badRequest(`A table seats at most ${MAX_PERSONS_PER_TABLE} people.`);
   }
   if (!Number.isInteger(roundCount) || roundCount < ROUND_LIMITS.min || roundCount > ROUND_LIMITS.max) {
     throw ApiError.badRequest(`roundCount must be between ${ROUND_LIMITS.min} and ${ROUND_LIMITS.max}.`);
@@ -220,57 +233,40 @@ export function validateConclaveDates(d: DateFields, opts: { isNew: boolean }) {
 }
 
 /**
- * Status from the clock and the admin's choices. "running" only once the start
- * date & time have arrived (or rounds have run). Terminal statuses an admin set
- * are final and never recomputed.
+ * Status from the admin's choices (and the registration close time).
+ *
+ *  - completed / cancelled are final.
+ *  - "running" only once the admin starts round 1 (never by the clock); it
+ *    stays running until the admin marks it completed, or the last round's time
+ *    is over (see autocomplete.service).
+ *  - Registration closes when tables are generated or locked, when the admin
+ *    switches it off, or at the optional close date & time.
  */
 export function evaluateConclaveStatus(data: any): { status: string; isRegistrationOpen: boolean } {
   try {
-    const rawStatus = String(data?.status || "").trim();
-    const statusLower = rawStatus.toLowerCase();
+    const statusLower = String(data?.status || "").trim().toLowerCase();
+    if (statusLower === "completed") return { status: ConclaveStatus.completed, isRegistrationOpen: false };
+    if (statusLower === "cancelled") return { status: ConclaveStatus.cancelled, isRegistrationOpen: false };
+    if (statusLower === "running") return { status: ConclaveStatus.running, isRegistrationOpen: false };
 
-    // 1. Preserve terminal statuses (completed or cancelled) - never auto-reopen
-    if (statusLower === "completed" || statusLower === "cancelled") {
-      return {
-        status: statusLower === "completed" ? ConclaveStatus.completed : ConclaveStatus.cancelled,
-        isRegistrationOpen: false,
-      };
-    }
-
-    // 2. An admin-started conclave stays running until an admin explicitly finishes it!
-    if (statusLower === "running") {
-      return { status: ConclaveStatus.running, isRegistrationOpen: false };
-    }
-
-    // 3. Registrations are strictly closed once the conclave schedule is marked as locked!
-    if (data?.isScheduleLocked || statusLower === "locked") {
+    // Generating tables (or locking them) closes registration for good.
+    if (data?.schedule || data?.isScheduleLocked || statusLower === "locked") {
       return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
     }
 
-    // 4. Admin registration override (Open / Closed)
-    const registrationOverride = String(data?.registrationOverride ?? "").toLowerCase();
-    if (registrationOverride === "open") {
-      return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
-    }
-    if (registrationOverride === "closed") {
-      return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
-    }
+    const override = String(data?.registrationOverride ?? "").toLowerCase();
+    if (override === "closed") return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
+    if (override === "open") return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
 
-    // 5. If registration start date is in the future and not overridden:
+    // "auto": open from the optional start, closed after the optional close time.
     const now = new Date();
-    const regStart = data?.regStartDate ? toDate(data.regStartDate) : null;
-    const regStartDateTime = combineDateTime(regStart, data?.regStartTime, "start");
-    if (regStartDateTime && now < regStartDateTime) {
-      return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
-    }
-
-    // 6. Registrations remain open up to the conclave status being marked as locked!
+    const regStart = combineDateTime(toDate(data?.regStartDate), data?.regStartTime, "start");
+    const regEnd = combineDateTime(toDate(data?.regEndDate), data?.regEndTime, "end");
+    if (regStart && now < regStart) return { status: ConclaveStatus.registrationNotOpen, isRegistrationOpen: false };
+    if (regEnd && now > regEnd) return { status: ConclaveStatus.registrationClosed, isRegistrationOpen: false };
     return { status: ConclaveStatus.registrationOpen, isRegistrationOpen: true };
   } catch {
-    return {
-      status: data?.status || ConclaveStatus.registrationOpen,
-      isRegistrationOpen: data?.isRegistrationOpen ?? true,
-    };
+    return { status: data?.status || ConclaveStatus.registrationOpen, isRegistrationOpen: data?.isRegistrationOpen ?? true };
   }
 }
 
@@ -286,31 +282,15 @@ export function normalizeTime(val: unknown): string | null {
   return typeof val === "string" ? val.trim() : null;
 }
 
-/** Round length: admin-tuned talking cadence × table size.
- * If blockMinutes is configured in settings, round duration is blockMinutes (move timing = blockMinutes - speaking - referral).
- * Otherwise, round duration is (speaking + referral) × seats + move buffer from settings.
- */
-export function roundDurationMs(
-  personsPerTable: number | null | undefined,
-  timing: RoundTiming,
-  blockMinutes?: unknown,
-  extensionSeconds?: number | null,
-): number {
-  const p = Math.max(1, Number(personsPerTable) || 1);
-  const active = (timing.bioSeconds + timing.referralSeconds) * 1000 * p;
-  const extMs = Math.max(0, (Number(extensionSeconds) || 0) * 1000);
-  const numBlock = Number(blockMinutes);
-
-  if (Number.isFinite(numBlock) && numBlock > 0) {
-    const baseBlockMs = numBlock * 60 * 1000;
-    return baseBlockMs + extMs;
-  }
-  const bufferMs = (timing.bufferSeconds || 0) * 1000;
-  return active + bufferMs + extMs;
-}
-
 const ALL_STATUSES = new Set<string>(Object.values(ConclaveStatus));
 const OVERRIDES = new Set(["auto", "open", "closed"]);
+
+/** 60 / 120 / 300 seconds, or null if absent/invalid. */
+function moveSecondsInput(v: unknown): number | null {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  return (MOVE_SECONDS_OPTIONS as readonly number[]).includes(n) ? n : null;
+}
 
 function dateInput(v: unknown, field: string): Date | null {
   if (v === null || v === undefined || v === "") return null;
@@ -351,7 +331,7 @@ export interface CreateInput {
   chiefGuests?: unknown;
   personsPerTable?: number;
   roundCount?: number;
-  roundDurationMinutes?: number;
+  moveSeconds?: number;
   memberLimit?: number;
   captainLimit?: number;
   region?: string;
@@ -366,7 +346,7 @@ export async function createConclave(input: CreateInput): Promise<string> {
   const defaults = await getConclaveDefaults();
   const personsPerTable = intInput(input.personsPerTable, defaults.personsPerTable, "personsPerTable");
   const roundCount = intInput(input.roundCount, defaults.roundCount, "roundCount");
-  const roundDurationMinutes = intInput(input.roundDurationMinutes, defaults.roundDurationMinutes || 15, "roundDurationMinutes");
+  const moveSeconds = moveSecondsInput(input.moveSeconds) ?? DEFAULT_MOVE_SECONDS;
   validateConfig(personsPerTable, roundCount);
   validateConclaveDates(input, { isNew: true });
 
@@ -394,7 +374,7 @@ export async function createConclave(input: CreateInput): Promise<string> {
     chiefGuests: Array.isArray(input.chiefGuests) ? input.chiefGuests : [],
     personsPerTable,
     roundCount,
-    roundDurationMinutes,
+    moveSeconds,
     roundExtensionSeconds: 0,
     memberLimit: intInput(input.memberLimit, 100, "memberLimit") || 100,
     captainLimit: intInput(input.captainLimit, 12, "captainLimit") || 12,
@@ -466,11 +446,10 @@ export async function updateConclave(id: string, body: Record<string, any>): Pro
       u.personsPerTable = p;
       u.roundCount = r;
     }
-    if (body.roundDurationMinutes !== undefined) {
-      u.roundDurationMinutes = Math.max(5, Math.min(60, Number(body.roundDurationMinutes) || 15));
-    }
-    if (body.roundProgressionMode !== undefined) {
-      u.roundProgressionMode = body.roundProgressionMode === "automatic" ? "automatic" : "manual";
+    if (body.moveSeconds !== undefined) {
+      const m = moveSecondsInput(body.moveSeconds);
+      if (m === null) throw ApiError.badRequest("Move time must be 1, 2 or 5 minutes.");
+      u.moveSeconds = m;
     }
     if (!Object.keys(u).length) throw ApiError.badRequest("Nothing to update.");
 
@@ -597,10 +576,8 @@ export async function notifyConclaveDetailsUpdated(
       }
     };
 
-    // 1. Broadcast to conclave FCM topic
-    void notifyConclave(conclaveId, payload).catch(() => { });
-
-    // 2. Notify all registered attendees
+    // Each registered member: one push (their personal topic) + an inbox entry.
+    // (Not also the conclave topic — that delivered every notice twice.)
     const attendees = await registrantsOf(conclaveId);
     for (const att of attendees) {
       const uid = att.userId;
@@ -721,7 +698,6 @@ export async function completeConclave(id: string) {
 /** Start a round (round 1 starts the conclave). */
 export async function startRound(id: string, roundNumber: number, adminUid: string): Promise<Date> {
   if (!Number.isInteger(roundNumber) || roundNumber < 1) throw ApiError.badRequest("roundNumber must be a positive whole number.");
-  const timing = await getRoundTiming();
   const roundStartedAt = new Date();
 
   await mutate(
@@ -731,18 +707,18 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
       if (roundNumber > (row.roundCount ?? 0)) throw ApiError.badRequest(`This conclave has only ${row.roundCount} rounds.`);
       if (TERMINAL_STATUSES.has(row.status)) throw ApiError.conflict(`This conclave is ${row.status}.`);
 
-      // In automatic mode, rounds auto-advance on the clock.
-      // In manual mode, every round is explicitly started by the admin.
-      if (row.roundProgressionMode === "automatic" && roundNumber > 1 && row.status === ConclaveStatus.running && row.currentRoundStartedAt && row.currentRound >= 1) {
-        const roundMs = roundDurationMs(row.personsPerTable, timing, row.roundDurationMinutes ?? row.legacy?.roundBlockMinutes, row.roundExtensionSeconds);
-        const liveRound = row.currentRound + Math.floor((Date.now() - row.currentRoundStartedAt.getTime()) / roundMs);
-        if (roundNumber <= liveRound) {
-          const shown = Math.min(liveRound, row.roundCount || liveRound);
-          throw ApiError.conflict(
-            `Round ${roundNumber} has already run — the conclave is on round ${shown}. Rounds advance automatically, so you don't need to start them by hand.`,
-            { liveRound: shown },
-          );
-        }
+      // Rounds only move forward, one at a time: the next round may be started
+      // early (even in automatic mode), but never one that already ran, and
+      // never by skipping ahead.
+      const live = liveClock(row);
+      if (row.status === ConclaveStatus.running && roundNumber <= live.round) {
+        throw ApiError.conflict(
+          `Round ${roundNumber} has already started — the conclave is on round ${live.round}. Rounds can't be restarted.`,
+          { liveRound: live.round },
+        );
+      }
+      if (roundNumber > live.round + 1) {
+        throw ApiError.badRequest(`Start round ${live.round + 1} next — rounds can't be skipped.`, { nextRound: live.round + 1 });
       }
 
       if (roundNumber === 1) {
@@ -838,14 +814,18 @@ export async function closeRound(id: string) {
   const curRound = row.currentRound || 1;
   if (curRound >= (row.roundCount || 4)) return completeConclave(id);
 
-  // Move the anchor far enough back that the current round reads as ended.
-  const endedAnchor = new Date(Date.now() - 16 * 60 * 1000);
+  // End the round now: move its anchor back so its talk time (+ extension)
+  // reads as just finished. Manual mode then waits for the admin; automatic
+  // mode starts the move break from now.
   await mutate(
     id,
     "round.close",
     (r) => {
       if (r.status !== ConclaveStatus.running) throw ApiError.badRequest("Only a running conclave round can be closed.");
-      return { isRoundPaused: false, roundPausedAt: null, roundElapsedMsBeforePause: null, currentRoundStartedAt: endedAnchor };
+      const m = materialize(r);
+      const ext = (m.roundExtensionSeconds ?? r.roundExtensionSeconds ?? 0) * 1000;
+      const endedAnchor = new Date(Date.now() - phases(r).talkMs - ext);
+      return { ...m, isRoundPaused: false, roundPausedAt: null, roundElapsedMsBeforePause: null, currentRoundStartedAt: endedAnchor };
     },
     { roundNumber: curRound },
   );
@@ -859,57 +839,83 @@ export async function closeRound(id: string) {
   return { closedRound: curRound, isEnded: true };
 }
 
+/**
+ * Manual ⇄ automatic, at any time (even mid-conclave). The clock is first
+ * pinned to the round it is actually on, so nothing jumps:
+ *  - automatic → manual: the round in progress stays; later rounds wait.
+ *  - manual → automatic while a finished round is waiting: the move break
+ *    starts now (not back when that round ended).
+ */
 export async function setProgressionMode(id: string, mode: string): Promise<string> {
   const normMode = mode === "automatic" ? "automatic" : "manual";
   await mutate(
     id,
     "conclave.set_progression_mode",
-    async () => ({
-      roundProgressionMode: normMode,
-    }),
+    (row) => {
+      if (TERMINAL_STATUSES.has(row.status)) throw ApiError.conflict(`This conclave is ${row.status}.`);
+      if ((row.roundProgressionMode ?? "manual") === normMode) return {};
+      const patch: ConclavePatch = { ...materialize(row), roundProgressionMode: normMode };
+      if (normMode === "automatic" && row.status === ConclaveStatus.running && !row.isRoundPaused) {
+        const live = liveClock(row);
+        if (live.phase === "waiting") {
+          const ext = (row.roundExtensionSeconds ?? 0) * 1000;
+          patch.currentRoundStartedAt = new Date(Date.now() - phases(row).talkMs - ext);
+        }
+      }
+      return patch;
+    },
     { mode: normMode },
   );
   return normMode;
 }
 
-/** Live extend active round time (e.g. +5 mins, +10 mins, +15 mins). */
-export async function extendRound(id: string, additionalSeconds: number, _adminUid: string): Promise<{ ok: boolean; roundExtensionSeconds: number }> {
-  if (!Number.isFinite(additionalSeconds) || additionalSeconds <= 0) {
-    throw ApiError.badRequest("additionalSeconds must be a positive number.");
+/**
+ * Extra time for the round in progress (+1 / +2 / +5 min), added AFTER the
+ * referral slot — bios and referrals keep their fixed times. For rare cases
+ * where tables want longer one-to-ones.
+ */
+export async function extendRound(id: string, additionalSeconds: number): Promise<{ ok: boolean; roundExtensionSeconds: number }> {
+  if (!(EXTEND_SECONDS_OPTIONS as readonly number[]).includes(additionalSeconds)) {
+    throw ApiError.badRequest("A round can be extended by 1, 2 or 5 minutes.");
   }
-
-  const { row: before } = await getConclaveOrThrow(id);
-  if (before.status !== ConclaveStatus.running) {
-    throw ApiError.conflict(`Cannot extend a round when conclave is ${before.status}.`);
-  }
-
-  const currentExt = Number(before.roundExtensionSeconds) || 0;
-  const nextExt = currentExt + additionalSeconds;
-
+  let total = 0;
   await mutate(
     id,
     "round.extend",
-    async () => ({
-      roundExtensionSeconds: nextExt,
-    }),
-    { addedSeconds: additionalSeconds, totalExtensionSeconds: nextExt }
+    (row) => {
+      if (row.status !== ConclaveStatus.running) throw ApiError.conflict(`Only a running conclave's round can be extended.`);
+      const m = materialize(row);
+      const pinned = { ...row, ...m } as ConclaveRow;
+      const live = liveClock(pinned);
+      if (!["bio", "referral", "extension"].includes(live.phase)) {
+        throw ApiError.conflict("Extend a round while it is in progress — this one has already finished.");
+      }
+      total = (pinned.roundExtensionSeconds ?? 0) + additionalSeconds;
+      if (total > MAX_EXTENSION_SECONDS) {
+        throw ApiError.badRequest(`A round can be extended by at most ${MAX_EXTENSION_SECONDS / 60} minutes in total.`);
+      }
+      return { ...m, roundExtensionSeconds: total };
+    },
+    { addedSeconds: additionalSeconds },
   );
-
-  return { ok: true, roundExtensionSeconds: nextExt };
+  return { ok: true, roundExtensionSeconds: total };
 }
 
-/** Set base round duration in minutes (e.g. 10m - 45m). */
-export async function setRoundDuration(id: string, durationMinutes: number): Promise<{ ok: boolean; roundDurationMinutes: number }> {
-  const mins = Math.max(5, Math.min(60, Math.round(Number(durationMinutes) || 15)));
+/** Automatic mode's break between rounds: 1, 2 or 5 minutes. */
+export async function setMoveSeconds(id: string, seconds: number): Promise<{ ok: boolean; moveSeconds: number }> {
+  const m = moveSecondsInput(seconds);
+  if (m === null) throw ApiError.badRequest("Move time must be 1, 2 or 5 minutes.");
   await mutate(
     id,
-    "conclave.set_round_duration",
-    async () => ({
-      roundDurationMinutes: mins,
-    }),
-    { roundDurationMinutes: mins }
+    "conclave.set_move_time",
+    (row) => {
+      if (TERMINAL_STATUSES.has(row.status)) throw ApiError.conflict(`This conclave is ${row.status}.`);
+      // Pin first, so changing the break doesn't renumber rounds already reached.
+      return { ...materialize(row), moveSeconds: m };
+    },
+    { moveSeconds: m },
   );
-  return { ok: true, roundDurationMinutes: mins };
+  return { ok: true, moveSeconds: m };
 }
 
 // ---------------------------------------------------------------------------

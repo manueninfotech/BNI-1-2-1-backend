@@ -109,13 +109,49 @@ describe("lifecycle", () => {
     expect(pushes.length).toBeGreaterThan(0);
   });
 
-  it("refuses to restart a round that the clock has already passed", async () => {
+  it("rounds only move forward: no restarting, no skipping (manual and automatic)", async () => {
     const id = await makeConclave();
     await pgdb.update(conclaves).set({ schedule: { rounds: [] }, roundCount: 4 }).where(eq(conclaves.id, id));
     await as("admin-1", () => svc.startRound(id, 1, "admin-1"));
-    // Pretend round 1 started long ago → the clock is on a later round.
-    await pgdb.update(conclaves).set({ currentRoundStartedAt: new Date(Date.now() - 6 * 3_600_000) }).where(eq(conclaves.id, id));
-    await expect(as("admin-1", () => svc.startRound(id, 2, "admin-1"))).rejects.toMatchObject({ status: 409 });
+    // Manual (default): round 1 can't be restarted, round 3 can't be skipped to,
+    // round 2 can be started whenever the admin is ready (even early).
+    await expect(as("admin-1", () => svc.startRound(id, 1, "admin-1"))).rejects.toMatchObject({ status: 409 });
+    await expect(as("admin-1", () => svc.startRound(id, 3, "admin-1"))).rejects.toMatchObject({ status: 400 });
+    await as("admin-1", () => svc.startRound(id, 2, "admin-1"));
+    // Automatic: the clock has moved on to a later round → an earlier one can't be started.
+    await pgdb
+      .update(conclaves)
+      .set({ roundProgressionMode: "automatic", currentRoundStartedAt: new Date(Date.now() - 40 * 60_000) })
+      .where(eq(conclaves.id, id));
+    await expect(as("admin-1", () => svc.startRound(id, 3, "admin-1"))).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("extending adds +1/+2/+5 min to the live round only; move time is 1/2/5 min", async () => {
+    const id = await makeConclave();
+    await pgdb.update(conclaves).set({ status: "running", currentRound: 1, roundCount: 4, personsPerTable: 8, currentRoundStartedAt: new Date(Date.now() - 60_000) }).where(eq(conclaves.id, id));
+    await expect(as("admin-1", () => svc.extendRound(id, 180))).rejects.toMatchObject({ status: 400 });
+    const { result } = await as("admin-1", () => svc.extendRound(id, 120));
+    expect(result.roundExtensionSeconds).toBe(120);
+    await as("admin-1", () => svc.extendRound(id, 300));
+    expect((await svc.getConclaveOrThrow(id)).row.roundExtensionSeconds).toBe(420);
+    await expect(as("admin-1", () => svc.setMoveSeconds(id, 90))).rejects.toMatchObject({ status: 400 });
+    await as("admin-1", () => svc.setMoveSeconds(id, 300));
+    expect((await svc.getConclaveOrThrow(id)).row.moveSeconds).toBe(300);
+    // A round that has finished (manual mode, waiting for the admin) can't be extended.
+    await pgdb.update(conclaves).set({ currentRoundStartedAt: new Date(Date.now() - 60 * 60_000) }).where(eq(conclaves.id, id));
+    await expect(as("admin-1", () => svc.extendRound(id, 60))).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("switching to automatic mid-conclave starts the move break now, not in the past", async () => {
+    const id = await makeConclave();
+    // Manual round 1 finished 30 min ago and has been waiting for the admin.
+    await pgdb.update(conclaves).set({ status: "running", currentRound: 1, roundCount: 4, personsPerTable: 8, moveSeconds: 120, currentRoundStartedAt: new Date(Date.now() - 42 * 60_000) }).where(eq(conclaves.id, id));
+    await as("admin-1", () => svc.setProgressionMode(id, "automatic"));
+    const { row } = await svc.getConclaveOrThrow(id);
+    expect(row.roundProgressionMode).toBe("automatic");
+    expect(row.currentRound).toBe(1); // didn't jump ahead
+    // Round 1 now reads as just ended → round 2 starts after the 2-minute break.
+    expect(Math.abs(Date.now() - row.currentRoundStartedAt!.getTime() - 12 * 60_000)).toBeLessThan(5_000);
   });
 
   it("pause and resume preserve the elapsed time", async () => {
@@ -178,6 +214,21 @@ describe("schedule generation", () => {
     expect(row).toMatchObject({ action: "schedule.generate", metadata: { participants: 7, captains: 2, regenerated: false } });
   });
 
+  it("closes registration, and seats extra captains as members for the whole conclave", async () => {
+    const id = await makeConclave();
+    await seedRoster(id);
+    // 3 captains for a 2-table roster: the system keeps 2 anchors (best category mix).
+    const [extra] = await pgdb.select().from(registrations).where(and(eq(registrations.conclaveId, id), eq(registrations.role, "member"))).limit(1);
+    await pgdb.update(registrations).set({ role: "captain" }).where(and(eq(registrations.conclaveId, id), eq(registrations.userId, extra.userId)));
+    await as("admin-1", () => generateForConclave(id, {}));
+
+    const regs = await pgdb.select().from(registrations).where(eq(registrations.conclaveId, id));
+    expect(regs.filter((r) => r.role === "captain")).toHaveLength(2);
+    expect(regs.filter((r) => r.role === "member")).toHaveLength(5);
+    const { row } = await svc.getConclaveOrThrow(id);
+    expect(row).toMatchObject({ isRegistrationOpen: false, registrationOverride: "closed", status: "registrationClosed" });
+  });
+
   it("explains a captain-count mismatch and refuses to regenerate while running", async () => {
     const id = await makeConclave();
     await seedRoster(id);
@@ -190,23 +241,33 @@ describe("schedule generation", () => {
 });
 
 describe("auto-complete sweep", () => {
-  it("completes finished running conclaves (audited as system) and leaves live ones", async () => {
-    const done = await makeConclave({ name: "Done" });
+  it("completes a conclave once its last round's time is over; never mid-way or while paused", async () => {
+    const lastDone = await makeConclave({ name: "Last round over" });
+    const waiting = await makeConclave({ name: "Manual, waiting for round 2" });
+    const autoDone = await makeConclave({ name: "Automatic, all rounds over" });
     const live = await makeConclave({ name: "Live" });
-    await pgdb.update(conclaves).set({ status: "running", currentRound: 1, roundCount: 2, currentRoundStartedAt: new Date(Date.now() - 5 * 3_600_000) }).where(eq(conclaves.id, done));
-    await pgdb.update(conclaves).set({ status: "running", currentRound: 1, roundCount: 2, currentRoundStartedAt: new Date() }).where(eq(conclaves.id, live));
+    const paused = await makeConclave({ name: "Paused on last round" });
+    const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000);
+    const base = { status: "running", roundCount: 2, personsPerTable: 8 } as const;
+    await pgdb.update(conclaves).set({ ...base, currentRound: 2, currentRoundStartedAt: hoursAgo(1) }).where(eq(conclaves.id, lastDone));
+    await pgdb.update(conclaves).set({ ...base, currentRound: 1, currentRoundStartedAt: hoursAgo(5) }).where(eq(conclaves.id, waiting));
+    await pgdb.update(conclaves).set({ ...base, roundProgressionMode: "automatic", currentRound: 1, currentRoundStartedAt: hoursAgo(1) }).where(eq(conclaves.id, autoDone));
+    await pgdb.update(conclaves).set({ ...base, currentRound: 2, currentRoundStartedAt: new Date() }).where(eq(conclaves.id, live));
+    await pgdb.update(conclaves).set({ ...base, currentRound: 2, currentRoundStartedAt: hoursAgo(1), isRoundPaused: true, roundElapsedMsBeforePause: 60_000 }).where(eq(conclaves.id, paused));
 
-    expect(await sweepFinishedConclaves()).toBe(1);
-    expect((await svc.getConclaveOrThrow(done)).row).toMatchObject({ status: "completed", currentRound: 2 });
-    expect((await svc.getConclaveOrThrow(live)).row.status).toBe("running");
-    const [a] = await pgdb.select().from(auditLog).where(and(eq(auditLog.action, "conclave.auto_complete"), eq(auditLog.entityId, done)));
+    expect(await sweepFinishedConclaves()).toBe(2);
+    expect((await svc.getConclaveOrThrow(lastDone)).row).toMatchObject({ status: "completed", currentRound: 2 });
+    expect((await svc.getConclaveOrThrow(autoDone)).row).toMatchObject({ status: "completed", currentRound: 2 });
+    for (const id of [waiting, live, paused]) expect((await svc.getConclaveOrThrow(id)).row.status).toBe("running");
+    const [a] = await pgdb.select().from(auditLog).where(and(eq(auditLog.action, "conclave.auto_complete"), eq(auditLog.entityId, lastDone)));
     expect(a).toBeTruthy();
   });
 
-  it("isFinished honours the day boundary", () => {
-    const timing = { bioSeconds: 60, referralSeconds: 30, bufferSeconds: 120 };
-    const yesterday = new Date(Date.now() - 2 * 86_400_000);
-    expect(isFinished({ currentRoundStartedAt: null, currentRound: 0, roundCount: 4, personsPerTable: 5, startDate: yesterday, endDate: null, legacy: {} }, timing)).toBe(true);
+  it("isFinished: a 'running' conclave with no round anchor is over once its day has passed", () => {
+    const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000);
+    expect(
+      isFinished({ currentRoundStartedAt: null, currentRound: 0, roundCount: 4, personsPerTable: 5, startDate: twoDaysAgo, endDate: null, isRoundPaused: false, roundElapsedMsBeforePause: null, roundProgressionMode: "manual", roundExtensionSeconds: 0, moveSeconds: 120 }),
+    ).toBe(true);
   });
 });
 

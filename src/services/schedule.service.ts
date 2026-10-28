@@ -5,8 +5,8 @@ import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import { generateSchedule, validate, tableCountFor, type ConclaveConfig } from "../engine/index.js";
 import { resolveCaptains, type ServerParticipant } from "../domain/captains.js";
-import { ROLE_LOCKED_STATUSES } from "../domain/conclave.js";
-import { validateConfig, evaluateConclaveStatus, toView } from "./conclave.service.js";
+import { ConclaveStatus, ROLE_LOCKED_STATUSES } from "../domain/conclave.js";
+import { validateConfig } from "./conclave.service.js";
 import { fetchUsers, isActiveUser } from "./user.service.js";
 import { getAutoLogoutHours, getConclaveDefaults } from "./settings.service.js";
 import { notifyConclaveChanged } from "./live.service.js";
@@ -18,7 +18,6 @@ export interface GenerateOptions {
   autoFillCaptains?: boolean;
   personsPerTable?: number;
   roundCount?: number;
-  roundDurationMinutes?: number;
 }
 
 /**
@@ -82,10 +81,6 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     const defaults = await getConclaveDefaults();
     let personsPerTable = conclave.personsPerTable || defaults.personsPerTable;
     let roundCount = conclave.roundCount || defaults.roundCount;
-    const roundDurationMinutes =
-      typeof opts.roundDurationMinutes === "number" && opts.roundDurationMinutes > 0
-        ? opts.roundDurationMinutes
-        : (conclave.roundDurationMinutes || defaults.roundDurationMinutes);
     if (opts.personsPerTable !== undefined || opts.roundCount !== undefined) {
       personsPerTable = Number(opts.personsPerTable ?? personsPerTable);
       roundCount = Number(opts.roundCount ?? roundCount);
@@ -138,7 +133,6 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
       throw e;
     }
 
-    const evaluated = evaluateConclaveStatus(toView(conclave));
     const scheduleSummary = {
       tableCount: schedule.tableCount,
       coverage: schedule.stats.coverage,
@@ -149,12 +143,13 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
       .set({
         personsPerTable,
         roundCount,
-        roundDurationMinutes,
         seed,
         schedule: schedule as unknown as Record<string, unknown>,
         participants,
-        status: evaluated.status,
-        isRegistrationOpen: evaluated.isRegistrationOpen,
+        // Generating the tables closes registration (organisers' rule).
+        status: ConclaveStatus.registrationClosed,
+        isRegistrationOpen: false,
+        registrationOverride: "closed",
         scheduleSummary,
         warnings: validation.warnings,
         snapshot: { activeOnly, takenAt: new Date().toISOString(), participantCount: participants.length, skippedInactiveCount: skippedInactive },

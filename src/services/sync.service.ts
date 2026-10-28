@@ -5,7 +5,8 @@ import { env } from "../config/env.js";
 import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import { ScheduleIndex, type StoredSchedule, type StoredParticipant } from "../domain/scheduleIndex.js";
-import { getConclaveOrThrow, evaluateConclaveStatus, roundDurationMs, toView, type ConclaveRow } from "./conclave.service.js";
+import { getConclaveOrThrow, evaluateConclaveStatus, toView, type ConclaveRow } from "./conclave.service.js";
+import { DEFAULT_MOVE_SECONDS, liveClock, phases, referralSlot, roundEndMs, roundStartMs, type ClockRow } from "../domain/roundClock.js";
 import { fetchUsers } from "./user.service.js";
 import { notifyUser, recordUserNotification } from "./notification.service.js";
 import { getNotificationTemplates, fillTemplate, getRoundTiming, type RoundTiming } from "./settings.service.js";
@@ -54,36 +55,17 @@ export interface SyncPayload {
 type Mark = { isPresent: boolean; at: string | null; by: string };
 
 /** Clock tolerance for phone timestamps (phones correct with the server offset, but not perfectly). */
-const CLOCK_SLACK_MS = 2 * 60_000;
+const CLOCK_SLACK_MS = 30_000;
 const REFERRAL_STATUSES = new Set(["Pending", "Accepted", "Completed", "Declined"]);
 
 /**
- * When referrals could be given in round `n`: the round's ACTIVE phase, exactly
- * as the app shows it — each person's turn (bio, then their referral time),
- * table by table — and closed at the transition ("Talking time is over…").
- * Same numbers as the app: admin-tuned bio/referral seconds × the conclave's
- * persons-per-table. (An earlier rule opened referrals only after ALL bios,
- * which disagreed with the app and silently dropped referrals given during
- * earlier turns.)
+ * When referrals may be given in round `n`: the round's referral slot, which
+ * follows everyone's bios (organisers' rule, 2026-10-28) — 8 per table: 8:00–12:00
+ * into the round. The app locks the referral button outside this slot.
  */
-export function referralWindow(
-  row: Pick<ConclaveRow, "currentRound" | "currentRoundStartedAt" | "personsPerTable" | "roundDurationMinutes" | "roundExtensionSeconds" | "legacy">,
-  timing: RoundTiming,
-  roundNumber: number,
-): { opens: number; closes: number } | null {
-  if (!row.currentRoundStartedAt || !row.currentRound) return null;
-  const roundMs = roundDurationMs(row.personsPerTable, timing, row.roundDurationMinutes ?? row.legacy?.roundBlockMinutes, row.roundExtensionSeconds);
-  const roundStartMs = row.currentRoundStartedAt.getTime() + (roundNumber - row.currentRound) * roundMs;
-  const p = Math.max(1, row.personsPerTable ?? 1);
-  const speakingMs = timing.bioSeconds * 1000 * p;
-  const referralMs = timing.referralSeconds * 1000 * p;
-  // Referral window opens immediately after speaking time concludes, and closes when referral exchange concludes.
-  // The remainder of the round duration is the move timing for table rotation.
-  const opens = roundStartMs + speakingMs;
-  const closes = opens + referralMs;
-  return { opens, closes };
+export function referralWindow(row: ClockRow, roundNumber: number): { opens: number; closes: number } | null {
+  return referralSlot(row, roundNumber);
 }
-
 
 export async function syncConclave(conclaveId: string, callerUid: string, payload: SyncPayload) {
   const serverReceivedAt = Date.now();
@@ -211,21 +193,23 @@ export async function syncConclave(conclaveId: string, callerUid: string, payloa
         // windows can only be estimated (rounds may have been closed early), so
         // a late sync for a past round is accepted rather than risk losing it.
         const madeAt = r.timestamp ? Date.parse(r.timestamp) : NaN;
-        const liveRound = conclave.currentRound || 0;
+        // The round the clock was on when the referral was made (automatic
+        // mode moves on without a stored update).
+        const liveRound = liveClock(conclave, Number.isFinite(madeAt) ? Math.min(madeAt, Date.now()) : Date.now()).round || conclave.currentRound || 0;
         if (!insecure && liveRound && round > liveRound) {
           errors.push(`Rejected referral ${id}: round ${round} hasn't started yet.`);
           acceptedReferrals.push(id);
           continue;
         }
         if (!insecure && round === liveRound && Number.isFinite(madeAt)) {
-          const w = referralWindow(conclave, timing, round);
+          const w = referralWindow(conclave, round);
           if (w && madeAt < w.opens - CLOCK_SLACK_MS) {
-            errors.push(`Rejected referral ${id}: it was made before round ${round} started.`);
+            errors.push(`Rejected referral ${id}: referrals open after everyone's bio in round ${round}.`);
             acceptedReferrals.push(id);
             continue;
           }
           if (w && madeAt > w.closes + CLOCK_SLACK_MS) {
-            errors.push(`Rejected referral ${id}: it was made after round ${round}'s talking time ended.`);
+            errors.push(`Rejected referral ${id}: round ${round}'s referral time had ended.`);
             acceptedReferrals.push(id);
             continue;
           }
@@ -302,7 +286,8 @@ async function buildState(
   const schedule = conclave.schedule as any;
   const getUid = (p: any) => p?._originalUid || p?.uid || p?.userId || String(p?.id);
   const isLive = conclave.status === "running" || conclave.status === "active";
-  const roundMs = roundDurationMs(conclave.personsPerTable, ctx.timing, conclave.roundDurationMinutes ?? conclave.legacy?.roundBlockMinutes, conclave.roundExtensionSeconds);
+  const { talkMs } = phases(conclave);
+  const stepMs = talkMs + (conclave.moveSeconds ?? DEFAULT_MOVE_SECONDS) * 1000;
 
   // Referrals given TO this member.
   const received = await pgdb.select().from(referrals).where(and(eq(referrals.conclaveId, conclaveId), eq(referrals.toUserId, callerUid)));
@@ -322,14 +307,22 @@ async function buildState(
 
   // A round's time label: the live anchor while running, else the planned start.
   const roundTimeLabel = (n: number) => {
-    let base = conclave.startDate ? new Date(conclave.startDate) : new Date();
-    const [hh, mm] = String(conclave.startTime ?? "").split(":");
-    if (hh && mm) base.setHours(Number(hh) || 9, Number(mm) || 0, 0, 0);
-    if (isLive && conclave.currentRoundStartedAt && conclave.currentRound) {
-      base = new Date(conclave.currentRoundStartedAt.getTime() - (conclave.currentRound - 1) * roundMs);
+    // Exact for rounds the clock has started; otherwise an estimate (rounds in
+    // manual mode start when the admin says so).
+    let start = roundStartMs(conclave, n);
+    if (start === null) {
+      if (isLive && conclave.currentRoundStartedAt && conclave.currentRound) {
+        const end = roundEndMs(conclave, conclave.currentRound) ?? conclave.currentRoundStartedAt.getTime() + talkMs;
+        start = end + (conclave.moveSeconds ?? DEFAULT_MOVE_SECONDS) * 1000 + Math.max(0, n - conclave.currentRound - 1) * stepMs;
+      } else {
+        const base = conclave.startDate ? new Date(conclave.startDate) : new Date();
+        const [hh, mm] = String(conclave.startTime ?? "").split(":");
+        if (hh && mm) base.setHours(Number(hh) || 9, Number(mm) || 0, 0, 0);
+        start = base.getTime() + (n - 1) * stepMs;
+      }
     }
-    const start = new Date(base.getTime() + (n - 1) * roundMs);
-    return `${formatTime12h(start)} - ${formatTime12h(new Date(start.getTime() + roundMs))}`;
+    const end = roundEndMs(conclave, n) ?? start + talkMs;
+    return `${formatTime12h(new Date(start))} - ${formatTime12h(new Date(end))}`;
   };
 
   let tableNumber: number | null = null;
@@ -410,7 +403,8 @@ async function buildState(
     endTime: conclave.endTime,
     agendaDocument: conclave.agendaDocument ?? null,
     roundTiming: ctx.timing,
-    roundDurationMinutes: conclave.roundDurationMinutes ?? 15,
+    moveSeconds: conclave.moveSeconds ?? DEFAULT_MOVE_SECONDS,
+    roundProgressionMode: conclave.roundProgressionMode ?? "manual",
     roundExtensionSeconds: conclave.roundExtensionSeconds ?? 0,
   };
 
@@ -438,7 +432,8 @@ async function buildState(
     syncedReferralIds: [...new Set(ctx.acceptedReferrals)],
     newReferralsReceived,
     roundTiming: ctx.timing,
-    roundDurationMinutes: conclave.roundDurationMinutes ?? 15,
+    moveSeconds: conclave.moveSeconds ?? DEFAULT_MOVE_SECONDS,
+    roundProgressionMode: conclave.roundProgressionMode ?? "manual",
     roundExtensionSeconds: conclave.roundExtensionSeconds ?? 0,
     isRoundPaused: Boolean(conclave.isRoundPaused),
     roundPausedAt: view.roundPausedAt,

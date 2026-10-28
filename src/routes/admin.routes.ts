@@ -53,7 +53,7 @@ router.post("/conclaves/:id/resume-round", asyncHandler(c.resumeRound));
 router.post("/conclaves/:id/close-round", asyncHandler(c.closeRound));
 router.post("/conclaves/:id/progression-mode", asyncHandler(c.setProgressionMode));
 router.post("/conclaves/:id/extend-round", asyncHandler(c.extendRound));
-router.patch("/conclaves/:id/round-duration", asyncHandler(c.setRoundDuration));
+router.patch("/conclaves/:id/move-time", asyncHandler(c.setMoveTime));
 
 // Scheduling
 router.post("/conclaves/:id/generate-schedule", asyncHandler(c.generate));

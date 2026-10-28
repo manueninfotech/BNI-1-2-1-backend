@@ -33,8 +33,10 @@ function assertOpen(row: ConclaveRow) {
   if (row.isScheduleLocked || statusLower === "locked") {
     throw ApiError.conflict("Registration is closed because the conclave schedule is locked.");
   }
+  // Closed if the admin/schedule closed it (stored flag) or the close time has
+  // passed since it was last saved (evaluated now).
   const evalResult = evaluateConclaveStatus(toView(row));
-  if (!evalResult.isRegistrationOpen) {
+  if (!row.isRegistrationOpen || !evalResult.isRegistrationOpen) {
     throw ApiError.conflict("Registration is not open for this conclave.");
   }
 }

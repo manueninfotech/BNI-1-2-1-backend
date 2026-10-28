@@ -4,16 +4,15 @@ import { conclaves } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
 import { ConclaveStatus } from "../domain/conclave.js";
 import { runAsSystem } from "../observability/context.js";
-import { roundDurationMs } from "./conclave.service.js";
-import { getRoundTiming } from "./settings.service.js";
+import { liveClock, roundEndMs } from "../domain/roundClock.js";
 import { notifyConclaveChanged } from "./live.service.js";
 
 /**
  * Auto-completion sweep.
  *
- * Rounds advance on the clock, so a conclave also finishes on the clock. The
- * STORED status must catch up, or a finished conclave lingers as "running" and
- * blocks the organiser from starting the next one.
+ * A conclave is marked completed once its last round's time is over (the
+ * admin can also mark it completed). The STORED status must catch up, or a
+ * finished conclave lingers as "running" and blocks starting the next one.
  *
  * Safe with several server instances: rows are claimed with
  * FOR UPDATE SKIP LOCKED, so two instances never complete the same conclave.
@@ -22,7 +21,12 @@ import { notifyConclaveChanged } from "./live.service.js";
 
 type Row = typeof conclaves.$inferSelect;
 
-/** Is this running conclave finished (all rounds elapsed, or its day has passed)? */
+/**
+ * Is this running conclave finished? Yes once its LAST round's time (talk +
+ * any extension) is over, with a minute's grace — in either mode. A paused
+ * conclave never is. Safety net: a conclave started over 24 hours ago, or a
+ * "running" one with no round anchor whose day has passed, is over too.
+ */
 export function isFinished(
   row: Pick<
     Row,
@@ -32,66 +36,36 @@ export function isFinished(
     | "personsPerTable"
     | "startDate"
     | "endDate"
-    | "legacy"
-  > &
-    Partial<
-      Pick<
-        Row,
-        | "isRoundPaused"
-        | "roundProgressionMode"
-        | "roundDurationMinutes"
-        | "roundExtensionSeconds"
-      >
-    >,
-  timing: Awaited<ReturnType<typeof getRoundTiming>>,
+    | "isRoundPaused"
+    | "roundElapsedMsBeforePause"
+    | "roundProgressionMode"
+    | "roundExtensionSeconds"
+    | "moveSeconds"
+  >,
   now = Date.now(),
 ): boolean {
-  // 1. A paused conclave/round must NEVER be auto-completed by the sweep!
   if (row.isRoundPaused) return false;
-
-  // 2. In manual progression mode, intermediate rounds do not auto-advance to next round.
-  // But if all rounds have been reached (baseRound >= roundCount), complete it once final round ends!
-  const roundCount = row.roundCount ?? 0;
-  const baseRound = Math.max(1, row.currentRound || 1);
-  if (row.roundProgressionMode === "manual" && baseRound < roundCount) return false;
-  if (row.currentRoundStartedAt && roundCount > 0) {
-    // The anchor is the start of the last-started round; count rounds remaining from it.
-    const baseRound = Math.max(1, row.currentRound || 1);
-    const remaining = Math.max(1, roundCount - baseRound + 1);
-    const roundMs = roundDurationMs(
-      row.personsPerTable,
-      timing,
-      row.roundDurationMinutes ?? (row.legacy as any)?.roundBlockMinutes,
-      row.roundExtensionSeconds,
-    );
-    // Add a 5-minute safety buffer past the nominal end time before auto-completing
-    const endsAt = row.currentRoundStartedAt.getTime() + remaining * roundMs + 5 * 60 * 1000;
-    if (now > endsAt) return true;
-  }
-
-  // 3. For conclaves that were never started (no currentRoundStartedAt):
-  // If the scheduled day has passed, it is considered over.
-  if (!row.currentRoundStartedAt) {
-    const day = row.endDate ?? row.startDate;
-    if (day) {
-      const endOfDay = new Date(day);
-      endOfDay.setHours(23, 59, 59, 999);
-      if (now > endOfDay.getTime()) return true;
+  if (row.currentRoundStartedAt) {
+    const live = liveClock(row, now);
+    if (live.phase === "done") {
+      const ends = roundEndMs(row, live.round);
+      if (ends !== null && now > ends + FINISH_GRACE_MS) return true;
     }
-  } else {
-    // If it was started, only consider it abandoned if started more than 24 hours ago
-    const startedMs = row.currentRoundStartedAt.getTime();
-    if (now - startedMs > 24 * 60 * 60 * 1000) {
-      return true;
-    }
+    return now - row.currentRoundStartedAt.getTime() > ABANDONED_AFTER_MS;
   }
-
+  const day = row.endDate ?? row.startDate;
+  if (day) {
+    const endOfDay = new Date(day);
+    endOfDay.setHours(23, 59, 59, 999);
+    if (now > endOfDay.getTime()) return true;
+  }
   return false;
 }
 
-/** Completes every finished running conclave. Returns how many it closed. */
+const FINISH_GRACE_MS = 60_000;
+const ABANDONED_AFTER_MS = 24 * 60 * 60_000;
+
 export async function sweepFinishedConclaves(): Promise<number> {
-  const timing = await getRoundTiming();
   return pgdb.transaction(async (tx) => {
     const running = await tx
       .select()
@@ -101,7 +75,7 @@ export async function sweepFinishedConclaves(): Promise<number> {
 
     let completed = 0;
     for (const row of running) {
-      if (!isFinished(row, timing)) continue;
+      if (!isFinished(row)) continue;
       const [after] = await tx
         .update(conclaves)
         .set({

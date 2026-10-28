@@ -286,7 +286,7 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
         ...(patch.phone !== undefined ? { phone: patch.phone } : {}),
         ...(patch.designation !== undefined ? { designation: patch.designation } : {}),
         updatedAt: new Date()
-      }).where(eq(users.uid, uid)).catch(() => {});
+      }).where(eq(users.uid, uid));
       return [updated];
     });
 
@@ -362,7 +362,7 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
         ...(patch.category ? { category: patch.category } : {}),
         ...(patch.phone !== undefined ? { phone: patch.phone } : {}),
         ...(patch.email !== undefined ? { email: patch.email } : {}),
-      }).where(eq(registrations.userId, uid)).catch(() => {});
+      }).where(eq(registrations.userId, uid));
     }
 
     return {

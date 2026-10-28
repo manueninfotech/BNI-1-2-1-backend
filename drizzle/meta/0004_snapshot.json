@@ -1,5 +1,5 @@
 {
-  "id": "d2f62545-7d46-4d08-9e05-006ad5cdb19e",
+  "id": "6468bae7-25f4-4c3f-a899-679276634212",
   "prevId": "2ce3ba8c-1cd8-4b68-9ee9-79786d0d7e1e",
   "version": "7",
   "dialect": "postgresql",
@@ -751,12 +751,12 @@
           "notNull": true,
           "default": "'manual'"
         },
-        "round_duration_minutes": {
-          "name": "round_duration_minutes",
+        "move_seconds": {
+          "name": "move_seconds",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
-          "default": 15
+          "default": 120
         },
         "round_extension_seconds": {
           "name": "round_extension_seconds",

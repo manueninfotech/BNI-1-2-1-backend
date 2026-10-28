@@ -1,4 +1,6 @@
 import { readSetting, writeSetting } from "../repositories/settings.repo.js";
+import { ApiError } from "../middleware/errors.js";
+import { MAX_PERSONS_PER_TABLE } from "../domain/roundClock.js";
 
 export const DEFAULT_AUTO_LOGOUT_HOURS = 5;
 
@@ -40,48 +42,33 @@ function posInt(v: any, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
 }
 
-// ---- Round timing (talking cadence, seconds; mirrors the app) -------------
+// ---- Round timing ----------------------------------------------------------
+// Fixed by the organisers: 1 min bio and 30 s referral per person. Not
+// editable. `bufferSeconds` is the default move break (automatic mode); each
+// conclave can choose 1 / 2 / 5 min. Kept in this shape because the app reads it.
 export interface RoundTiming {
   bioSeconds: number;
   referralSeconds: number;
   bufferSeconds: number;
 }
-const ROUND_TIMING_DEFAULTS: RoundTiming = { bioSeconds: 60, referralSeconds: 30, bufferSeconds: 120 };
-
-let cachedRoundTiming: RoundTiming = { ...ROUND_TIMING_DEFAULTS };
+const FIXED_ROUND_TIMING: RoundTiming = { bioSeconds: 60, referralSeconds: 30, bufferSeconds: 120 };
 
 export function getCachedRoundTiming(): RoundTiming {
-  return cachedRoundTiming;
+  return { ...FIXED_ROUND_TIMING };
 }
-
 export async function getRoundTiming(): Promise<RoundTiming> {
-  const d = await readSettings("roundTiming");
-  cachedRoundTiming = {
-    bioSeconds: posInt(d.bioSeconds, ROUND_TIMING_DEFAULTS.bioSeconds),
-    referralSeconds: posInt(d.referralSeconds, ROUND_TIMING_DEFAULTS.referralSeconds),
-    bufferSeconds: posInt(d.bufferSeconds, ROUND_TIMING_DEFAULTS.bufferSeconds),
-  };
-  return cachedRoundTiming;
+  return { ...FIXED_ROUND_TIMING };
 }
-export async function setRoundTiming(input: Partial<RoundTiming>): Promise<RoundTiming> {
-  const current = await getRoundTiming();
-  const next: RoundTiming = {
-    bioSeconds: posInt(input.bioSeconds, current.bioSeconds),
-    referralSeconds: posInt(input.referralSeconds, current.referralSeconds),
-    bufferSeconds: posInt(input.bufferSeconds, current.bufferSeconds),
-  };
-  await writeSettings("roundTiming", next);
-  cachedRoundTiming = next;
-  return next;
+export async function setRoundTiming(_input: Partial<RoundTiming>): Promise<RoundTiming> {
+  throw ApiError.badRequest("Bio (1 min) and referral (30 s) times are fixed and can't be changed.");
 }
 
 // ---- Default conclave config ----------------------------------------------
 export interface ConclaveDefaults {
   personsPerTable: number;
   roundCount: number;
-  roundDurationMinutes: number;
 }
-const CONCLAVE_DEFAULTS: ConclaveDefaults = { personsPerTable: 7, roundCount: 6, roundDurationMinutes: 15 };
+const CONCLAVE_DEFAULTS: ConclaveDefaults = { personsPerTable: 7, roundCount: 6 };
 
 let cachedConclaveDefaults: ConclaveDefaults = { ...CONCLAVE_DEFAULTS };
 
@@ -94,16 +81,14 @@ export async function getConclaveDefaults(): Promise<ConclaveDefaults> {
   cachedConclaveDefaults = {
     personsPerTable: posInt(d.personsPerTable, CONCLAVE_DEFAULTS.personsPerTable),
     roundCount: posInt(d.roundCount, CONCLAVE_DEFAULTS.roundCount),
-    roundDurationMinutes: posInt(d.roundDurationMinutes, CONCLAVE_DEFAULTS.roundDurationMinutes),
   };
   return cachedConclaveDefaults;
 }
 export async function setConclaveDefaults(input: Partial<ConclaveDefaults>): Promise<ConclaveDefaults> {
   const current = await getConclaveDefaults();
   const next: ConclaveDefaults = {
-    personsPerTable: posInt(input.personsPerTable, current.personsPerTable),
+    personsPerTable: Math.min(MAX_PERSONS_PER_TABLE, posInt(input.personsPerTable, current.personsPerTable)),
     roundCount: posInt(input.roundCount, current.roundCount),
-    roundDurationMinutes: posInt(input.roundDurationMinutes, current.roundDurationMinutes),
   };
   await writeSettings("conclaveDefaults", next);
   cachedConclaveDefaults = next;

@@ -50,7 +50,8 @@ export class ScheduleIndex {
   constructor(schedule: StoredSchedule, participants: StoredParticipant[]) {
     const uidOf = new Map<number, string>();
     for (const p of participants) {
-      const uid = p?._originalUid || (p as any)?.uid || (p as any)?.userId || (p?.id != null ? String(p.id) : null);
+      // Real user ids only — an engine's numeric seat id is never a uid.
+      const uid = p?._originalUid || (p as any)?.uid || (p as any)?.userId || null;
       if (uid) uidOf.set(p.id, uid);
     }
 
