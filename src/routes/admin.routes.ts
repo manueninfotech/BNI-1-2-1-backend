@@ -45,6 +45,7 @@ router.delete("/conclaves/:id", asyncHandler(c.deleteConclave));
 router.post("/conclaves/:id/registration", asyncHandler(c.setRegistration));
 router.post("/conclaves/:id/cancel", asyncHandler(c.cancel));
 router.post("/conclaves/:id/complete", asyncHandler(c.complete));
+router.post("/conclaves/:id/finish", asyncHandler(c.complete));
 router.post("/conclaves/:id/lock-schedule", asyncHandler(c.lockSchedule));
 router.post("/conclaves/:id/agenda-document", asyncHandler(c.uploadAgendaDocument));
 router.post("/conclaves/:id/start-round", asyncHandler(c.startRound));

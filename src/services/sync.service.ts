@@ -285,6 +285,11 @@ async function buildState(
   const participants = (Array.isArray(conclave.participants) ? conclave.participants : []) as any[];
   const schedule = conclave.schedule as any;
   const getUid = (p: any) => p?._originalUid || p?.uid || p?.userId || String(p?.id);
+  const matchesUid = (p: any, uid: string) => {
+    if (getUid(p) === uid) return true;
+    if (Array.isArray(p?.uids) && p.uids.includes(uid)) return true;
+    return false;
+  };
   const isLive = conclave.status === "running" || conclave.status === "active";
   const { talkMs } = phases(conclave);
   const stepMs = talkMs + (conclave.moveSeconds ?? DEFAULT_MOVE_SECONDS) * 1000;
@@ -330,7 +335,7 @@ async function buildState(
   let tableOccupants: any[] = [];
   let mySchedule: any[] = [];
 
-  const me = participants.find((p) => getUid(p) === callerUid);
+  const me = participants.find((p) => matchesUid(p, callerUid));
   if (me && schedule?.rounds) {
     const presence = new Map<string, boolean>();
     const marked = new Set<string>();

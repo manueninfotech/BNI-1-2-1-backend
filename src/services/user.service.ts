@@ -199,7 +199,7 @@ export async function getMe({ uid, email, emailVerified }: MeInput) {
       .limit(1);
   }
 
-  const captain = await isLiveCaptain(uid);
+  const captain = (await isLiveCaptain(uid)) || (user?.role === "captain") || Boolean(user?.isCaptain);
   return {
     uid,
     id: uid,
