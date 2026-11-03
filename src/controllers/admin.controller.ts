@@ -232,6 +232,7 @@ export async function generate(req: AuthedRequest, res: Response) {
     autoFillCaptains: req.body?.autoFillCaptains === true,
     personsPerTable: req.body?.personsPerTable !== undefined ? Number(req.body.personsPerTable) : undefined,
     roundCount: req.body?.roundCount !== undefined ? Number(req.body.roundCount) : undefined,
+    tableCount: req.body?.tableCount !== undefined ? Number(req.body.tableCount) : undefined,
   });
   res.json({ message: "Schedule generated successfully.", ...result });
 }

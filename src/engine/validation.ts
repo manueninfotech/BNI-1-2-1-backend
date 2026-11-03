@@ -29,7 +29,7 @@ export function validate(
   const P = config.personsPerTable;
   const R = config.roundCount;
   const A = participants.length;
-  const T = tableCountFor(A, P);
+  const T = config.tableCount !== undefined && config.tableCount > 0 ? config.tableCount : tableCountFor(A, P);
   const minRounds = config.minRounds ?? DEFAULT_LIMITS.minRounds;
   const maxRounds = config.maxRounds ?? DEFAULT_LIMITS.maxRounds;
   const captainSet = new Set(captainIds);

@@ -27,6 +27,7 @@ export interface ConclaveConfig {
   roundCount: number;
   /** Seed for deterministic, reproducible schedules. */
   seed: number;
+  tableCount?: number;
   minRounds?: number;
   maxRounds?: number;
   autoLogoutHours?: number;

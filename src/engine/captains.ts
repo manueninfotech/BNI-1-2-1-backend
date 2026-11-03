@@ -15,8 +15,9 @@ export function autoSelectCaptains(
   participants: Participant[],
   personsPerTable: number,
   seed: number,
+  targetTableCount?: number,
 ): number[] {
-  const T = tableCountFor(participants.length, personsPerTable);
+  const T = targetTableCount !== undefined && targetTableCount > 0 ? targetTableCount : tableCountFor(participants.length, personsPerTable);
   if (T <= 0) return [];
 
   const rng = makeRng(seed ^ 0x9e3779b9);

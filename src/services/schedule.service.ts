@@ -18,6 +18,7 @@ export interface GenerateOptions {
   autoFillCaptains?: boolean;
   personsPerTable?: number;
   roundCount?: number;
+  tableCount?: number;
 }
 
 /**
@@ -87,7 +88,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
       validateConfig(personsPerTable, roundCount);
     }
 
-    const tablesRequired = tableCountFor(participants.length, personsPerTable);
+    const tablesRequired = opts.tableCount !== undefined && Number(opts.tableCount) > 0 ? Math.max(1, Number(opts.tableCount)) : tableCountFor(participants.length, personsPerTable);
     const skipCaptainCheck = opts.autoFillCaptains && designatedCaptainIds.length === 0;
     if (!skipCaptainCheck && designatedCaptainIds.length < tablesRequired) {
       const diff = tablesRequired - designatedCaptainIds.length;
@@ -106,8 +107,8 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     }
 
     const seed = typeof conclave.seed === "number" ? conclave.seed : Date.now();
-    const captainIds = resolveCaptains(participants, designatedCaptainIds, personsPerTable, seed);
-    const config: ConclaveConfig = { personsPerTable, roundCount, seed };
+    const captainIds = resolveCaptains(participants, designatedCaptainIds, personsPerTable, seed, tablesRequired);
+    const config: ConclaveConfig = { personsPerTable, roundCount, seed, tableCount: tablesRequired };
 
     const validation = validate(participants, captainIds, config);
     if (!validation.ok) {

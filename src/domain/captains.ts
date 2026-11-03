@@ -42,8 +42,9 @@ export function resolveCaptains(
   designatedIds: number[],
   personsPerTable: number,
   seed: number,
+  targetTableCount?: number,
 ): number[] {
-  const T = tableCountFor(participants.length, personsPerTable);
+  const T = targetTableCount !== undefined && targetTableCount > 0 ? targetTableCount : tableCountFor(participants.length, personsPerTable);
   if (T <= 0) return [];
 
   const byId = new Map(participants.map((p) => [p.id, p]));
