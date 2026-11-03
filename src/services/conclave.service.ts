@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { pgdb } from "../db/client.js";
-import { conclaves, registrations, users } from "../db/schema.js";
+import { conclaves, referrals, registrations, users } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import {
@@ -43,7 +43,7 @@ type ConclavePatch = Partial<typeof conclaves.$inferInsert>;
 
 const iso = (d: Date | null | undefined) => (d ? d.toISOString() : null);
 
-export function toView(row: ConclaveRow, registrationCount?: number) {
+export function toView(row: ConclaveRow, registrationCount?: number, referralCount?: number) {
   return {
     // Legacy-only fields first, so real columns always win.
     ...(row.legacy ?? {}),
@@ -102,6 +102,7 @@ export function toView(row: ConclaveRow, registrationCount?: number) {
     createdAt: iso(row.createdAt),
     updatedAt: iso(row.updatedAt),
     ...(registrationCount !== undefined ? { registrationCount } : {}),
+    ...(referralCount !== undefined ? { referralCount } : {}),
   };
 }
 function clockView(row: ConclaveRow) {
@@ -952,7 +953,11 @@ export const normRegion = (r: unknown) => String(r ?? "").toLowerCase().replace(
  */
 export async function listConclaves(region?: string): Promise<ConclaveView[]> {
   const rows = await pgdb
-    .select({ row: conclaves, regCount: sql<number>`(SELECT count(*)::int FROM ${registrations} r WHERE r.conclave_id = ${conclaves.id})` })
+    .select({
+      row: conclaves,
+      regCount: sql<number>`(SELECT count(*)::int FROM ${registrations} r WHERE r.conclave_id = ${conclaves.id})`,
+      refCount: sql<number>`(SELECT count(*)::int FROM ${referrals} ref WHERE ref.conclave_id = ${conclaves.id})`,
+    })
     .from(conclaves)
     .orderBy(desc(conclaves.startDate));
 
@@ -960,7 +965,7 @@ export async function listConclaves(region?: string): Promise<ConclaveView[]> {
   const out: ConclaveView[] = [];
   const fixes: { id: string; status: string; isRegistrationOpen: boolean }[] = [];
 
-  for (const { row, regCount } of rows) {
+  for (const { row, regCount, refCount } of rows) {
     if (target && normRegion(row.region) !== target) continue;
 
     const count = regCount > 0 ? regCount : Array.isArray(row.participants) ? row.participants.length : 0;
@@ -979,7 +984,7 @@ export async function listConclaves(region?: string): Promise<ConclaveView[]> {
       const e = evaluateConclaveStatus(toView(row));
       effective = { ...row, status: e.status, isRegistrationOpen: e.isRegistrationOpen };
     }
-    out.push(toView(effective, count));
+    out.push(toView(effective, count, refCount));
   }
 
   // Persist self-heal corrections (audited as automatic fixes), best-effort.
