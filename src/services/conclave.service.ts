@@ -642,6 +642,7 @@ export async function cancelConclave(id: string) {
 export async function lockConclaveSchedule(id: string) {
   await mutate(id, "conclave.lock_schedule", (row) => {
     if (!row.schedule) throw ApiError.badRequest("Generate a schedule before publishing it.");
+    if (row.isScheduleLocked) throw ApiError.conflict("Schedule is already locked.");
     return {
       isScheduleLocked: true,
       isRegistrationOpen: false,
@@ -649,11 +650,10 @@ export async function lockConclaveSchedule(id: string) {
       status: row.status === ConclaveStatus.completed ? ConclaveStatus.completed : ConclaveStatus.registrationClosed,
     };
   });
-  // Best-effort: publishing is when members learn their schedule is ready and
-  // captains which table they anchor.
-  try {
-    await notifyScheduleReady(id);
-  } catch {}
+  // Fire notifications asynchronously in parallel so lock completes immediately without blocking
+  void notifyScheduleReady(id).catch((err) => {
+    console.error(`notifyScheduleReady failed for conclave ${id}:`, err);
+  });
 }
 
 async function registrantsOf(id: string) {
@@ -667,31 +667,42 @@ async function registrantsOf(id: string) {
 export async function notifyScheduleReady(id: string): Promise<{ captains: number; members: number }> {
   let captains = 0;
   let members = 0;
-  for (const r of await registrantsOf(id)) {
-    try {
-      if (r.role === "captain") {
-        await notifyUser(
-          r.userId,
-          {
+  const registrants = await registrantsOf(id);
+
+  await Promise.allSettled(
+    registrants.map(async (r) => {
+      try {
+        if (r.role === "captain") {
+          const payload = {
             title: "You're a Table Captain ⭐",
             body: `You're the captain for Table ${r.tableNumber ?? "your table"}. Please take your table and get ready to scan.`,
+            type: "captain_assignment",
             data: { conclaveId: id, type: "captain_assignment", tableNumber: String(r.tableNumber ?? "") },
-          },
-          "round_alerts",
-        );
-        captains++;
-      } else {
-        await notifyUser(
-          r.userId,
-          { title: "Your conclave schedule is ready 📋", body: "Tap to view your table and who you'll be meeting.", data: { conclaveId: id, type: "schedule_ready" } },
-          "general",
-        );
-        members++;
+          };
+          await Promise.allSettled([
+            notifyUser(r.userId, payload, "round_alerts"),
+            recordUserNotification(r.userId, payload),
+          ]);
+          captains++;
+        } else {
+          const payload = {
+            title: "Your conclave schedule is ready 📋",
+            body: "Tap to view your table and who you'll be meeting.",
+            type: "schedule_ready",
+            data: { conclaveId: id, type: "schedule_ready" },
+          };
+          await Promise.allSettled([
+            notifyUser(r.userId, payload, "general"),
+            recordUserNotification(r.userId, payload),
+          ]);
+          members++;
+        }
+      } catch (err) {
+        console.warn(`Failed notifying user ${r.userId} for schedule ready:`, err);
       }
-    } catch {
-      // one bad token must not stop the broadcast
-    }
-  }
+    })
+  );
+
   return { captains, members };
 }
 
