@@ -8,6 +8,7 @@ import { ApiError } from "../middleware/errors.js";
 import { ROLE_LOCKED_STATUSES } from "../domain/conclave.js";
 import { registrationFeeOf } from "./registration.service.js";
 import { normalizePhone } from "./user.service.js";
+import { notifyUser, recordUserNotification } from "./notification.service.js";
 import type { ConclaveRow } from "./conclave.service.js";
 
 /**
@@ -237,7 +238,8 @@ export async function addMember(conclaveId: string, body: Record<string, any>, a
 const PROFILE_FIELDS = ["name", "company", "category", "chapter", "region", "state", "country"] as const;
 
 export async function updateMember(conclaveId: string, uid: string, body: Record<string, any>, role: AdminRole) {
-  return pgdb.transaction(async (tx) => {
+  let becameCaptain = false;
+  const result = await pgdb.transaction(async (tx) => {
     const [c] = await tx.select().from(conclaves).where(eq(conclaves.id, conclaveId)).for("share");
     if (!c) throw ApiError.notFound("Conclave not found.");
     assertMayManage(c, role);
@@ -259,6 +261,7 @@ export async function updateMember(conclaveId: string, uid: string, body: Record
         const frozen = membersFrozen(c);
         if (frozen) throw ApiError.conflict(frozen);
         patch.role = nextRole;
+        if (nextRole === "captain") becameCaptain = true;
       }
     }
 
@@ -299,6 +302,22 @@ export async function updateMember(conclaveId: string, uid: string, body: Record
     }
     return after;
   });
+  // A newly-promoted captain learns their role + table immediately (not only via
+  // the lock-time broadcast). Done after commit — FCM is a network call. Best-effort.
+  if (becameCaptain) {
+    const tableNumber = (result as { tableNumber?: number | null } | undefined)?.tableNumber ?? null;
+    const payload = {
+      title: "You're a Table Captain ⭐",
+      body: `You're the captain for Table ${tableNumber ?? "your table"}. Please take your table and get ready to scan.`,
+      type: "captain_assignment",
+      data: { conclaveId, type: "captain_assignment", tableNumber: String(tableNumber ?? "") },
+    };
+    await Promise.allSettled([
+      notifyUser(uid, payload, "round_alerts"),
+      recordUserNotification(uid, payload),
+    ]);
+  }
+  return result;
 }
 
 // --- Remove -------------------------------------------------------------------

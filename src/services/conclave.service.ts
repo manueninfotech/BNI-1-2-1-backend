@@ -650,7 +650,9 @@ export async function lockConclaveSchedule(id: string) {
       status: row.status === ConclaveStatus.completed ? ConclaveStatus.completed : ConclaveStatus.registrationClosed,
     };
   });
-  // Fire notifications asynchronously in parallel so lock completes immediately without blocking
+  // Re-locking throws ApiError.conflict above, so this only runs on the first
+  // lock — no duplicate "schedule ready" broadcast from a double-click (#6).
+  // Fire notifications asynchronously so lock completes immediately without blocking.
   void notifyScheduleReady(id).catch((err) => {
     console.error(`notifyScheduleReady failed for conclave ${id}:`, err);
   });
@@ -846,6 +848,15 @@ export async function closeRound(id: string) {
   if (row.status !== ConclaveStatus.running) throw ApiError.badRequest("Only a running conclave round can be closed.");
   const curRound = row.currentRound || 1;
   if (curRound >= (row.roundCount || 4)) return completeConclave(id);
+
+  // Idempotent: if this round's talk phase has already ended (we're already in
+  // the move break — e.g. a double-click), don't re-anchor and restart the move
+  // timer, and don't re-send the "Round Closed" push.
+  const anchorMs = row.currentRoundStartedAt ? new Date(row.currentRoundStartedAt).getTime() : Date.now();
+  const extMs = (row.roundExtensionSeconds ?? 0) * 1000;
+  if (!row.isRoundPaused && Date.now() >= anchorMs + phases(row).talkMs + extMs) {
+    return { closedRound: curRound, isEnded: true, alreadyClosed: true };
+  }
 
   // End the round now: move its anchor back so its talk time (+ extension)
   // reads as just finished. Manual mode then waits for the admin; automatic
