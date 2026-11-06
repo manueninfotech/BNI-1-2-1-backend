@@ -16,6 +16,9 @@ import {
  */
 export interface ServerParticipant extends Participant {
   _originalUid: string;
+  /** Profile photo, snapshotted into the schedule so the app can show faces in
+   * the round roster instead of initials (#5/#6). */
+  photoUrl?: string | null;
 }
 
 /**

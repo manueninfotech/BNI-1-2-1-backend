@@ -66,6 +66,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
         businessCategory: u.category || "Uncategorized",
         location: (u.location ?? { withinGuntur: true }) as never,
         chapter: u.chapter ?? null,
+        photoUrl: u.photoUrl ?? null,
         _originalUid: reg.userId,
       } as ServerParticipant);
       if (reg.role === "captain") designatedCaptainIds.push(id);
