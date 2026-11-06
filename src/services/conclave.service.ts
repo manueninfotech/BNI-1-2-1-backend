@@ -363,7 +363,17 @@ export async function createConclave(input: CreateInput): Promise<string> {
 
   const defaults = await getConclaveDefaults();
   const personsPerTable = intInput(input.personsPerTable, defaults.personsPerTable, "personsPerTable");
-  const roundCount = intInput(input.roundCount, defaults.roundCount, "roundCount");
+  let roundCount = intInput(input.roundCount, defaults.roundCount, "roundCount");
+  // The New-conclave form has no rounds field — rounds are chosen later, at
+  // schedule generation. So a stale/out-of-range *default* (e.g. a settings
+  // value edited below the minimum) must never block creation: clamp it into
+  // the allowed range. An explicitly-passed bad value still fails below.
+  if (input.roundCount === undefined) {
+    roundCount = Math.min(
+      ROUND_LIMITS.max,
+      Math.max(ROUND_LIMITS.min, roundCount || ROUND_LIMITS.min),
+    );
+  }
   const moveSeconds = moveSecondsInput(input.moveSeconds) ?? DEFAULT_MOVE_SECONDS;
   validateConfig(personsPerTable, roundCount);
   validateConclaveDates(input, { isNew: true });
