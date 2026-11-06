@@ -1121,9 +1121,34 @@ export async function listForMember(uid: string, email?: string) {
         : c.participants,
       isRegistered: !!reg,
       myRole: reg?.role ?? null,
-      myTableNumber: reg?.tableNumber ?? null,
+      // Members' registrations carry no table (only captains do), so fall back
+      // to their ROUND-1 table from the schedule — this is what lets the app
+      // show "go to Table N" as soon as the schedule is locked, before Round 1
+      // starts.
+      myTableNumber: reg?.tableNumber ?? firstRoundTableForUid(c.schedule, parts, uid),
     };
   });
+}
+
+/** This uid's Round-1 table from an in-memory schedule, or null. */
+function firstRoundTableForUid(
+  schedule: unknown,
+  participants: Record<string, unknown>[] | null,
+  uid: string,
+): number | null {
+  const parts = participants ?? [];
+  const uidOf = (p: Record<string, unknown>) =>
+    (p._originalUid as string) || (p.uid as string) || (p.userId as string) || String(p.id);
+  const byId = new Map<unknown, Record<string, unknown>>();
+  for (const p of parts) byId.set(p.id, p);
+  const round1 = (schedule as { rounds?: Array<{ tables?: Array<{ tableNumber: number; captainId?: unknown; memberIds?: unknown[] }> }> } | null)?.rounds?.[0];
+  for (const t of round1?.tables ?? []) {
+    for (const pid of [t.captainId, ...((t.memberIds ?? []) as unknown[])]) {
+      const p = byId.get(pid);
+      if (p && uidOf(p) === uid) return t.tableNumber;
+    }
+  }
+  return null;
 }
 
 /**
