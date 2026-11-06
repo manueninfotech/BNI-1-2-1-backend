@@ -665,21 +665,51 @@ async function registrantsOf(id: string) {
     .where(eq(registrations.conclaveId, id));
 }
 
+/**
+ * Maps each participant's uid to the table they sit at in ROUND 1, read from the
+ * generated schedule. Members' `registrations.tableNumber` is null (only captains
+ * get one), so this is how we tell a member which table to go to at the start.
+ */
+async function firstRoundTableByUid(id: string): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  const [row] = await pgdb
+    .select({ schedule: conclaves.schedule, participants: conclaves.participants })
+    .from(conclaves)
+    .where(eq(conclaves.id, id));
+  if (!row) return map;
+  const schedule = row.schedule as { rounds?: Array<{ tables?: Array<{ tableNumber: number; captainId?: unknown; memberIds?: unknown[] }> }> } | null;
+  const participants = (Array.isArray(row.participants) ? row.participants : []) as Array<Record<string, unknown>>;
+  const uidOf = (p: Record<string, unknown>) =>
+    (p._originalUid as string) || (p.uid as string) || (p.userId as string) || String(p.id);
+  const byId = new Map<unknown, Record<string, unknown>>();
+  for (const p of participants) byId.set(p.id, p);
+  const round1 = schedule?.rounds?.[0];
+  for (const t of round1?.tables ?? []) {
+    for (const pid of [t.captainId, ...((t.memberIds ?? []) as unknown[])]) {
+      const p = byId.get(pid);
+      if (p) map.set(uidOf(p), t.tableNumber);
+    }
+  }
+  return map;
+}
+
 /** Personal push to every registrant: members "schedule ready", captains their table. */
 export async function notifyScheduleReady(id: string): Promise<{ captains: number; members: number }> {
   let captains = 0;
   let members = 0;
   const registrants = await registrantsOf(id);
+  const tableByUid = await firstRoundTableByUid(id);
 
   await Promise.allSettled(
     registrants.map(async (r) => {
       try {
+        const table = r.tableNumber ?? tableByUid.get(r.userId) ?? null;
         if (r.role === "captain") {
           const payload = {
             title: "You're a Table Captain ⭐",
-            body: `You're the captain for Table ${r.tableNumber ?? "your table"}. Please take your table and get ready to scan.`,
+            body: `Your conclave is about to start. You're the captain for Table ${table ?? "your table"} — please take your table for Round 1 and get ready to scan.`,
             type: "captain_assignment",
-            data: { conclaveId: id, type: "captain_assignment", tableNumber: String(r.tableNumber ?? "") },
+            data: { conclaveId: id, type: "captain_assignment", tableNumber: String(table ?? ""), roundNumber: "1" },
           };
           await Promise.allSettled([
             notifyUser(r.userId, payload, "round_alerts"),
@@ -688,10 +718,12 @@ export async function notifyScheduleReady(id: string): Promise<{ captains: numbe
           captains++;
         } else {
           const payload = {
-            title: "Your conclave schedule is ready 📋",
-            body: "Tap to view your table and who you'll be meeting.",
+            title: "Your conclave is about to start 🏁",
+            body: table != null
+              ? `Please go to Table ${table} for Round 1. Tap to see who you'll be meeting.`
+              : "Your schedule is ready — tap to view your table and who you'll be meeting.",
             type: "schedule_ready",
-            data: { conclaveId: id, type: "schedule_ready" },
+            data: { conclaveId: id, type: "schedule_ready", tableNumber: String(table ?? ""), roundNumber: "1" },
           };
           await Promise.allSettled([
             notifyUser(r.userId, payload, "general"),
