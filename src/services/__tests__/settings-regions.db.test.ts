@@ -27,10 +27,10 @@ afterAll(async () => {
 });
 
 describe("categories", () => {
-  it("normalises: trims, de-dupes case-insensitively, sorts, pins Other last", async () => {
+  it("normalises: trims, capitalises the first letter, de-dupes, sorts, pins Other last", async () => {
     const { result } = await asAdmin(() => categories.setCategories([" Tax ", "other", "audit", "TAX", ""]));
-    expect(result).toEqual(["audit", "Tax", "other"]);
-    expect(await categories.listCategories()).toEqual(["audit", "Tax", "other"]);
+    expect(result).toEqual(["Audit", "Tax", "Other"]);
+    expect(await categories.listCategories()).toEqual(["Audit", "Tax", "Other"]);
   });
 
   it("rejects an empty list and duplicate adds", async () => {
@@ -63,6 +63,12 @@ describe("settings", () => {
   it("fills notification templates", async () => {
     await asAdmin(() => settingsSvc.setNotificationTemplates({ roundStarted: { title: "R{round}", body: "Go" } }));
     expect(await settingsSvc.resolveNotification("roundStarted", { round: 3 })).toEqual({ title: "R3", body: "Go" });
+  });
+
+  it("capitalises the first letter of configured regions", async () => {
+    const result = await settingsSvc.setRegions(["guntur Region", "hyderabad East"]);
+    expect(result).toEqual(["Guntur Region", "Hyderabad East"]);
+    expect(await settingsSvc.getRegions()).toEqual(["Guntur Region", "Hyderabad East"]);
   });
 });
 

@@ -36,12 +36,20 @@ describe("round shape", () => {
 });
 
 describe("manual mode (default)", () => {
-  it("phases, then waits for the admin; the last round reads as done", () => {
+  it("shows a move break, then waits for the admin; the last round reads as done", () => {
     expect(liveClock(row(), T0 + 1 * MIN)).toMatchObject({ round: 1, phase: "bio" });
     expect(liveClock(row(), T0 + 9 * MIN)).toMatchObject({ round: 1, phase: "referral" });
+    expect(liveClock(row(), T0 + 12 * MIN)).toMatchObject({ round: 1, phase: "move", phaseEndsMs: T0 + 14 * MIN });
+    expect(liveClock(row(), T0 + 13 * MIN)).toMatchObject({ round: 1, phase: "move", phaseEndsMs: T0 + 14 * MIN });
+    expect(liveClock(row(), T0 + 14 * MIN)).toMatchObject({ round: 1, phase: "waiting", phaseEndsMs: null });
     expect(liveClock(row(), T0 + 30 * MIN)).toMatchObject({ round: 1, phase: "waiting", phaseEndsMs: null });
     expect(roundStartMs(row(), 2)).toBeNull();
     expect(liveClock(row({ currentRound: 4 }), T0 + 30 * MIN).phase).toBe("done");
+  });
+
+  it("does not advance the next round when the move break ends", () => {
+    expect(roundStartMs(row(), 2)).toBeNull();
+    expect(liveClock(row(), T0 + 14 * MIN)).toMatchObject({ round: 1, phase: "waiting" });
   });
 });
 

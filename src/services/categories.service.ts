@@ -10,13 +10,16 @@ import { readSetting, writeSetting } from "../repositories/settings.repo.js";
 
 const KEY = "businessCategories";
 
+const capitalizeFirst = (value: string) => value.charAt(0).toLocaleUpperCase() + value.slice(1);
+
 /** Clean + de-dupe (case-insensitively), sort A–Z, pin "Other" last. */
 function normalize(list: unknown): string[] {
   if (!Array.isArray(list)) return [];
   const seen = new Set<string>();
   const out: string[] = [];
   for (const e of list) {
-    const s = String(e ?? "").trim();
+    const raw = String(e ?? "").trim();
+    const s = raw ? capitalizeFirst(raw) : "";
     if (!s) continue;
     const k = s.toLowerCase();
     if (seen.has(k)) continue;

@@ -14,11 +14,10 @@
  *  - The admin may extend a live round (+1 / +2 / +5 min). The extra time is
  *    added AFTER the referral slot (free time for one-to-ones); bios and the
  *    referral slot never move.
- *  - Progression is "manual" by default: the admin starts every round, and a
- *    finished round waits. In "automatic" mode, after a round (and any
- *    extension) a move break of 1 / 2 / 5 min follows (chosen per conclave),
- *    then the next round starts by itself. The mode can be switched at any
- *    time, even while the conclave runs.
+ *  - After a round (and any extension), a move break of 1 / 2 / 5 min follows
+ *    (chosen per conclave). Manual mode then waits for the admin to start the
+ *    next round; automatic mode starts it by itself. The mode can be switched
+ *    at any time, even while the conclave runs.
  *  - Pausing freezes the clock.
  */
 
@@ -134,6 +133,9 @@ export function liveClock(row: ClockRow, now = Date.now()): LiveClock {
   if (into < talkMs) return { round: k, phase: "referral", roundStartMs: start, phaseEndsMs: start + talkMs };
   if (into < talkMs + ext) return { round: k, phase: "extension", roundStartMs: start, phaseEndsMs: start + talkMs + ext };
   if (k >= total) return { round: k, phase: "done", roundStartMs: start, phaseEndsMs: null };
+  if (t < start + talkMs + ext + moveMs(row)) {
+    return { round: k, phase: "move", roundStartMs: start, phaseEndsMs: start + talkMs + ext + moveMs(row) };
+  }
   if (isAutomatic(row)) {
     return { round: k, phase: "move", roundStartMs: start, phaseEndsMs: start + talkMs + ext + moveMs(row) };
   }

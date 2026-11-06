@@ -97,13 +97,15 @@ export async function setConclaveDefaults(input: Partial<ConclaveDefaults>): Pro
 
 // ---- Regions --------------------------------------------------------------
 const REGION_DEFAULTS = ["Global BNI Network", "Guntur Region"];
+const capitalizeFirst = (value: string) => value.charAt(0).toLocaleUpperCase() + value.slice(1);
 
 function cleanList(list: unknown, fallback: string[]): string[] {
   if (!Array.isArray(list)) return fallback;
   const seen = new Set<string>();
   const out: string[] = [];
   for (const e of list) {
-    const s = String(e ?? "").trim();
+    const raw = String(e ?? "").trim();
+    const s = raw ? capitalizeFirst(raw) : "";
     if (!s || seen.has(s.toLowerCase())) continue;
     seen.add(s.toLowerCase());
     out.push(s);
