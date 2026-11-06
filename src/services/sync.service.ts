@@ -10,6 +10,7 @@ import { DEFAULT_MOVE_SECONDS, liveClock, phases, referralSlot, roundEndMs, roun
 import { fetchUsers } from "./user.service.js";
 import { notifyUser, recordUserNotification } from "./notification.service.js";
 import { getNotificationTemplates, fillTemplate, getRoundTiming, type RoundTiming } from "./settings.service.js";
+import { notifyConclaveChanged } from "./live.service.js";
 
 /**
  * Offline sync: the phone uploads attendance marks and referrals captured with
@@ -241,6 +242,9 @@ export async function syncConclave(conclaveId: string, callerUid: string, payloa
         }
       }
       acceptedReferrals.push(id);
+    }
+    if (acceptedReferrals.length > 0 || acceptedAttendance.length > 0) {
+      await notifyConclaveChanged(tx, conclaveId);
     }
   });
 
