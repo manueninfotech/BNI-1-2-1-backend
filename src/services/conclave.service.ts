@@ -796,6 +796,10 @@ export async function startRound(id: string, roundNumber: number, adminUid: stri
 
       if (roundNumber === 1) {
         if (!row.schedule) throw ApiError.badRequest("No schedule has been generated. Generate one before starting round 1.");
+        // Locking finalizes the seating AND notifies everyone their table — so a
+        // conclave must be locked before round 1 can start, not started on an
+        // unlocked (still-editable) schedule.
+        if (!row.isScheduleLocked) throw ApiError.badRequest("Lock & finalize the seating before starting round 1.");
         // One admin can't run two rooms at once.
         const [other] = await pgdb
           .select({ id: conclaves.id, name: conclaves.name })
