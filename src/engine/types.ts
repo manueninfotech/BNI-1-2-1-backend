@@ -34,7 +34,9 @@ export interface ConclaveConfig {
 }
 
 export const DEFAULT_LIMITS = {
-  minRounds: 4,
+  // 2 so short/test conclaves (and chapters that run fewer rounds) can schedule
+  // — the old floor of 4 forced every conclave to at least 4 rounds.
+  minRounds: 2,
   maxRounds: 8,
   autoLogoutHours: 5,
 } as const;
