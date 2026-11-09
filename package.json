@@ -2,7 +2,7 @@
   "name": "conclave-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "BNI 121 Conclave \u2014 API and matching engine",
+  "description": "BNI 121 Conclave — API and matching engine",
   "type": "module",
   "main": "src/index.ts",
   "engines": {
@@ -28,7 +28,7 @@
     "drizzle-orm": "^0.45.4",
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
-    "firebase-admin": "^14.1.0",
+    "firebase-admin": "^14.5.0",
     "pg": "^8.23.1",
     "razorpay": "^2.9.8",
     "tsx": "^4.22.5"
