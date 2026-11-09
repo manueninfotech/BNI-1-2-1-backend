@@ -83,7 +83,7 @@ export async function syncConclave(conclaveId: string, callerUid: string, payloa
   const { row: conclave } = await getConclaveOrThrow(conclaveId);
   const schedule = (conclave.schedule ?? null) as StoredSchedule | null;
   const participants = (Array.isArray(conclave.participants) ? conclave.participants : []) as StoredParticipant[];
-  const index = schedule && participants.length ? new ScheduleIndex(schedule, participants) : null;
+  const index = schedule && participants.length ? new ScheduleIndex(schedule, participants, conclave.standInCaptains ?? {}) : null;
 
   // ---- Validate attendance ------------------------------------------------
   const validAttendance: AttendanceRow[] = [];
@@ -371,14 +371,20 @@ async function buildState(
         if (!table) return null;
         const n = r.roundNumber;
         const status = n < current ? "Completed" : n === current && isLive ? "Active" : "Upcoming";
-        const cap = participants.find((p) => p.id === table.captainId);
-        const mates = participants.filter((p) => table.memberIds?.includes(p.id));
+        // This round's captain: the admin's stand-in if marked (and seated
+        // here), else the table's anchor; none in a captainless conclave.
+        const seated = participants.filter((p) => p.id === table.captainId || table.memberIds?.includes(p.id));
+        const standInUid = (conclave.standInCaptains ?? {})[String(n)]?.[String(table.tableNumber)];
+        const cap =
+          (standInUid ? seated.find((p) => matchesUid(p, standInUid)) : undefined) ??
+          (table.captainId === null ? undefined : seated.find((p) => p.id === table.captainId));
+        const mates = seated.filter((p) => p !== cap);
         return {
           number: n,
           status,
           table: `Table ${table.tableNumber}`,
           tableNumber: table.tableNumber,
-          captain: cap ? cap.name : "Unknown",
+          captain: cap ? cap.name : "",
           time: roundTimeLabel(n),
           participants: [...(cap ? [person(cap, true, n)] : []), ...mates.map((m) => person(m, false, n))],
         };

@@ -1,18 +1,32 @@
 // Schedule generation (spec §7). Social-golfer rotation with a hard
 // business-category coloring constraint.
 //
-// Decisions baked in:
-//   - Captains are fixed table anchors (one per table, all rounds).
+// Rules:
+//   - Captains are fixed table anchors (one per table, all rounds). A table may
+//     also have no anchor (captainless conclaves).
 //   - Business-category separation (C1) is HARD and never violated.
-//   - Repeat pairings (C2) are SOFT: minimized, allowed only if forced.
-//   - Objective: maximize the number of DISTINCT people each member meets.
+//   - Tables are BALANCED (organisers' rule): with A people at T tables, every
+//     table seats floor(A/T) or ceil(A/T), never more than P. 26 people at 5 per
+//     table -> 6 tables of 5,5,4,4,4,4.
+//   - Repeat pairings (C2) are SOFT: minimised, allowed only if forced.
+//   - Objective: maximise the number of DISTINCT people each member meets.
 //
-// Efficiency:
-//   - Ids are mapped to dense indices [0..A).
-//   - "Have these two met?" is an O(1) lookup in a single Uint8Array bit-matrix
-//     (A*A bytes; ~88KB at A=300), so the hot path does no Set hashing.
-//   - Per round the work is O(A * T) for placement plus O(T * P^2) to record
-//     pairings — linear in the schedule size.
+// Method, per round:
+//   1. Greedy: most-constrained members first, each to the category-safe table
+//      with the fewest people they have already met (ties: emptier table).
+//   2. Repair when a member has no safe seat: move one member out of a table
+//      (to another safe table with room) so the newcomer fits.
+//   3. Retry with a fresh seeded order if the round still dead-ends.
+//   4. Improve: swap pairs of members between tables whenever that lowers the
+//      round's repeat total (C1 and table sizes stay intact by construction).
+//
+// Mid-event re-planning: `planSchedule` keeps the rounds already played exactly
+// as they were, counts who has met whom in them, and plans only the rest — the
+// path walk-ins and new tables take.
+//
+// Efficiency: ids map to dense indices; "how often have these two met?" is an
+// O(1) lookup in one Uint8Array (A*A bytes: 25 MB at 5,000 people); table
+// categories are a flat counter array. Deterministic for a given seed.
 
 import {
   type ConclaveConfig,
@@ -35,26 +49,51 @@ export class InfeasibleRoundError extends Error {
   }
 }
 
-interface WorkingTable {
+/** One table to plan: its number and its fixed anchor (null = no captain). */
+export interface PlanTable {
   tableNumber: number;
-  captainIdx: number;
-  occupants: number[]; // dense indices, occupants[0] === captainIdx
-  cats: Set<number>; // category indices currently present
+  captainId: number | null;
 }
 
+export interface PlanInput {
+  participants: Participant[];
+  tables: PlanTable[];
+  config: ConclaveConfig;
+  /** Rounds already played, kept verbatim (their pairings count as "met"). */
+  history?: RoundSeating[];
+  /** First round to plan (default 1). Rounds before it come from `history`. */
+  fromRound?: number;
+}
+
+const BALANCED_ATTEMPTS = 24;
+const RELAXED_ATTEMPTS = 12;
+const IMPROVE_PASSES = 3;
+const SWAP_SAMPLE_TABLES = 16;
+
+/** Classic entry point: captains anchor tables 1..T in order. */
 export function generateSchedule(
   participants: Participant[],
   captainIds: number[],
   config: ConclaveConfig,
 ): Schedule {
+  return planSchedule({
+    participants,
+    tables: captainIds.map((captainId, i) => ({ tableNumber: i + 1, captainId })),
+    config,
+  });
+}
+
+export function planSchedule(input: PlanInput): Schedule {
+  const { participants, config } = input;
   const A = participants.length;
   const P = config.personsPerTable;
+  const fromRound = Math.max(1, input.fromRound ?? 1);
+  const T = input.tables.length;
 
   // --- dense index mapping --------------------------------------------------
   const idToIdx = new Map<number, number>();
   participants.forEach((p, i) => idToIdx.set(p.id, i));
 
-  // category -> index
   const catToIdx = new Map<string, number>();
   const catIdxOf = new Int32Array(A);
   for (let i = 0; i < A; i++) {
@@ -66,201 +105,313 @@ export function generateSchedule(
     }
     catIdxOf[i] = ci;
   }
+  const C = Math.max(1, catToIdx.size);
 
-  const captainIdxs = captainIds.map((id) => {
-    const idx = idToIdx.get(id);
-    if (idx === undefined) throw new Error(`Captain id ${id} not in participants.`);
-    return idx;
+  const anchorIdx = new Int32Array(T).fill(-1);
+  const anchorSet = new Set<number>();
+  input.tables.forEach((t, i) => {
+    if (t.captainId === null) return;
+    const idx = idToIdx.get(t.captainId);
+    if (idx === undefined) throw new Error(`Captain id ${t.captainId} not in participants.`);
+    if (anchorSet.has(idx)) throw new Error(`Captain id ${t.captainId} anchors two tables.`);
+    anchorIdx[i] = idx;
+    anchorSet.add(idx);
   });
-  const captainIdxSet = new Set(captainIdxs);
   const memberIdxs: number[] = [];
-  for (let i = 0; i < A; i++) if (!captainIdxSet.has(i)) memberIdxs.push(i);
+  for (let i = 0; i < A; i++) if (!anchorSet.has(i)) memberIdxs.push(i);
 
-  // global category frequency, used to order most-constrained members first
-  const catFreq = new Int32Array(catToIdx.size);
+  const catFreq = new Int32Array(C);
   for (let i = 0; i < A; i++) catFreq[catIdxOf[i]]++;
 
-  // --- met bit-matrix -------------------------------------------------------
+  // --- meeting counts (history first) ----------------------------------------
   const met = new Uint8Array(A * A);
-  const degree = new Int32Array(A); // distinct people each index has met
-  let uniquePairsMet = 0;
-  let repeatPairings = 0;
+  const meet = (occ: number[]) => {
+    for (let a = 0; a < occ.length; a++) {
+      for (let b = a + 1; b < occ.length; b++) {
+        const x = occ[a];
+        const y = occ[b];
+        if (met[x * A + y] < 255) {
+          met[x * A + y]++;
+          met[y * A + x]++;
+        }
+      }
+    }
+  };
 
   const rounds: RoundSeating[] = [];
-
-  for (let r = 1; r <= config.roundCount; r++) {
-    const roundRng = makeRng(config.seed + r * 0x1000193);
-    const tables = buildTables(captainIdxs, catIdxOf);
-
-    // Order members: most-constrained category first, shuffled within for
-    // cross-round variety. A higher global category frequency means more
-    // tables are likely already blocked, so seat those people earlier.
-    const ordered = stableSortByDesc(shuffle(memberIdxs, roundRng), (m) => catFreq[catIdxOf[m]]);
-
-    const tableOrder = shuffle(
-      tables.map((_, i) => i),
-      roundRng,
-    );
-
-    for (const m of ordered) {
-      placeMember(m, tables, tableOrder, catIdxOf, met, A, P, r);
+  for (const r of input.history ?? []) {
+    if (r.roundNumber >= fromRound) continue;
+    rounds.push(r);
+    for (const t of r.tables) {
+      const occ: number[] = [];
+      for (const id of [t.captainId, ...t.memberIds]) {
+        const idx = id === null || id === undefined ? undefined : idToIdx.get(id);
+        if (idx !== undefined) occ.push(idx);
+      }
+      meet(occ);
     }
+  }
 
-    // Record pairings for this completed round.
-    for (const t of tables) {
-      const occ = t.occupants;
-      for (let a = 0; a < occ.length; a++) {
-        for (let b = a + 1; b < occ.length; b++) {
-          const x = occ[a];
-          const y = occ[b];
-          const key = x * A + y;
-          if (met[key]) {
-            repeatPairings++;
-          } else {
-            met[key] = 1;
-            met[y * A + x] = 1;
-            degree[x]++;
-            degree[y]++;
-            uniquePairsMet++;
+  // --- plan the remaining rounds ---------------------------------------------
+  const ctx: RoundCtx = { A, T, P, C, catIdxOf, anchorIdx, memberIdxs, catFreq, met };
+  for (let r = fromRound; r <= config.roundCount; r++) {
+    const tables = planRound(ctx, config.seed, r);
+    for (const occ of tables) meet(occ);
+    rounds.push(toRoundSeating(r, tables, input.tables, anchorIdx, participants));
+  }
+  rounds.sort((a, b) => a.roundNumber - b.roundNumber);
+
+  const stats = computeStats(A, T, config.roundCount, met);
+  return { config, tableCount: T, rounds, stats };
+}
+
+// ---------------------------------------------------------------------------
+
+interface RoundCtx {
+  A: number;
+  T: number;
+  P: number;
+  C: number;
+  catIdxOf: Int32Array;
+  anchorIdx: Int32Array;
+  memberIdxs: number[];
+  catFreq: Int32Array;
+  met: Uint8Array;
+}
+
+/** Plans one round; returns each table's occupants (anchor first, if any). */
+function planRound(ctx: RoundCtx, seed: number, r: number): number[][] {
+  const { A, T, P } = ctx;
+  if (T === 0) throw new InfeasibleRoundError(r, -1, `Round ${r}: no tables to seat anyone at.`);
+  const base = Math.floor(A / T);
+  const extra = A % T;
+  if (base + (extra > 0 ? 1 : 0) > P) {
+    throw new InfeasibleRoundError(r, -1, `Round ${r}: ${A} people cannot fit ${T} tables of ${P}.`);
+  }
+
+  // Balanced first; only if that is impossible, fall back to "never above P".
+  for (const balanced of [true, false]) {
+    const attempts = balanced ? BALANCED_ATTEMPTS : RELAXED_ATTEMPTS;
+    for (let k = 0; k < attempts; k++) {
+      const rng = makeRng(seed + r * 0x1000193 + k * 0x9e3779b1);
+      const seating = tryRound(ctx, rng, balanced ? { base, extra } : null);
+      if (seating) {
+        improve(ctx, seating, rng);
+        return seating.occ;
+      }
+    }
+  }
+  throw new InfeasibleRoundError(
+    r,
+    -1,
+    `Round ${r}: no category-safe seating found. A business category probably has more people than there are tables.`,
+  );
+}
+
+interface Seating {
+  occ: number[][];
+  tableOf: Int32Array;
+  cats: Uint16Array; // T * C counters
+  ceilUsed: number;
+  limit: { base: number; extra: number } | null;
+}
+
+function tryRound(ctx: RoundCtx, rng: Rng, limit: { base: number; extra: number } | null): Seating | null {
+  const { A, T, C, catIdxOf, anchorIdx, memberIdxs, catFreq } = ctx;
+  const s: Seating = {
+    occ: Array.from({ length: T }, () => [] as number[]),
+    tableOf: new Int32Array(A).fill(-1),
+    cats: new Uint16Array(T * C),
+    ceilUsed: 0,
+    limit,
+  };
+  for (let t = 0; t < T; t++) if (anchorIdx[t] >= 0) add(ctx, s, anchorIdx[t], t);
+
+  const ordered = stableSortByDesc(shuffle(memberIdxs, rng), (m) => catFreq[catIdxOf[m]]);
+  const tableOrder = shuffle(
+    Array.from({ length: T }, (_, i) => i),
+    rng,
+  );
+
+  for (const m of ordered) {
+    const best = bestTable(ctx, s, m, tableOrder);
+    if (best >= 0) {
+      add(ctx, s, m, best);
+      continue;
+    }
+    if (!repair(ctx, s, m, tableOrder)) return null;
+  }
+  return s;
+}
+
+function hasRoom(ctx: RoundCtx, s: Seating, t: number): boolean {
+  const n = s.occ[t].length;
+  if (!s.limit) return n < ctx.P;
+  const { base, extra } = s.limit;
+  return n < base || (n === base && s.ceilUsed < extra);
+}
+
+function safe(ctx: RoundCtx, s: Seating, m: number, t: number): boolean {
+  return s.cats[t * ctx.C + ctx.catIdxOf[m]] === 0;
+}
+
+function add(ctx: RoundCtx, s: Seating, m: number, t: number) {
+  if (s.limit && s.occ[t].length === s.limit.base) s.ceilUsed++;
+  s.occ[t].push(m);
+  s.tableOf[m] = t;
+  s.cats[t * ctx.C + ctx.catIdxOf[m]]++;
+}
+
+function remove(ctx: RoundCtx, s: Seating, m: number) {
+  const t = s.tableOf[m];
+  const occ = s.occ[t];
+  occ.splice(occ.indexOf(m), 1);
+  if (s.limit && occ.length === s.limit.base) s.ceilUsed--;
+  s.tableOf[m] = -1;
+  s.cats[t * ctx.C + ctx.catIdxOf[m]]--;
+}
+
+/** Repeat cost of seating m with table t's occupants (skipping `except`). */
+function cost(ctx: RoundCtx, s: Seating, m: number, t: number, except = -1): number {
+  const row = m * ctx.A;
+  let c = 0;
+  for (const o of s.occ[t]) if (o !== except && o !== m) c += ctx.met[row + o];
+  return c;
+}
+
+function bestTable(ctx: RoundCtx, s: Seating, m: number, order: number[]): number {
+  let best = -1;
+  let bestCost = Infinity;
+  let bestSize = Infinity;
+  for (const t of order) {
+    if (!hasRoom(ctx, s, t) || !safe(ctx, s, m, t)) continue;
+    const c = cost(ctx, s, m, t);
+    const n = s.occ[t].length;
+    if (c < bestCost || (c === bestCost && n < bestSize)) {
+      best = t;
+      bestCost = c;
+      bestSize = n;
+    }
+  }
+  return best;
+}
+
+/**
+ * m has no safe table with room. Find a table t where, once one of its members
+ * x leaves (to another safe table d with room), m is safe and fits. Covers both
+ * "blocked by a same-category member" and "the only safe tables are full" (the
+ * exact-fit dead end). Table sizes stay valid: t loses x and gains m.
+ */
+function repair(ctx: RoundCtx, s: Seating, m: number, order: number[]): boolean {
+  const catM = ctx.catIdxOf[m];
+  let bestT = -1;
+  let bestX = -1;
+  let bestDest = -1;
+  let bestCost = Infinity;
+
+  for (const t of order) {
+    const sameCat = s.cats[t * ctx.C + catM];
+    if (sameCat > 1) continue; // two to evict — not a one-move repair
+    for (const x of s.occ[t]) {
+      if (ctx.anchorIdx[t] === x) continue; // anchors never move
+      if (sameCat === 1 && ctx.catIdxOf[x] !== catM) continue; // must evict the blocker
+      for (const d of order) {
+        if (d === t) continue;
+        if (!hasRoom(ctx, s, d) || !safe(ctx, s, x, d)) continue;
+        const c = cost(ctx, s, m, t, x) + cost(ctx, s, x, d);
+        if (c < bestCost) {
+          bestCost = c;
+          bestT = t;
+          bestX = x;
+          bestDest = d;
+        }
+        break; // first safe destination for this x is enough
+      }
+    }
+  }
+  if (bestT < 0) return false;
+  remove(ctx, s, bestX);
+  add(ctx, s, bestX, bestDest);
+  add(ctx, s, m, bestT);
+  return true;
+}
+
+/** Swap members between tables while it lowers the round's repeat total. */
+function improve(ctx: RoundCtx, s: Seating, rng: Rng) {
+  const { T, C, catIdxOf, anchorIdx } = ctx;
+  if (T < 2) return;
+  for (let pass = 0; pass < IMPROVE_PASSES; pass++) {
+    let improved = false;
+    for (let a = 0; a < T; a++) {
+      for (const m of [...s.occ[a]]) {
+        if (anchorIdx[a] === m || s.tableOf[m] !== a) continue;
+        const cm = cost(ctx, s, m, a);
+        if (cm === 0) continue; // no repeats for m here
+        const catM = catIdxOf[m];
+        const sample = Math.min(T - 1, SWAP_SAMPLE_TABLES);
+        let done = false;
+        for (let k = 0; k < sample && !done; k++) {
+          const b = (a + 1 + Math.floor(rng() * (T - 1))) % T;
+          for (const x of s.occ[b]) {
+            if (anchorIdx[b] === x) continue;
+            const catX = catIdxOf[x];
+            // C1 after the swap: b without x must not hold catM; a without m must not hold catX.
+            if (catX !== catM && (s.cats[b * C + catM] > 0 || s.cats[a * C + catX] > 0)) continue;
+            const before = cm + cost(ctx, s, x, b);
+            const after = cost(ctx, s, m, b, x) + cost(ctx, s, x, a, m);
+            if (after < before) {
+              remove(ctx, s, m);
+              remove(ctx, s, x);
+              add(ctx, s, m, b);
+              add(ctx, s, x, a);
+              improved = true;
+              done = true;
+              break;
+            }
           }
         }
       }
     }
-
-    rounds.push(toRoundSeating(r, tables, participants));
+    if (!improved) break;
   }
-
-  const stats = computeStats(A, captainIdxs.length, config.roundCount, degree, uniquePairsMet, repeatPairings);
-
-  return { config, tableCount: captainIdxs.length, rounds, stats };
-}
-
-function buildTables(captainIdxs: number[], catIdxOf: Int32Array): WorkingTable[] {
-  return captainIdxs.map((c, i) => ({
-    tableNumber: i + 1,
-    captainIdx: c,
-    occupants: [c],
-    cats: new Set<number>([catIdxOf[c]]),
-  }));
-}
-
-function placeMember(
-  m: number,
-  tables: WorkingTable[],
-  tableOrder: number[],
-  catIdxOf: Int32Array,
-  met: Uint8Array,
-  A: number,
-  P: number,
-  roundNumber: number,
-): void {
-  const cat = catIdxOf[m];
-  let best = -1;
-  let bestRepeat = Infinity;
-  let bestFree = -1;
-
-  for (const ti of tableOrder) {
-    const t = tables[ti];
-    if (t.occupants.length >= P) continue; // C4
-    if (t.cats.has(cat)) continue; // C1 hard
-
-    // repeat cost = how many current occupants this member has already met
-    let repeat = 0;
-    const base = m * A;
-    for (const o of t.occupants) if (met[base + o]) repeat++;
-    const free = P - t.occupants.length;
-
-    // minimize repeats (C2), then prefer emptier tables for balance
-    if (repeat < bestRepeat || (repeat === bestRepeat && free > bestFree)) {
-      best = ti;
-      bestRepeat = repeat;
-      bestFree = free;
-    }
-  }
-
-  if (best === -1) {
-    if (!repair(m, tables, catIdxOf, P)) {
-      throw new InfeasibleRoundError(
-        roundNumber,
-        m,
-        `Round ${roundNumber}: no category-safe table for participant index ${m}. ` +
-          `This usually means a V11 feasibility violation slipped through.`,
-      );
-    }
-    return;
-  }
-
-  const t = tables[best];
-  t.occupants.push(m);
-  t.cats.add(cat);
-}
-
-/**
- * Repair step: m has no open category-safe table. Find a table with a free
- * seat that is blocked only because a *member* there shares m's category;
- * relocate that blocker to another safe table, then seat m. Keeps C1 intact.
- */
-function repair(m: number, tables: WorkingTable[], catIdxOf: Int32Array, P: number): boolean {
-  const cat = catIdxOf[m];
-  for (const t of tables) {
-    if (t.occupants.length >= P) continue;
-    if (!t.cats.has(cat)) continue; // would have been a candidate already
-
-    // blocker = a non-captain occupant whose category equals m's
-    const blockerPos = t.occupants.findIndex((o, pos) => pos > 0 && catIdxOf[o] === cat);
-    if (blockerPos === -1) continue; // blocked by the captain — cannot move
-    const blocker = t.occupants[blockerPos];
-    const blockerCat = catIdxOf[blocker];
-
-    const alt = tables.find(
-      (t2) => t2 !== t && t2.occupants.length < P && !t2.cats.has(blockerCat),
-    );
-    if (!alt) continue;
-
-    // move blocker -> alt
-    t.occupants.splice(blockerPos, 1);
-    rebuildCats(t, catIdxOf);
-    alt.occupants.push(blocker);
-    alt.cats.add(blockerCat);
-
-    // seat m at t
-    t.occupants.push(m);
-    t.cats.add(cat);
-    return true;
-  }
-  return false;
-}
-
-function rebuildCats(t: WorkingTable, catIdxOf: Int32Array): void {
-  t.cats = new Set(t.occupants.map((o) => catIdxOf[o]));
 }
 
 function toRoundSeating(
   roundNumber: number,
-  tables: WorkingTable[],
+  occ: number[][],
+  tables: PlanTable[],
+  anchorIdx: Int32Array,
   participants: Participant[],
 ): RoundSeating {
-  const seats: TableSeating[] = tables.map((t) => ({
-    tableNumber: t.tableNumber,
-    captainId: participants[t.captainIdx].id,
-    memberIds: t.occupants.slice(1).map((o) => participants[o].id),
-  }));
+  const seats: TableSeating[] = occ.map((o, t) => {
+    const anchor = anchorIdx[t];
+    return {
+      tableNumber: tables[t].tableNumber,
+      captainId: tables[t].captainId,
+      memberIds: o.filter((i) => i !== anchor).map((i) => participants[i].id),
+    };
+  });
   return { roundNumber, tables: seats };
 }
 
-function computeStats(
-  A: number,
-  tableCount: number,
-  rounds: number,
-  degree: Int32Array,
-  uniquePairsMet: number,
-  repeatPairings: number,
-): ScheduleStats {
+function computeStats(A: number, tableCount: number, rounds: number, met: Uint8Array): ScheduleStats {
+  let uniquePairsMet = 0;
+  let repeatPairings = 0;
   let min = Infinity;
   let max = 0;
   let sum = 0;
   for (let i = 0; i < A; i++) {
-    const d = degree[i];
+    let d = 0;
+    const row = i * A;
+    for (let j = 0; j < A; j++) {
+      const c = met[row + j];
+      if (c === 0) continue;
+      d++;
+      if (j > i) {
+        uniquePairsMet++;
+        repeatPairings += c - 1;
+      }
+    }
     sum += d;
     if (d < min) min = d;
     if (d > max) max = d;

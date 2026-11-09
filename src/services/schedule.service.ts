@@ -3,7 +3,7 @@ import { pgdb } from "../db/client.js";
 import { conclaves, registrations } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
-import { generateSchedule, validate, tableCountFor, type ConclaveConfig } from "../engine/index.js";
+import { generateSchedule, planSchedule, validate, tableCountFor, type ConclaveConfig } from "../engine/index.js";
 import { resolveCaptains, type ServerParticipant } from "../domain/captains.js";
 import { ConclaveStatus, ROLE_LOCKED_STATUSES } from "../domain/conclave.js";
 import { validateConfig } from "./conclave.service.js";
@@ -66,6 +66,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
         businessCategory: u.category || "Uncategorized",
         location: (u.location ?? { withinGuntur: true }) as never,
         chapter: u.chapter ?? null,
+        membership: u.membership ?? "",
         photoUrl: u.photoUrl ?? null,
         _originalUid: reg.userId,
       } as ServerParticipant);
@@ -90,7 +91,10 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     }
 
     const tablesRequired = opts.tableCount !== undefined && Number(opts.tableCount) > 0 ? Math.max(1, Number(opts.tableCount)) : tableCountFor(participants.length, personsPerTable);
-    const skipCaptainCheck = opts.autoFillCaptains && designatedCaptainIds.length === 0;
+    // Captainless conclave: no anchors, nobody is a captain, nothing to check.
+    const captainless = conclave.captainMode === "none";
+    if (captainless) designatedCaptainIds.length = 0;
+    const skipCaptainCheck = captainless || (opts.autoFillCaptains && designatedCaptainIds.length === 0);
     if (!skipCaptainCheck && designatedCaptainIds.length < tablesRequired) {
       const diff = tablesRequired - designatedCaptainIds.length;
       const fix = `Promote ${diff} more member(s) to Table Captain in the Members page.`;
@@ -108,8 +112,8 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     }
 
     const seed = typeof conclave.seed === "number" ? conclave.seed : Date.now();
-    const captainIds = resolveCaptains(participants, designatedCaptainIds, personsPerTable, seed, tablesRequired);
-    const config: ConclaveConfig = { personsPerTable, roundCount, seed, tableCount: tablesRequired };
+    const captainIds = captainless ? [] : resolveCaptains(participants, designatedCaptainIds, personsPerTable, seed, tablesRequired);
+    const config: ConclaveConfig = { personsPerTable, roundCount, seed, tableCount: tablesRequired, captainless };
 
     const validation = validate(participants, captainIds, config);
     if (!validation.ok) {
@@ -122,7 +126,13 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
 
     let schedule;
     try {
-      schedule = generateSchedule(participants, captainIds, config);
+      schedule = captainless
+        ? planSchedule({
+            participants,
+            tables: Array.from({ length: tablesRequired }, (_, i) => ({ tableNumber: i + 1, captainId: null })),
+            config,
+          })
+        : generateSchedule(participants, captainIds, config);
     } catch (e) {
       if ((e as Error).name === "InfeasibleRoundError") {
         throw ApiError.badRequest(
@@ -163,7 +173,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     // Roster follows the schedule: captain/member, participant id, captain's table.
     const captainSet = new Set(captainIds);
     const tableOfCaptain = new Map<number, number>();
-    for (const t of schedule.rounds[0]?.tables ?? []) tableOfCaptain.set(t.captainId, t.tableNumber);
+    for (const t of schedule.rounds[0]?.tables ?? []) if (t.captainId !== null) tableOfCaptain.set(t.captainId, t.tableNumber);
     let rolesChanged = 0;
     for (const p of participants) {
       const isCaptain = captainSet.has(p.id);

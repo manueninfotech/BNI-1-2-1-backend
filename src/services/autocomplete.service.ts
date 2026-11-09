@@ -62,7 +62,8 @@ export function isFinished(
   return false;
 }
 
-const FINISH_GRACE_MS = 60_000;
+// Matches the app's wrapCooldown: "That's a wrap" for 15 s, then the summary.
+const FINISH_GRACE_MS = 15_000;
 const ABANDONED_AFTER_MS = 24 * 60 * 60_000;
 
 export async function sweepFinishedConclaves(): Promise<number> {
@@ -107,7 +108,7 @@ export async function sweepFinishedConclaves(): Promise<number> {
 let timer: NodeJS.Timeout | null = null;
 
 /** Starts the periodic sweep (default every 60s). Idempotent. */
-export function startAutoCompleteSweep(intervalMs = 60_000): void {
+export function startAutoCompleteSweep(intervalMs = 15_000): void {
   if (timer) return;
   const tick = () =>
     runAsSystem("autocomplete-sweep", sweepFinishedConclaves)

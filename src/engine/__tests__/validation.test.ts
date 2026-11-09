@@ -74,9 +74,9 @@ describe("validation gate", () => {
     expect(codes(result.errors)).toContain("V7");
   });
 
-  it("V5: round count outside the 4..8 window", () => {
+  it("V5: round count outside the 2..8 window", () => {
     const people = generateSeedParticipants(60);
-    const config = baseCfg({ personsPerTable: 7, roundCount: 2 });
+    const config = baseCfg({ personsPerTable: 7, roundCount: 1 });
     const captains = autoSelectCaptains(people, config.personsPerTable, config.seed);
     const result = validate(people, captains, config);
     expect(codes(result.errors)).toContain("V5");

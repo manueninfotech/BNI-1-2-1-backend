@@ -157,6 +157,10 @@ export const conclaves = pgTable(
     warnings: jsonb("warnings").$type<unknown[]>().notNull().default([]),
     snapshot: jsonb("snapshot").$type<Record<string, unknown> | null>(),
     isScheduleLocked: boolean("is_schedule_locked").notNull().default(false),
+    /** "required": every table has a fixed captain who scans attendance. "none": no captains, no attendance. */
+    captainMode: text("captain_mode").notNull().default("required"),
+    /** Per-round stand-in captains the admin marked: { "<round>": { "<tableNumber>": uid } }. */
+    standInCaptains: jsonb("stand_in_captains").$type<Record<string, Record<string, string>>>().notNull().default({}),
 
     // Live round state.
     roundProgressionMode: text("round_progression_mode").notNull().default("manual"), // "manual" | "automatic"
@@ -206,6 +210,12 @@ export const registrations = pgTable(
     amountPaid: numeric("amount_paid", { mode: "number" }),
     payment: jsonb("payment").$type<Record<string, unknown> | null>(),
     addedBy: jsonb("added_by").$type<Record<string, unknown> | null>(),
+    /** Registered at the venue after the conclave started (needs region-admin approval). */
+    isWalkIn: boolean("is_walk_in").notNull().default(false),
+    /** walk-in: "pending" | "approved" | "rejected" (null for normal registrations). */
+    walkInStatus: text("walk_in_status"),
+    /** walk-in: first round they are seated in (set on approval). */
+    joinsFromRound: integer("joins_from_round"),
     registeredAt: ts("registered_at").notNull().defaultNow(),
     legacy: legacy(),
   },

@@ -48,9 +48,11 @@ export function auditSchedule(participants: Participant[], schedule: Schedule): 
         violations.push(`Round ${round.roundNumber} table ${table.tableNumber} has ${occ.length} > ${P}.`);
       }
 
-      // C5
-      const prev = captainTable.get(table.captainId);
-      if (prev === undefined) captainTable.set(table.captainId, table.tableNumber);
+      // C5 (captainless tables have no anchor to drift)
+      const prev = table.captainId === null ? undefined : captainTable.get(table.captainId);
+      if (table.captainId === null) {
+        // nothing to check
+      } else if (prev === undefined) captainTable.set(table.captainId, table.tableNumber);
       else if (prev !== table.tableNumber) {
         captainDrift++;
         violations.push(`Captain ${table.captainId} moved from table ${prev} to ${table.tableNumber}.`);

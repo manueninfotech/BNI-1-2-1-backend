@@ -13,6 +13,7 @@ import * as users from "../services/user.service.js";
 import * as referralsSvc from "../services/referrals.service.js";
 import * as oneToOnesSvc from "../services/oneToOnes.service.js";
 import * as notificationsSvc from "../services/notifications.service.js";
+import * as walkIns from "../services/walkIn.service.js";
 
 export async function listNotifications(req: AuthedRequest, res: Response) {
   res.json(await notificationsSvc.listForUser(req.uid));
@@ -206,3 +207,8 @@ export async function presence(req: AuthedRequest, res: Response) {
   await users.setPresence(req.uid, req.body?.state);
   res.status(204).end();
 }
+
+export async function requestWalkIn(req: AuthedRequest, res: Response) {
+  res.json(await walkIns.requestWalkIn(req.params.id, req.uid));
+}
+

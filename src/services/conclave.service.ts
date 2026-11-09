@@ -11,6 +11,7 @@ import {
 } from "../domain/conclave.js";
 import { notifyConclave, notifyUser, recordUserNotification } from "./notification.service.js";
 import { notifyConclaveChanged } from "./live.service.js";
+import { joinsFromRound } from "../domain/walkIns.js";
 import {
   DEFAULT_MOVE_SECONDS,
   EXTEND_SECONDS_OPTIONS,
@@ -84,6 +85,10 @@ export function toView(row: ConclaveRow, registrationCount?: number, referralCou
     warnings: row.warnings,
     snapshot: row.snapshot,
     isScheduleLocked: row.isScheduleLocked,
+    captainMode: row.captainMode === "none" ? "none" : "required",
+    // Walk-ins can ask to join while a round is still ahead.
+    walkInOpen: row.status === ConclaveStatus.running && joinsFromRound(row) !== null,
+    standInCaptains: row.standInCaptains ?? {},
     roundProgressionMode: row.roundProgressionMode ?? "manual",
     moveSeconds: row.moveSeconds ?? DEFAULT_MOVE_SECONDS,
     roundExtensionSeconds: row.roundExtensionSeconds ?? 0,
@@ -350,10 +355,18 @@ export interface CreateInput {
   personsPerTable?: number;
   roundCount?: number;
   moveSeconds?: number;
+  captainMode?: string;
   memberLimit?: number;
   captainLimit?: number;
   region?: string;
   paymentDetails?: Record<string, unknown>;
+}
+
+/** "required" | "none", or null for anything else. */
+export function captainModeInput(v: unknown): "required" | "none" | null {
+  if (v === undefined || v === null || v === "") return null;
+  const s = String(v).toLowerCase();
+  return s === "none" || s === "required" ? s : null;
 }
 
 export async function createConclave(input: CreateInput): Promise<string> {
@@ -375,6 +388,9 @@ export async function createConclave(input: CreateInput): Promise<string> {
     );
   }
   const moveSeconds = moveSecondsInput(input.moveSeconds) ?? DEFAULT_MOVE_SECONDS;
+  if (input.captainMode !== undefined && input.captainMode !== null && input.captainMode !== "" && !captainModeInput(input.captainMode)) {
+    throw ApiError.badRequest('captainMode must be "required" or "none".');
+  }
   validateConfig(personsPerTable, roundCount);
   validateConclaveDates(input, { isNew: true });
 
@@ -404,6 +420,7 @@ export async function createConclave(input: CreateInput): Promise<string> {
     roundCount,
     moveSeconds,
     roundExtensionSeconds: 0,
+    captainMode: captainModeInput(input.captainMode) ?? "required",
     memberLimit: intInput(input.memberLimit, 100, "memberLimit") || 100,
     captainLimit: intInput(input.captainLimit, 12, "captainLimit") || 12,
     paymentDetails: input.paymentDetails ?? null,
@@ -443,6 +460,14 @@ export async function updateConclave(id: string, body: Record<string, any>): Pro
       if (body.paymentDetails?.registrationFee !== undefined) u.registrationFee = Number(body.paymentDetails.registrationFee) || 0;
     }
     if (body.chiefGuests !== undefined) u.chiefGuests = Array.isArray(body.chiefGuests) ? body.chiefGuests : [];
+    if (body.captainMode !== undefined) {
+      const mode = captainModeInput(body.captainMode);
+      if (!mode) throw ApiError.badRequest('captainMode must be "required" or "none".');
+      if (mode !== (row.captainMode ?? "required") && row.schedule) {
+        throw ApiError.conflict("A schedule already exists. Change the captain setting before generating tables, or regenerate them after.");
+      }
+      u.captainMode = mode;
+    }
     if (body.date !== undefined || body.startDate !== undefined) u.startDate = dateInput(body.date ?? body.startDate, "date");
     if (body.endDate !== undefined) u.endDate = dateInput(body.endDate, "endDate");
     if (body.regStartDate !== undefined) u.regStartDate = dateInput(body.regStartDate, "regStartDate");
@@ -1118,7 +1143,14 @@ export async function listForMember(uid: string, email?: string) {
       if (e) conditions.push(sql`lower(${registrations.email}) = ${e}`);
       if (u?.phone) conditions.push(eq(registrations.phone, u.phone));
       return pgdb
-        .select({ id: registrations.conclaveId, role: registrations.role, tableNumber: registrations.tableNumber })
+        .select({
+          id: registrations.conclaveId,
+          role: registrations.role,
+          tableNumber: registrations.tableNumber,
+          isWalkIn: registrations.isWalkIn,
+          walkInStatus: registrations.walkInStatus,
+          joinsFromRound: registrations.joinsFromRound,
+        })
         .from(registrations)
         .where(or(...conditions));
     })(),
@@ -1133,7 +1165,9 @@ export async function listForMember(uid: string, email?: string) {
       participants: parts
         ? parts.map(({ phone, ...p }) => (met.has(String(p._originalUid)) || p._originalUid === uid ? { ...p, phone } : p))
         : c.participants,
-      isRegistered: !!reg,
+      // A walk-in waiting for approval isn't seated yet, so not "registered".
+      isRegistered: !!reg && !(reg.isWalkIn && reg.walkInStatus !== "approved"),
+      walkIn: reg?.isWalkIn ? { status: reg.walkInStatus ?? "pending", joinsFromRound: reg.joinsFromRound } : null,
       myRole: reg?.role ?? null,
       // Members' registrations carry no table (only captains do), so fall back
       // to their ROUND-1 table from the schedule — this is what lets the app
@@ -1211,3 +1245,68 @@ export async function getForMember(id: string, uid: string, email?: string) {
   if (!found) throw ApiError.notFound("Conclave not found.");
   return found;
 }
+
+/**
+ * Marks a stand-in captain for one table in one round (or clears it with a null
+ * uid). Used when a table's captain is late or away: the stand-in gets the scan
+ * button for that round only, and the server accepts their attendance marks.
+ * The stand-in must be seated at that table that round, and past rounds can't
+ * be changed.
+ */
+export async function setStandInCaptain(
+  id: string,
+  roundNumber: number,
+  tableNumber: number,
+  uid: string | null,
+): Promise<{ roundNumber: number; tableNumber: number; uid: string | null }> {
+  if (!Number.isInteger(roundNumber) || roundNumber < 1) throw ApiError.badRequest("Pick a round.");
+  if (!Number.isInteger(tableNumber) || tableNumber < 1) throw ApiError.badRequest("Pick a table.");
+  await mutate(
+    id,
+    "conclave.stand_in_captain",
+    (row) => {
+      if (TERMINAL_STATUSES.has(row.status)) throw ApiError.conflict(`This conclave is ${row.status}.`);
+      if (row.captainMode === "none") throw ApiError.conflict("This conclave runs without captains.");
+      const rounds = Number(row.roundCount) || 0;
+      if (roundNumber > rounds) throw ApiError.badRequest(`This conclave has ${rounds} rounds.`);
+      const live = liveClock(row);
+      if (row.status === ConclaveStatus.running && roundNumber < live.round) {
+        throw ApiError.conflict(`Round ${roundNumber} is over; pick the current or a later round.`);
+      }
+      const schedule = row.schedule as { rounds?: Array<{ roundNumber: number; tables?: Array<{ tableNumber: number; captainId: number | null; memberIds?: number[] }> }> } | null;
+      const table = schedule?.rounds?.find((r) => r.roundNumber === roundNumber)?.tables?.find((t) => t.tableNumber === tableNumber);
+      if (!table) throw ApiError.notFound(`There is no Table ${tableNumber} in round ${roundNumber}.`);
+
+      const all = { ...(row.standInCaptains ?? {}) } as Record<string, Record<string, string>>;
+      const forRound = { ...(all[String(roundNumber)] ?? {}) };
+      if (uid) {
+        const participants = (Array.isArray(row.participants) ? row.participants : []) as Array<Record<string, unknown>>;
+        const seatIds = new Set([table.captainId, ...(table.memberIds ?? [])].filter((x) => x !== null));
+        const p = participants.find((x) => x._originalUid === uid);
+        if (!p || !seatIds.has(p.id as number)) {
+          throw ApiError.badRequest(`That member isn't seated at Table ${tableNumber} in round ${roundNumber}.`);
+        }
+        forRound[String(tableNumber)] = uid;
+      } else {
+        delete forRound[String(tableNumber)];
+      }
+      if (Object.keys(forRound).length) all[String(roundNumber)] = forRound;
+      else delete all[String(roundNumber)];
+      return { standInCaptains: all };
+    },
+    { roundNumber, tableNumber, uid },
+  );
+  if (uid) {
+    void notifyUser(
+      uid,
+      {
+        title: "You're the captain for this round",
+        body: `Please lead Table ${tableNumber} in round ${roundNumber} and scan everyone in.`,
+        data: { conclaveId: id, type: "stand_in_captain", tableNumber: String(tableNumber), roundNumber: String(roundNumber) },
+      },
+      "round_alerts",
+    ).catch(() => {});
+  }
+  return { roundNumber, tableNumber, uid };
+}
+

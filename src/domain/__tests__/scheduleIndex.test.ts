@@ -122,3 +122,29 @@ describe("canRefer — a referral is a promise made face to face", () => {
     expect(index.canRefer(1, "bhanu", "sravan")).toBe(index.canRefer(1, "sravan", "bhanu"));
   });
 });
+
+describe("ScheduleIndex — captain modes", () => {
+  const participants = [1, 2, 3, 4].map((id) => ({ id, _originalUid: `u${id}` }));
+
+  it("a stand-in captain may mark their table that round; the absent anchor may not", () => {
+    const schedule = { rounds: [{ roundNumber: 2, tables: [{ tableNumber: 1, captainId: 1, memberIds: [2, 3] }] }] };
+    const idx = new ScheduleIndex(schedule, participants, { "2": { "1": "u2" } });
+    expect(idx.canMarkAttendance(2, "u2", "u3")).toBe(true);
+    expect(idx.canMarkAttendance(2, "u1", "u3")).toBe(false);
+  });
+
+  it("ignores a stand-in who isn't seated at that table", () => {
+    const schedule = { rounds: [{ roundNumber: 1, tables: [{ tableNumber: 1, captainId: 1, memberIds: [2] }] }] };
+    const idx = new ScheduleIndex(schedule, participants, { "1": { "1": "u4" } });
+    expect(idx.canMarkAttendance(1, "u4", "u2")).toBe(false);
+    expect(idx.canMarkAttendance(1, "u1", "u2")).toBe(true);
+  });
+
+  it("captainless tables still seat everyone, allow referrals, and have no captain", () => {
+    const schedule = { rounds: [{ roundNumber: 1, tables: [{ tableNumber: 1, captainId: null, memberIds: [1, 2, 3] }] }] };
+    const idx = new ScheduleIndex(schedule, participants);
+    expect(idx.canRefer(1, "u1", "u3")).toBe(true);
+    expect(idx.canMarkAttendance(1, "u2", "u2")).toBe(true);
+    expect(idx.canMarkAttendance(1, "u1", "u2")).toBe(false);
+  });
+});

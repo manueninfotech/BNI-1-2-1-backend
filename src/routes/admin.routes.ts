@@ -54,6 +54,10 @@ router.post("/conclaves/:id/resume-round", asyncHandler(c.resumeRound));
 router.post("/conclaves/:id/close-round", asyncHandler(c.closeRound));
 router.post("/conclaves/:id/progression-mode", asyncHandler(c.setProgressionMode));
 router.post("/conclaves/:id/extend-round", asyncHandler(c.extendRound));
+router.post("/conclaves/:id/stand-in-captain", asyncHandler(c.setStandInCaptain));
+router.get("/conclaves/:id/walk-ins", asyncHandler(c.listWalkIns));
+router.post("/conclaves/:id/walk-ins/:uid/approve", asyncHandler(c.approveWalkIn));
+router.post("/conclaves/:id/walk-ins/:uid/reject", asyncHandler(c.rejectWalkIn));
 router.patch("/conclaves/:id/move-time", asyncHandler(c.setMoveTime));
 
 // Scheduling

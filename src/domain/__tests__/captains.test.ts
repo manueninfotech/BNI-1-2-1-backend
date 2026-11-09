@@ -115,19 +115,15 @@ describe("resolveCaptains", () => {
     expect(report.ok).toBe(true);
   });
 
-  // KNOWN ENGINE LIMITATION — pinned so a future engine change surfaces it.
-  //
-  // When A is an exact multiple of P there are zero spare seats (T*P - A === 0),
-  // making each round an exact-cover problem. The matcher is a greedy heuristic
-  // with a single-step repair, so it can fail even though the validation gate
-  // (V1-V11) passes. This is NOT caused by captain selection: it reproduces with
-  // the engine's own autoSelectCaptains too. The server converts this into an
-  // actionable 400 rather than a 500.
+  // Exact fit: when A is a multiple of P there are zero spare seats (T*P - A
+  // === 0), so every round is an exact-cover problem. The old greedy matcher
+  // dead-ended here; the matcher now repairs and retries, so these must seat
+  // cleanly — every table full, no category clash.
   it.each([
     ["200 people, 8/table", 200, 25, 8], // 25 tables * 8 = 200 -> slack 0
     ["120 people, 6/table", 120, 20, 6], // 20 tables * 6 = 120 -> slack 0
   ])(
-    "%s: zero spare seats defeats the greedy matcher despite passing validation",
+    "%s: zero spare seats still seats everyone, category-safe",
     (_label, A, k, P) => {
       const ps = roster(A as number, k as number);
       const captains = resolveCaptains(ps, [], P as number, SEED);
@@ -137,12 +133,12 @@ describe("resolveCaptains", () => {
         seed: SEED,
       };
 
-      // The gate says yes...
       expect(validate(ps, captains, config).ok).toBe(true);
-      // ...but the matcher cannot actually seat it.
-      expect(() => generateSchedule(ps, captains, config)).toThrowError(
-        /no category-safe table/,
-      );
+      const schedule = generateSchedule(ps, captains, config);
+      expect(auditSchedule(ps, schedule).ok).toBe(true);
+      for (const round of schedule.rounds) {
+        for (const t of round.tables) expect(t.memberIds.length + 1).toBe(P);
+      }
     },
   );
 });

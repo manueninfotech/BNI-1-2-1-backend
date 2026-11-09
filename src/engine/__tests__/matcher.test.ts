@@ -93,7 +93,7 @@ describe("matching engine — hard constraints", () => {
     for (const round of schedule.rounds) {
       const seen = new Set<number>();
       for (const t of round.tables) {
-        seen.add(t.captainId);
+        if (t.captainId !== null) seen.add(t.captainId);
         for (const m of t.memberIds) seen.add(m);
         expect(t.memberIds.length + 1).toBeLessThanOrEqual(config.personsPerTable);
       }

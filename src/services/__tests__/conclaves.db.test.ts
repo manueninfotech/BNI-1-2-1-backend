@@ -61,7 +61,7 @@ describe("create / update", () => {
     await expect(makeConclave({ date: days(-2) })).rejects.toMatchObject({ status: 400 });
     await expect(makeConclave({ regEndDate: days(20) })).rejects.toMatchObject({ status: 400 }); // reg closes after start
     await expect(makeConclave({ personsPerTable: 1 })).rejects.toMatchObject({ status: 400 });
-    await expect(makeConclave({ roundCount: 2 })).rejects.toMatchObject({ status: 400 }); // engine needs 4–8
+    await expect(makeConclave({ roundCount: 1 })).rejects.toMatchObject({ status: 400 }); // engine needs 2–8
 
     const { result: id, requestId } = await as("admin-1", () => svc.createConclave({ name: "Real", venueLocation: "Hall", date: days(10) } as any));
     const [row] = await auditFor(requestId);
@@ -101,7 +101,10 @@ describe("lifecycle", () => {
     const b = await makeConclave({ name: "B" });
     await expect(as("admin-1", () => svc.startRound(a, 1, "admin-1"))).rejects.toMatchObject({ status: 400 });
 
+    // Round 1 also needs the seating locked (locking notifies everyone their table).
     await pgdb.update(conclaves).set({ schedule: { rounds: [] } });
+    await expect(as("admin-1", () => svc.startRound(a, 1, "admin-1"))).rejects.toMatchObject({ status: 400 });
+    await pgdb.update(conclaves).set({ isScheduleLocked: true });
     const { requestId } = await as("admin-1", () => svc.startRound(a, 1, "admin-1"));
     expect((await auditFor(requestId))[0]).toMatchObject({ action: "conclave.start", metadata: { roundNumber: 1 } });
     expect((await svc.getConclaveOrThrow(a)).row).toMatchObject({ status: "running", currentRound: 1, startedBy: "admin-1" });
@@ -111,7 +114,7 @@ describe("lifecycle", () => {
 
   it("rounds only move forward: no restarting, no skipping (manual and automatic)", async () => {
     const id = await makeConclave();
-    await pgdb.update(conclaves).set({ schedule: { rounds: [] }, roundCount: 4 }).where(eq(conclaves.id, id));
+    await pgdb.update(conclaves).set({ schedule: { rounds: [] }, isScheduleLocked: true, roundCount: 4 }).where(eq(conclaves.id, id));
     await as("admin-1", () => svc.startRound(id, 1, "admin-1"));
     // Manual (default): round 1 can't be restarted, round 3 can't be skipped to,
     // round 2 can be started whenever the admin is ready (even early).

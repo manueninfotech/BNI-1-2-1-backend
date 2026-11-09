@@ -33,6 +33,7 @@ export function validate(
   const minRounds = config.minRounds ?? DEFAULT_LIMITS.minRounds;
   const maxRounds = config.maxRounds ?? DEFAULT_LIMITS.maxRounds;
   const captainSet = new Set(captainIds);
+  const captainless = config.captainless === true;
 
   // --- 6.1 Data integrity ---------------------------------------------------
   // V1: every participant has a non-empty business category.
@@ -70,7 +71,7 @@ export function validate(
   if (A < P) {
     err("V7", `Only ${A} active people; need at least ${P} to fill one table.`);
   }
-  if (A <= T) {
+  if (!captainless && A <= T) {
     err(
       "V7",
       `No rotating members: ${A} people need ${T} captains, leaving ${A - T}. ` +
@@ -78,7 +79,10 @@ export function validate(
     );
   }
   // V8: designated captains must equal table count.
-  if (captainIds.length !== T && A >= P) {
+  if (captainless && captainIds.length > 0) {
+    err("V8", "A conclave without captains can't have captains designated.");
+  }
+  if (!captainless && captainIds.length !== T && A >= P) {
     const diff = Math.abs(captainIds.length - T);
     if (captainIds.length < T) {
       err("V8", `Designate ${diff} more captain(s): need ${T}, have ${captainIds.length}.`);
@@ -141,9 +145,14 @@ export function validate(
       );
     }
   }
+  // W3: organisers want at least 3 at every table.
+  if (T > 0 && Math.floor(A / T) < 3) {
+    warn("W3", `${A} people at ${T} tables leaves some tables with fewer than 3 people.`);
+  }
   // W2: uneven tables.
   if (A % P !== 0) {
-    warn("W2", `${A} people / ${P} per table is uneven; some tables seat ${P - 1}.`);
+    const lo = T > 0 ? Math.floor(A / T) : 0;
+    warn("W2", `${A} people / ${P} per table is uneven; the ${T} tables will seat ${lo} or ${lo + 1}, kept even.`);
   }
 
   return {

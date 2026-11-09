@@ -36,6 +36,13 @@
       "when": 1793205279289,
       "tag": "0004_round_controls",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1794256263662,
+      "tag": "0005_captain_modes_walk_ins",
+      "breakpoints": true
     }
   ]
 }

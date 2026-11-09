@@ -31,6 +31,8 @@ export interface ConclaveConfig {
   minRounds?: number;
   maxRounds?: number;
   autoLogoutHours?: number;
+  /** No captains: tables have no fixed anchor and everyone rotates. */
+  captainless?: boolean;
 }
 
 export const DEFAULT_LIMITS = {
@@ -43,14 +45,15 @@ export const DEFAULT_LIMITS = {
 
 export interface TableSeating {
   tableNumber: number;
-  captainId: number;
+  /** The table's fixed anchor; null in a captainless conclave. */
+  captainId: number | null;
   /** Member ids seated this round, excluding the captain. */
   memberIds: number[];
 }
 
 /** Convenience: all occupant ids at a table = [captainId, ...memberIds]. */
 export function occupantsOf(t: TableSeating): number[] {
-  return [t.captainId, ...t.memberIds];
+  return t.captainId === null ? [...t.memberIds] : [t.captainId, ...t.memberIds];
 }
 
 export interface RoundSeating {

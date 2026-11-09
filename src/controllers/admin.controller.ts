@@ -15,6 +15,7 @@ import * as settings from "../services/settings.service.js";
 import * as feedback from "../services/feedback.service.js";
 import * as payments from "../services/payments.service.js";
 import * as members from "../services/conclaveMembers.service.js";
+import * as walkIns from "../services/walkIn.service.js";
 
 // --- Conclave members (admin add / edit / remove) -----------------------------
 
@@ -341,5 +342,30 @@ export async function deleteConclave(req: AuthedRequest, res: Response) {
 export async function setUserRole(req: AuthedRequest, res: Response) {
   await usersService.setUserRole(req.params.uid, req.body?.role);
   res.json({ message: "User role updated successfully." });
+}
+
+export async function setStandInCaptain(req: AuthedRequest, res: Response) {
+  const { roundNumber, tableNumber, uid } = req.body ?? {};
+  const result = await conclaves.setStandInCaptain(
+    req.params.id,
+    Number(roundNumber),
+    Number(tableNumber),
+    uid ? String(uid) : null,
+  );
+  res.json(result);
+}
+
+export async function listWalkIns(req: AuthedRequest, res: Response) {
+  res.json(await walkIns.listWalkIns(req.params.id));
+}
+
+export async function approveWalkIn(req: AuthedRequest, res: Response) {
+  res.json(
+    await walkIns.approveWalkIn(req.params.id, req.params.uid, { captainUid: req.body?.captainUid ?? null }, { uid: req.uid, email: req.email }),
+  );
+}
+
+export async function rejectWalkIn(req: AuthedRequest, res: Response) {
+  res.json(await walkIns.rejectWalkIn(req.params.id, req.params.uid, req.body?.reason));
 }
 
