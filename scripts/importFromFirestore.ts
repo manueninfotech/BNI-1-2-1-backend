@@ -134,8 +134,7 @@ const adminSpec: Spec = {
 const conclaveSpec: Spec = {
   name: [["name", "title"], S], description: [["description"], S],
   venueLocation: [["venueLocation", "venue", "location"], S], region: [["region"], S],
-  coordinator: [["coordinator"], S], creator: [["creator"], S], theme: [["theme"], S],
-  dateRange: [["dateRange"], S],
+  coordinator: [["coordinator"], S],
   startDate: [["startDate", "date"], D], endDate: [["endDate"], D],
   startTime: [["startTime"], S], endTime: [["endTime"], S],
   regStartDate: [["regStartDate"], D], regEndDate: [["regEndDate", "registrationCloseDate"], D],

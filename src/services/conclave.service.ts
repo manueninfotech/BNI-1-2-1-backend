@@ -54,9 +54,7 @@ export function toView(row: ConclaveRow, registrationCount?: number, referralCou
     venueLocation: row.venueLocation,
     region: row.region,
     coordinator: row.coordinator,
-    creator: row.creator,
-    theme: row.theme,
-    dateRange: row.dateRange,
+    dateRange: row.startDate ? (row.endDate && row.endDate.getTime() !== row.startDate.getTime() ? `${row.startDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} - ${row.endDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}` : row.startDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })) : '',
     date: iso(row.startDate),
     startDate: iso(row.startDate),
     endDate: iso(row.endDate),
@@ -344,11 +342,9 @@ export interface CreateInput {
   regEndTime?: string;
   registrationOverride?: string;
   isRegistrationOpen?: boolean;
-  dateRange?: string;
   startTime?: string;
   endTime?: string;
   coordinator?: string;
-  creator?: string;
   description?: string;
   status?: string;
   chiefGuests?: unknown;
@@ -403,9 +399,7 @@ export async function createConclave(input: CreateInput): Promise<string> {
     venueLocation,
     region: input.region || "Global BNI Network",
     coordinator: input.coordinator || "",
-    creator: input.creator || "",
     description: input.description || "",
-    dateRange: input.dateRange || "",
     startDate: dateInput(input.date ?? input.startDate, "date") ?? new Date(),
     endDate: dateInput(input.endDate, "endDate"),
     regStartDate: dateInput(input.regStartDate, "regStartDate"),
@@ -449,9 +443,7 @@ export async function updateConclave(id: string, body: Record<string, any>): Pro
     text("venueLocation", body.venueLocation);
     text("region", body.region);
     text("coordinator", body.coordinator);
-    text("creator", body.creator);
     text("description", body.description);
-    text("dateRange", body.dateRange);
     if (u.name !== undefined && !u.name?.trim()) throw ApiError.badRequest("Name can't be empty.");
     if (body.memberLimit !== undefined) u.memberLimit = intInput(body.memberLimit, 100, "memberLimit") || 100;
     if (body.captainLimit !== undefined) u.captainLimit = intInput(body.captainLimit, 12, "captainLimit") || 12;

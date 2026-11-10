@@ -17,6 +17,7 @@
     "test:watch": "vitest",
     "create-admin": "tsx scripts/createAdmin.ts",
     "seed": "tsx scripts/seedDev.ts",
+    "seed:active-test": "tsx scripts/seedActiveTest.ts",
     "import-firestore": "tsx scripts/importFromFirestore.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate"
