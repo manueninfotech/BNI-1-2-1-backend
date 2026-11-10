@@ -4,6 +4,7 @@ import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { startReminderScheduler } from "./services/oneToOnes.service.js";
 import { startAutoCompleteSweep } from "./services/autocomplete.service.js";
+import { startLiveActivitySweep } from "./services/liveActivity.service.js";
 import { runMigrations } from "./db/migrate.js";
 import { pool } from "./db/client.js";
 
@@ -35,6 +36,10 @@ async function main() {
   // In-process sweep that completes conclaves whose auto-advancing rounds have
   // all elapsed (and clears any stale 'running'). No external cron needed.
   startAutoCompleteSweep();
+
+  // In-process sweep that pushes round changes to iOS Live Activities (the
+  // lock-screen round card) while the app is suspended.
+  startLiveActivitySweep();
   });
 
   // Graceful shutdown: Container Apps sends SIGTERM before replacing a revision.

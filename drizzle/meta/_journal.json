@@ -50,6 +50,13 @@
       "when": 1794320796434,
       "tag": "0006_specific_ask",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1794325531491,
+      "tag": "0007_live_activity_tokens",
+      "breakpoints": true
     }
   ]
 }

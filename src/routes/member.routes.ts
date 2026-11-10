@@ -40,6 +40,8 @@ router.post("/conclaves/:id/payment/order", paymentOrderLimiter, asyncHandler(c.
 router.post("/conclaves/:id/register", asyncHandler(c.register));
 router.post("/conclaves/:id/walk-in", asyncHandler(c.requestWalkIn));
 router.put("/conclaves/:id/ask", asyncHandler(c.setSpecificAsk));
+router.put("/conclaves/:id/live-activity", asyncHandler(c.registerLiveActivity));
+router.delete("/conclaves/:id/live-activity", asyncHandler(c.removeLiveActivity));
 router.post("/conclaves/:id/feedback", asyncHandler(c.submitFeedback));
 router.delete("/conclaves/:id/register", asyncHandler(c.deregister));
 router.post("/conclaves/:id/sync", syncLimiter, asyncHandler(c.syncConclave));

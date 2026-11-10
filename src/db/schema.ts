@@ -161,6 +161,8 @@ export const conclaves = pgTable(
     captainMode: text("captain_mode").notNull().default("required"),
     /** Per-round stand-in captains the admin marked: { "<round>": { "<tableNumber>": uid } }. */
     standInCaptains: jsonb("stand_in_captains").$type<Record<string, Record<string, string>>>().notNull().default({}),
+    /** Last round/phase state pushed to iOS Live Activities (dedupes pushes across instances). */
+    liveActivityKey: text("live_activity_key"),
 
     // Live round state.
     roundProgressionMode: text("round_progression_mode").notNull().default("manual"), // "manual" | "automatic"
@@ -434,3 +436,19 @@ export const auditLog = pgTable(
     index("audit_request_idx").on(t.requestId),
   ],
 );
+
+/** iOS Live Activity push tokens: one per member per conclave (the lock-screen round card). */
+export const liveActivityTokens = pgTable(
+  "live_activity_tokens",
+  {
+    conclaveId: text("conclave_id").notNull().references(() => conclaves.id, { onDelete: "cascade" }),
+    userId: text("user_id").notNull(),
+    /** The activity's APNs push token (hex). */
+    pushToken: text("push_token").notNull(),
+    /** The device's FCM registration token (FCM routes the Live Activity push). */
+    fcmToken: text("fcm_token").notNull(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.conclaveId, t.userId] })],
+);
+

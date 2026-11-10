@@ -14,6 +14,7 @@ import * as referralsSvc from "../services/referrals.service.js";
 import * as oneToOnesSvc from "../services/oneToOnes.service.js";
 import * as notificationsSvc from "../services/notifications.service.js";
 import * as walkIns from "../services/walkIn.service.js";
+import * as liveActivity from "../services/liveActivity.service.js";
 
 export async function listNotifications(req: AuthedRequest, res: Response) {
   res.json(await notificationsSvc.listForUser(req.uid));
@@ -214,5 +215,13 @@ export async function requestWalkIn(req: AuthedRequest, res: Response) {
 
 export async function setSpecificAsk(req: AuthedRequest, res: Response) {
   res.json(await registration.setSpecificAsk(req.params.id, req.uid, req.body?.specificAsk));
+}
+
+export async function registerLiveActivity(req: AuthedRequest, res: Response) {
+  res.json(await liveActivity.registerToken(req.params.id, req.uid, req.body ?? {}));
+}
+
+export async function removeLiveActivity(req: AuthedRequest, res: Response) {
+  res.json(await liveActivity.removeToken(req.params.id, req.uid));
 }
 
