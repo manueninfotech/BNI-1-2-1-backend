@@ -1150,12 +1150,29 @@ export async function listForMember(uid: string, email?: string) {
           isWalkIn: registrations.isWalkIn,
           walkInStatus: registrations.walkInStatus,
           joinsFromRound: registrations.joinsFromRound,
+          specificAsk: registrations.specificAsk,
         })
         .from(registrations)
         .where(or(...conditions));
     })(),
   ]);
   const regBy = new Map(mine.map((r) => [r.id, r]));
+  // Conclave Specific Asks of everyone in the conclaves this member is in —
+  // shown on each person's card at the table.
+  const myConclaveIds = [...regBy.keys()];
+  const askRows = myConclaveIds.length
+    ? await pgdb
+        .select({ conclaveId: registrations.conclaveId, uid: registrations.userId, ask: registrations.specificAsk })
+        .from(registrations)
+        .where(and(inArray(registrations.conclaveId, myConclaveIds), sql`${registrations.specificAsk} IS NOT NULL`))
+    : [];
+  const asksBy = new Map<string, Record<string, string>>();
+  for (const r of askRows) {
+    if (!r.ask) continue;
+    const m = asksBy.get(r.conclaveId) ?? {};
+    m[r.uid] = r.ask;
+    asksBy.set(r.conclaveId, m);
+  }
   return all.map((c) => {
     const parts = Array.isArray(c.participants) ? (c.participants as Record<string, unknown>[]) : null;
     const met = parts ? tablemateUids(c.schedule, parts, uid) : new Set<string>();
@@ -1168,6 +1185,8 @@ export async function listForMember(uid: string, email?: string) {
       // A walk-in waiting for approval isn't seated yet, so not "registered".
       isRegistered: !!reg && !(reg.isWalkIn && reg.walkInStatus !== "approved"),
       walkIn: reg?.isWalkIn ? { status: reg.walkInStatus ?? "pending", joinsFromRound: reg.joinsFromRound } : null,
+      mySpecificAsk: reg?.specificAsk ?? null,
+      specificAsks: reg ? asksBy.get(c.id) ?? {} : {},
       myRole: reg?.role ?? null,
       // Members' registrations carry no table (only captains do), so fall back
       // to their ROUND-1 table from the schedule — this is what lets the app

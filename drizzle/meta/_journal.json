@@ -43,6 +43,13 @@
       "when": 1794256263662,
       "tag": "0005_captain_modes_walk_ins",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1794320796434,
+      "tag": "0006_specific_ask",
+      "breakpoints": true
     }
   ]
 }

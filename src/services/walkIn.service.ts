@@ -10,7 +10,7 @@ import type { Schedule } from "../engine/index.js";
 import { fetchUsers } from "./user.service.js";
 import { notifyUser } from "./notification.service.js";
 import { notifyConclaveChanged } from "./live.service.js";
-import { registrationFeeOf } from "./registration.service.js";
+import { registrationFeeOf, SPECIFIC_ASK_MAX } from "./registration.service.js";
 
 /**
  * Walk-ins: people who join at the venue after the conclave has started.
@@ -31,7 +31,7 @@ const opt = (v: unknown, max = 200) => {
 };
 
 /** The member asks to join a running conclave. Idempotent. */
-export async function requestWalkIn(conclaveId: string, uid: string) {
+export async function requestWalkIn(conclaveId: string, uid: string, details: { specificAsk?: unknown } = {}) {
   const users = await fetchUsers([uid]);
   const u = users.get(uid);
   if (!u) throw ApiError.notFound("Your profile wasn't found. Please sign in again.");
@@ -75,6 +75,7 @@ export async function requestWalkIn(conclaveId: string, uid: string) {
         category: opt(u.category),
         chapter: opt(u.chapter),
         region: opt(u.region),
+        specificAsk: opt(details.specificAsk, SPECIFIC_ASK_MAX),
       })
       .onConflictDoNothing({ target: [registrations.conclaveId, registrations.userId] })
       .returning();

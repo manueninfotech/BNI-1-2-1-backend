@@ -209,6 +209,10 @@ export async function presence(req: AuthedRequest, res: Response) {
 }
 
 export async function requestWalkIn(req: AuthedRequest, res: Response) {
-  res.json(await walkIns.requestWalkIn(req.params.id, req.uid));
+  res.json(await walkIns.requestWalkIn(req.params.id, req.uid, req.body ?? {}));
+}
+
+export async function setSpecificAsk(req: AuthedRequest, res: Response) {
+  res.json(await registration.setSpecificAsk(req.params.id, req.uid, req.body?.specificAsk));
 }
 

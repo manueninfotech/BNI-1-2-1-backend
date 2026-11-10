@@ -210,6 +210,8 @@ export const registrations = pgTable(
     amountPaid: numeric("amount_paid", { mode: "number" }),
     payment: jsonb("payment").$type<Record<string, unknown> | null>(),
     addedBy: jsonb("added_by").$type<Record<string, unknown> | null>(),
+    /** The member's "Conclave Specific Ask": what they want from this conclave (shown to tablemates). */
+    specificAsk: text("specific_ask"),
     /** Registered at the venue after the conclave started (needs region-admin approval). */
     isWalkIn: boolean("is_walk_in").notNull().default(false),
     /** walk-in: "pending" | "approved" | "rejected" (null for normal registrations). */

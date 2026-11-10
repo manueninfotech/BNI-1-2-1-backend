@@ -142,6 +142,7 @@ export async function register(conclaveId: string, uid: string, details: Record<
     mealPreference: opt(details.mealPreference, 50),
     needsAccommodation: opt(details.needsAccommodation, 50),
     specialInstructions: opt(details.specialInstructions, 1000),
+    specificAsk: opt(details.specificAsk, SPECIFIC_ASK_MAX),
   };
 
   try {
@@ -220,3 +221,36 @@ export async function countRegistrations(conclaveId: string): Promise<number> {
   const [{ n }] = await pgdb.select({ n: sql<number>`count(*)::int` }).from(registrations).where(eq(registrations.conclaveId, conclaveId));
   return n;
 }
+
+/** Max length of a member's Conclave Specific Ask. */
+export const SPECIFIC_ASK_MAX = 200;
+
+/**
+ * Sets (or clears) the member's Conclave Specific Ask — what they hope to get
+ * from this conclave, shown on their card to every tablemate. Editable until
+ * the conclave starts; after that the tables are reading it.
+ */
+export async function setSpecificAsk(conclaveId: string, uid: string, ask: unknown) {
+  const text = opt(ask, SPECIFIC_ASK_MAX);
+  return pgdb.transaction(async (tx) => {
+    const [c] = await tx.select({ status: conclaves.status }).from(conclaves).where(eq(conclaves.id, conclaveId));
+    if (!c) throw ApiError.notFound("Conclave not found.");
+    if (ROLE_LOCKED_STATUSES.has(c.status)) {
+      throw ApiError.conflict("The conclave has started, so your ask can no longer change.");
+    }
+    const [before] = await tx
+      .select()
+      .from(registrations)
+      .where(and(eq(registrations.conclaveId, conclaveId), eq(registrations.userId, uid)))
+      .for("update");
+    if (!before) throw ApiError.notFound("Register for this conclave first.");
+    const [after] = await tx
+      .update(registrations)
+      .set({ specificAsk: text })
+      .where(and(eq(registrations.conclaveId, conclaveId), eq(registrations.userId, uid)))
+      .returning();
+    await audit.change({ action: "registration.specific_ask", entityType: "registration", entityId: `${conclaveId}:${uid}`, conclaveId, before, after }, tx);
+    return { specificAsk: text };
+  });
+}
+
