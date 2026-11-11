@@ -2,7 +2,8 @@
 // hard constraint from scratch. Used by tests (accuracy) and by the UI (a live
 // "constraints held" badge). Intentionally simple and decoupled from the matcher.
 
-import { occupantsOf, type Participant, type Schedule } from "./types.js";
+import { chapterKey } from "./matcher.js";
+import { occupantsOf, resolveSeatingRules, type Participant, type Schedule } from "./types.js";
 
 export interface AuditReport {
   ok: boolean;
@@ -17,17 +18,33 @@ export interface AuditReport {
   captainDrift: number;
   // C2 (soft, reported not failed): pairs that shared a table >1 time
   repeatPairings: number;
+  // Chapter rule (reported, not failed): tables holding more members of one
+  // chapter than its fair share (1 while the chapter fits the tables, else
+  // ceil(size / tables)).
+  chapterOverflows: number;
 }
 
 export function auditSchedule(participants: Participant[], schedule: Schedule): AuditReport {
   const violations: string[] = [];
   const byId = new Map(participants.map((p) => [p.id, p]));
   const P = schedule.config.personsPerTable;
+  // Only the rules this schedule was made with are checked.
+  const rules = resolveSeatingRules(schedule.config.rules);
 
   let categoryCollisions = 0;
   let seatingErrors = 0;
   let oversizedTables = 0;
   let captainDrift = 0;
+  let chapterOverflows = 0;
+
+  // Chapter fair share per table.
+  const chapterSize = new Map<string, number>();
+  for (const p of participants) {
+    const k = chapterKey(p.chapter);
+    if (k) chapterSize.set(k, (chapterSize.get(k) ?? 0) + 1);
+  }
+  const T = Math.max(1, schedule.tableCount);
+  const chapterCap = (k: string) => Math.max(1, Math.ceil((chapterSize.get(k) ?? 0) / T));
 
   // C5: captain -> table number must be constant across rounds.
   const captainTable = new Map<number, number>();
@@ -68,7 +85,7 @@ export function auditSchedule(participants: Participant[], schedule: Schedule): 
         seenThisRound.add(id);
 
         const cat = byId.get(id)?.businessCategory ?? "?";
-        if (cats.has(cat)) {
+        if (rules.category === "separate" && cats.has(cat)) {
           categoryCollisions++;
           violations.push(
             `Round ${round.roundNumber} table ${table.tableNumber}: duplicate category "${cat}".`,
@@ -76,6 +93,14 @@ export function auditSchedule(participants: Participant[], schedule: Schedule): 
         }
         cats.add(cat);
       }
+
+      // Chapter rule
+      const chCount = new Map<string, number>();
+      for (const id of occ) {
+        const k = chapterKey(byId.get(id)?.chapter);
+        if (k) chCount.set(k, (chCount.get(k) ?? 0) + 1);
+      }
+      if (rules.chapter === "separate") for (const [k, n] of chCount) if (n > chapterCap(k)) chapterOverflows++;
 
       // C2 accounting
       for (let a = 0; a < occ.length; a++) {
@@ -106,5 +131,6 @@ export function auditSchedule(participants: Participant[], schedule: Schedule): 
     oversizedTables,
     captainDrift,
     repeatPairings,
+    chapterOverflows,
   };
 }

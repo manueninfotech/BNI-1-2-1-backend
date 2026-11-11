@@ -187,7 +187,7 @@ export async function approveWalkIn(
         throw ApiError.conflict(e.message, { ...e.details, needsCaptain: Boolean(e.details.needsCaptains) });
       }
       if ((e as Error).name === "InfeasibleRoundError") {
-        throw ApiError.conflict("There's no category-safe seat for this member in the remaining rounds.", { detail: (e as Error).message });
+        throw ApiError.conflict("There's no seat for this member in the remaining rounds that keeps this conclave's seating rules.", { detail: (e as Error).message });
       }
       throw e;
     }

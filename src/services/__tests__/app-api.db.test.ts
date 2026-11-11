@@ -120,3 +120,29 @@ describe("live stream (SSE + LISTEN/NOTIFY)", () => {
     expect(row.isRoundPaused).toBe(true);
   });
 });
+
+describe("seating rules (per conclave)", () => {
+  it("seating rules: defaults, save, reject bad values, lock once a schedule exists", async () => {
+    const ctx = { requestId: "rules-test", source: "admin_panel", actor: { uid: "adm", role: "admin" }, changeCount: 0 } as const;
+    const [fresh] = await pgdb
+      .insert(conclaves)
+      .values({ name: "Rules", startDate: new Date(), status: "registrationOpen" })
+      .returning();
+    const view = async () => (await svc.getConclaveOrThrow(fresh.id)).data as any;
+    expect((await view()).seatingRules).toEqual({ category: "separate", chapter: "off", balancedTables: true });
+
+    await runWithContext(ctx as never, () => svc.updateConclave(fresh.id, { seatingRules: { chapter: "separate" } }));
+    expect((await view()).seatingRules).toEqual({ category: "separate", chapter: "separate", balancedTables: true });
+
+    await expect(
+      runWithContext(ctx as never, () => svc.updateConclave(fresh.id, { seatingRules: { chapter: "sometimes" } })),
+    ).rejects.toThrow(/seatingRules.chapter/);
+
+    // Once tables exist, the rules can't change (re-saving the same rules is fine).
+    await pgdb.update(conclaves).set({ schedule: { rounds: [] } }).where(eq(conclaves.id, fresh.id));
+    await runWithContext(ctx as never, () => svc.updateConclave(fresh.id, { seatingRules: { chapter: "separate" } }));
+    await expect(
+      runWithContext(ctx as never, () => svc.updateConclave(fresh.id, { seatingRules: { chapter: "off" } })),
+    ).rejects.toThrow(/schedule already exists/);
+  });
+});

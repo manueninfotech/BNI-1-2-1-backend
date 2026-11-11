@@ -1,0 +1,1 @@
+ALTER TABLE "conclaves" ADD COLUMN "seating_rules" jsonb DEFAULT '{}'::jsonb NOT NULL;

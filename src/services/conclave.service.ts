@@ -12,6 +12,7 @@ import {
 import { notifyConclave, notifyUser, recordUserNotification } from "./notification.service.js";
 import { notifyConclaveChanged } from "./live.service.js";
 import { joinsFromRound } from "../domain/walkIns.js";
+import { resolveSeatingRules, type SeatingRules } from "../engine/types.js";
 import {
   DEFAULT_MOVE_SECONDS,
   EXTEND_SECONDS_OPTIONS,
@@ -86,6 +87,7 @@ export function toView(row: ConclaveRow, registrationCount?: number, referralCou
     snapshot: row.snapshot,
     isScheduleLocked: row.isScheduleLocked,
     captainMode: row.captainMode === "none" ? "none" : "required",
+    seatingRules: resolveSeatingRules(row.seatingRules),
     // Walk-ins can ask to join while a round is still ahead.
     walkInOpen: row.status === ConclaveStatus.running && joinsFromRound(row) !== null,
     standInCaptains: row.standInCaptains ?? {},
@@ -356,6 +358,7 @@ export interface CreateInput {
   roundCount?: number;
   moveSeconds?: number;
   captainMode?: string;
+  seatingRules?: unknown;
   memberLimit?: number;
   captainLimit?: number;
   region?: string;
@@ -363,6 +366,25 @@ export interface CreateInput {
 }
 
 /** "required" | "none", or null for anything else. */
+/** Validates seating rules from the admin panel; stores only known keys. */
+export function seatingRulesInput(v: unknown): SeatingRules {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) {
+    throw ApiError.badRequest("seatingRules must be an object.");
+  }
+  const r = v as Record<string, unknown>;
+  const pick = (k: string, ok: readonly string[]) => {
+    if (r[k] !== undefined && !ok.includes(String(r[k]))) {
+      throw ApiError.badRequest(`seatingRules.${k} must be one of: ${ok.join(", ")}.`);
+    }
+  };
+  pick("category", ["separate", "off"]);
+  pick("chapter", ["separate", "off"]);
+  if (r.balancedTables !== undefined && typeof r.balancedTables !== "boolean") {
+    throw ApiError.badRequest("seatingRules.balancedTables must be true or false.");
+  }
+  return resolveSeatingRules(r);
+}
+
 export function captainModeInput(v: unknown): "required" | "none" | null {
   if (v === undefined || v === null || v === "") return null;
   const s = String(v).toLowerCase();
@@ -421,6 +443,7 @@ export async function createConclave(input: CreateInput): Promise<string> {
     moveSeconds,
     roundExtensionSeconds: 0,
     captainMode: captainModeInput(input.captainMode) ?? "required",
+    seatingRules: input.seatingRules !== undefined ? { ...seatingRulesInput(input.seatingRules) } : {},
     memberLimit: intInput(input.memberLimit, 100, "memberLimit") || 100,
     captainLimit: intInput(input.captainLimit, 12, "captainLimit") || 12,
     paymentDetails: input.paymentDetails ?? null,
@@ -460,6 +483,14 @@ export async function updateConclave(id: string, body: Record<string, any>): Pro
       if (body.paymentDetails?.registrationFee !== undefined) u.registrationFee = Number(body.paymentDetails.registrationFee) || 0;
     }
     if (body.chiefGuests !== undefined) u.chiefGuests = Array.isArray(body.chiefGuests) ? body.chiefGuests : [];
+    if (body.seatingRules !== undefined) {
+      const next = seatingRulesInput(body.seatingRules);
+      const same = JSON.stringify(resolveSeatingRules(next)) === JSON.stringify(resolveSeatingRules(row.seatingRules));
+      if (!same && row.schedule) {
+        throw ApiError.conflict("A schedule already exists. Change the seating rules before generating tables, or regenerate them after.");
+      }
+      u.seatingRules = { ...next };
+    }
     if (body.captainMode !== undefined) {
       const mode = captainModeInput(body.captainMode);
       if (!mode) throw ApiError.badRequest('captainMode must be "required" or "none".');

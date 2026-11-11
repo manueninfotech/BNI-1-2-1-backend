@@ -159,6 +159,8 @@ export const conclaves = pgTable(
     isScheduleLocked: boolean("is_schedule_locked").notNull().default(false),
     /** "required": every table has a fixed captain who scans attendance. "none": no captains, no attendance. */
     captainMode: text("captain_mode").notNull().default("required"),
+    /** Organiser's seating rules (engine SeatingRules); {} means the defaults. */
+    seatingRules: jsonb("seating_rules").$type<Record<string, unknown>>().notNull().default({}),
     /** Per-round stand-in captains the admin marked: { "<round>": { "<tableNumber>": uid } }. */
     standInCaptains: jsonb("stand_in_captains").$type<Record<string, Record<string, string>>>().notNull().default({}),
     /** Last round/phase state pushed to iOS Live Activities (dedupes pushes across instances). */

@@ -33,6 +33,38 @@ export interface ConclaveConfig {
   autoLogoutHours?: number;
   /** No captains: tables have no fixed anchor and everyone rotates. */
   captainless?: boolean;
+  /** The organiser's seating rules for this conclave (see SeatingRules). */
+  rules?: SeatingRules;
+}
+
+/**
+ * Per-conclave seating rules, set by organisers in the admin panel and stored
+ * with the schedule (so a schedule, and every walk-in re-plan of it, keeps the
+ * rules it was generated with).
+ *
+ *  - category: "separate" (default) never seats two people of one business
+ *    category at a table; "off" ignores categories.
+ *  - chapter: "separate" seats at most one member of a chapter per table while
+ *    the chapter has no more people than there are tables, and spreads a bigger
+ *    chapter evenly (at most ceil(size / tables) per table); "off" (default).
+ *  - balancedTables: true (default) keeps table sizes within one of each other.
+ */
+export interface SeatingRules {
+  category: "separate" | "off";
+  chapter: "separate" | "off";
+  balancedTables: boolean;
+}
+
+export const DEFAULT_SEATING_RULES: SeatingRules = { category: "separate", chapter: "off", balancedTables: true };
+
+/** Fills missing or unknown values with the defaults. */
+export function resolveSeatingRules(raw: unknown): SeatingRules {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  return {
+    category: r.category === "off" ? "off" : "separate",
+    chapter: r.chapter === "separate" ? "separate" : "off",
+    balancedTables: r.balancedTables === false ? false : true,
+  };
 }
 
 export const DEFAULT_LIMITS = {
@@ -76,6 +108,8 @@ export interface ScheduleStats {
   maxUniqueMetPerMember: number;
   /** uniquePairsMet / totalPairsPossible, 0..1. */
   coverage: number;
+  /** Rounds where the chapter rule (C4) could not be met and was dropped. */
+  chapterRelaxedRounds?: number;
 }
 
 export interface Schedule {

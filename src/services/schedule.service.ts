@@ -3,7 +3,7 @@ import { pgdb } from "../db/client.js";
 import { conclaves, registrations } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
-import { generateSchedule, planSchedule, validate, tableCountFor, type ConclaveConfig } from "../engine/index.js";
+import { generateSchedule, planSchedule, resolveSeatingRules, validate, tableCountFor, type ConclaveConfig } from "../engine/index.js";
 import { resolveCaptains, type ServerParticipant } from "../domain/captains.js";
 import { ConclaveStatus, ROLE_LOCKED_STATUSES } from "../domain/conclave.js";
 import { validateConfig } from "./conclave.service.js";
@@ -113,7 +113,10 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
 
     const seed = typeof conclave.seed === "number" ? conclave.seed : Date.now();
     const captainIds = captainless ? [] : resolveCaptains(participants, designatedCaptainIds, personsPerTable, seed, tablesRequired);
-    const config: ConclaveConfig = { personsPerTable, roundCount, seed, tableCount: tablesRequired, captainless };
+    // The organiser's seating rules travel inside the schedule's config, so the
+    // schedule and every walk-in re-plan of it keep the rules it was made with.
+    const rules = resolveSeatingRules(conclave.seatingRules);
+    const config: ConclaveConfig = { personsPerTable, roundCount, seed, tableCount: tablesRequired, captainless, rules };
 
     const validation = validate(participants, captainIds, config);
     if (!validation.ok) {
@@ -136,7 +139,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
     } catch (e) {
       if ((e as Error).name === "InfeasibleRoundError") {
         throw ApiError.badRequest(
-          "The roster passed validation but no category-safe seating exists for it. " +
+          "The roster passed validation but no seating that keeps this conclave's seating rules exists for it. " +
             "Try changing persons-per-table (an exact fit with no spare seats is the usual cause), " +
             "or reduce the over-represented business categories.",
           { detail: (e as Error).message, derived: validation.derived },
@@ -144,6 +147,19 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
       }
       throw e;
     }
+
+    // Tell the organiser when the chapter rule had to give way somewhere.
+    const relaxed = schedule.stats.chapterRelaxedRounds ?? 0;
+    const warnings = relaxed > 0
+      ? [
+          ...validation.warnings,
+          {
+            code: "W5",
+            severity: "warning" as const,
+            message: `Chapter members couldn't be kept apart in ${relaxed} round${relaxed === 1 ? "" : "s"}; those rounds still keep categories apart.`,
+          },
+        ]
+      : validation.warnings;
 
     const scheduleSummary = {
       tableCount: schedule.tableCount,
@@ -163,7 +179,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
         isRegistrationOpen: false,
         registrationOverride: "closed",
         scheduleSummary,
-        warnings: validation.warnings,
+        warnings,
         snapshot: { activeOnly, takenAt: new Date().toISOString(), participantCount: participants.length, skippedInactiveCount: skippedInactive },
         updatedAt: new Date(),
       })
@@ -202,7 +218,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
           rolesChanged,
           activeOnly,
           skippedInactive,
-          warnings: validation.warnings.length,
+          warnings: warnings.length,
         },
       },
       tx,
@@ -215,7 +231,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
       participants: participants.length,
       activeOnly,
       skippedInactiveCount: skippedInactive,
-      warnings: validation.warnings,
+      warnings,
       stats: schedule.stats,
     };
   });

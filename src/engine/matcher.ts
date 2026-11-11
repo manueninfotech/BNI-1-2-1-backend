@@ -4,10 +4,18 @@
 // Rules:
 //   - Captains are fixed table anchors (one per table, all rounds). A table may
 //     also have no anchor (captainless conclaves).
-//   - Business-category separation (C1) is HARD and never violated.
-//   - Tables are BALANCED (organisers' rule): with A people at T tables, every
-//     table seats floor(A/T) or ceil(A/T), never more than P. 26 people at 5 per
-//     table -> 6 tables of 5,5,4,4,4,4.
+//   The organiser picks which of these apply per conclave (config.rules, see
+//   SeatingRules in types.ts); defaults in brackets.
+//   - Business-category separation (C1) [on] is HARD and never violated.
+//   - Chapter separation (C4) [off]: no two members of the same BNI chapter at
+//     one table, while the chapter has no more people than there are tables. A
+//     bigger chapter is spread as evenly as possible instead: at most
+//     ceil(size / tables) per table. People without a chapter are unaffected.
+//     If a round still cannot honour C4 it is planned without it rather than
+//     failing (stats.chapterRelaxedRounds counts these).
+//   - Tables are BALANCED [on]: with A people at T tables, every table seats
+//     floor(A/T) or ceil(A/T), never more than P. 26 people at 5 per table ->
+//     6 tables of 5,5,4,4,4,4. Off: tables only need to stay within P.
 //   - Repeat pairings (C2) are SOFT: minimised, allowed only if forced.
 //   - Objective: maximise the number of DISTINCT people each member meets.
 //
@@ -29,6 +37,7 @@
 // categories are a flat counter array. Deterministic for a given seed.
 
 import {
+  resolveSeatingRules,
   type ConclaveConfig,
   type Participant,
   type RoundSeating,
@@ -85,6 +94,7 @@ export function generateSchedule(
 
 export function planSchedule(input: PlanInput): Schedule {
   const { participants, config } = input;
+  const rules = resolveSeatingRules(config.rules);
   const A = participants.length;
   const P = config.personsPerTable;
   const fromRound = Math.max(1, input.fromRound ?? 1);
@@ -123,6 +133,26 @@ export function planSchedule(input: PlanInput): Schedule {
   const catFreq = new Int32Array(C);
   for (let i = 0; i < A; i++) catFreq[catIdxOf[i]]++;
 
+  // Chapters (C4). Free text, so normalise; no chapter = no constraint (-1).
+  const chToIdx = new Map<string, number>();
+  const chIdxOf = new Int32Array(A).fill(-1);
+  for (let i = 0; i < A; i++) {
+    const key = chapterKey(participants[i].chapter);
+    if (!key) continue;
+    let hi = chToIdx.get(key);
+    if (hi === undefined) {
+      hi = chToIdx.size;
+      chToIdx.set(key, hi);
+    }
+    chIdxOf[i] = hi;
+  }
+  const H = Math.max(1, chToIdx.size);
+  const chFreq = new Int32Array(H);
+  for (let i = 0; i < A; i++) if (chIdxOf[i] >= 0) chFreq[chIdxOf[i]]++;
+  // One per table while the chapter fits; otherwise spread evenly.
+  const chCap = new Int32Array(H);
+  for (let h = 0; h < H; h++) chCap[h] = T > 0 ? Math.max(1, Math.ceil(chFreq[h] / T)) : 1;
+
   // --- meeting counts (history first) ----------------------------------------
   const met = new Uint8Array(A * A);
   const meet = (occ: number[]) => {
@@ -153,15 +183,24 @@ export function planSchedule(input: PlanInput): Schedule {
   }
 
   // --- plan the remaining rounds ---------------------------------------------
-  const ctx: RoundCtx = { A, T, P, C, catIdxOf, anchorIdx, memberIdxs, catFreq, met };
+  const ctx: RoundCtx = {
+    A, T, P, C, catIdxOf, anchorIdx, memberIdxs, catFreq, met,
+    H, chIdxOf, chFreq, chCap,
+    categories: rules.category === "separate",
+    chapters: rules.chapter === "separate" && chToIdx.size > 0,
+    balanced: rules.balancedTables,
+  };
+  let chapterRelaxedRounds = 0;
   for (let r = fromRound; r <= config.roundCount; r++) {
-    const tables = planRound(ctx, config.seed, r);
+    const { tables, chapterRelaxed } = planRound(ctx, config.seed, r);
+    if (chapterRelaxed) chapterRelaxedRounds++;
     for (const occ of tables) meet(occ);
     rounds.push(toRoundSeating(r, tables, input.tables, anchorIdx, participants));
   }
   rounds.sort((a, b) => a.roundNumber - b.roundNumber);
 
   const stats = computeStats(A, T, config.roundCount, met);
+  stats.chapterRelaxedRounds = chapterRelaxedRounds;
   return { config, tableCount: T, rounds, stats };
 }
 
@@ -177,10 +216,29 @@ interface RoundCtx {
   memberIdxs: number[];
   catFreq: Int32Array;
   met: Uint8Array;
+  /** Chapters (C4): count, per-member index (-1 = none), sizes, per-table cap. */
+  H: number;
+  chIdxOf: Int32Array;
+  chFreq: Int32Array;
+  chCap: Int32Array;
+  /** Which rules this conclave uses (from config.rules). */
+  categories: boolean;
+  chapters: boolean;
+  balanced: boolean;
+}
+
+/** "Amaravati", " amaravati ", "Amaravati Chapter" -> "amaravati"; blank -> "". */
+export function chapterKey(raw: string | null | undefined): string {
+  return (raw ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\bchapter\b/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 /** Plans one round; returns each table's occupants (anchor first, if any). */
-function planRound(ctx: RoundCtx, seed: number, r: number): number[][] {
+function planRound(ctx: RoundCtx, seed: number, r: number): { tables: number[][]; chapterRelaxed: boolean } {
   const { A, T, P } = ctx;
   if (T === 0) throw new InfeasibleRoundError(r, -1, `Round ${r}: no tables to seat anyone at.`);
   const base = Math.floor(A / T);
@@ -190,21 +248,26 @@ function planRound(ctx: RoundCtx, seed: number, r: number): number[][] {
   }
 
   // Balanced first; only if that is impossible, fall back to "never above P".
-  for (const balanced of [true, false]) {
-    const attempts = balanced ? BALANCED_ATTEMPTS : RELAXED_ATTEMPTS;
-    for (let k = 0; k < attempts; k++) {
-      const rng = makeRng(seed + r * 0x1000193 + k * 0x9e3779b1);
-      const seating = tryRound(ctx, rng, balanced ? { base, extra } : null);
-      if (seating) {
-        improve(ctx, seating, rng);
-        return seating.occ;
+  // Chapters (C4) are honoured in both; only if neither works is C4 dropped.
+  for (const useChapters of ctx.chapters ? [true, false] : [false]) {
+    for (const balanced of ctx.balanced ? [true, false] : [false]) {
+      const attempts = balanced ? BALANCED_ATTEMPTS : RELAXED_ATTEMPTS;
+      for (let k = 0; k < attempts; k++) {
+        const rng = makeRng(seed + r * 0x1000193 + k * 0x9e3779b1);
+        const seating = tryRound(ctx, rng, balanced ? { base, extra } : null, useChapters);
+        if (seating) {
+          improve(ctx, seating, rng);
+          return { tables: seating.occ, chapterRelaxed: ctx.chapters && !useChapters };
+        }
       }
     }
   }
   throw new InfeasibleRoundError(
     r,
     -1,
-    `Round ${r}: no category-safe seating found. A business category probably has more people than there are tables.`,
+    ctx.categories
+      ? `Round ${r}: no category-safe seating found. A business category probably has more people than there are tables.`
+      : `Round ${r}: no seating found that fits the tables.`,
   );
 }
 
@@ -212,22 +275,37 @@ interface Seating {
   occ: number[][];
   tableOf: Int32Array;
   cats: Uint16Array; // T * C counters
+  chs: Uint16Array; // T * H counters
+  useChapters: boolean;
   ceilUsed: number;
   limit: { base: number; extra: number } | null;
 }
 
-function tryRound(ctx: RoundCtx, rng: Rng, limit: { base: number; extra: number } | null): Seating | null {
-  const { A, T, C, catIdxOf, anchorIdx, memberIdxs, catFreq } = ctx;
+function tryRound(
+  ctx: RoundCtx,
+  rng: Rng,
+  limit: { base: number; extra: number } | null,
+  useChapters: boolean,
+): Seating | null {
+  const { A, T, C, H, catIdxOf, chIdxOf, chFreq, anchorIdx, memberIdxs, catFreq } = ctx;
   const s: Seating = {
     occ: Array.from({ length: T }, () => [] as number[]),
     tableOf: new Int32Array(A).fill(-1),
     cats: new Uint16Array(T * C),
+    chs: new Uint16Array(T * H),
+    useChapters,
     ceilUsed: 0,
     limit,
   };
   for (let t = 0; t < T; t++) if (anchorIdx[t] >= 0) add(ctx, s, anchorIdx[t], t);
 
-  const ordered = stableSortByDesc(shuffle(memberIdxs, rng), (m) => catFreq[catIdxOf[m]]);
+  // Most-constrained first: big categories, then (when on) big chapters.
+  const ordered = stableSortByDesc(
+    shuffle(memberIdxs, rng),
+    (m) =>
+      (ctx.categories ? catFreq[catIdxOf[m]] * 4096 : 0) +
+      (useChapters && chIdxOf[m] >= 0 ? Math.min(4095, chFreq[chIdxOf[m]]) : 0),
+  );
   const tableOrder = shuffle(
     Array.from({ length: T }, (_, i) => i),
     rng,
@@ -251,8 +329,18 @@ function hasRoom(ctx: RoundCtx, s: Seating, t: number): boolean {
   return n < base || (n === base && s.ceilUsed < extra);
 }
 
-function safe(ctx: RoundCtx, s: Seating, m: number, t: number): boolean {
-  return s.cats[t * ctx.C + ctx.catIdxOf[m]] === 0;
+/** Could m join table t, ignoring `away` (a member about to leave t)? */
+function safe(ctx: RoundCtx, s: Seating, m: number, t: number, away = -1): boolean {
+  if (ctx.categories) {
+    const cat = ctx.catIdxOf[m];
+    const catAway = away >= 0 && ctx.catIdxOf[away] === cat ? 1 : 0;
+    if (s.cats[t * ctx.C + cat] - catAway > 0) return false;
+  }
+  if (!s.useChapters) return true;
+  const ch = ctx.chIdxOf[m];
+  if (ch < 0) return true;
+  const chAway = away >= 0 && ctx.chIdxOf[away] === ch ? 1 : 0;
+  return s.chs[t * ctx.H + ch] - chAway < ctx.chCap[ch];
 }
 
 function add(ctx: RoundCtx, s: Seating, m: number, t: number) {
@@ -260,6 +348,7 @@ function add(ctx: RoundCtx, s: Seating, m: number, t: number) {
   s.occ[t].push(m);
   s.tableOf[m] = t;
   s.cats[t * ctx.C + ctx.catIdxOf[m]]++;
+  if (ctx.chIdxOf[m] >= 0) s.chs[t * ctx.H + ctx.chIdxOf[m]]++;
 }
 
 function remove(ctx: RoundCtx, s: Seating, m: number) {
@@ -269,6 +358,7 @@ function remove(ctx: RoundCtx, s: Seating, m: number) {
   if (s.limit && occ.length === s.limit.base) s.ceilUsed--;
   s.tableOf[m] = -1;
   s.cats[t * ctx.C + ctx.catIdxOf[m]]--;
+  if (ctx.chIdxOf[m] >= 0) s.chs[t * ctx.H + ctx.chIdxOf[m]]--;
 }
 
 /** Repeat cost of seating m with table t's occupants (skipping `except`). */
@@ -303,18 +393,16 @@ function bestTable(ctx: RoundCtx, s: Seating, m: number, order: number[]): numbe
  * exact-fit dead end). Table sizes stay valid: t loses x and gains m.
  */
 function repair(ctx: RoundCtx, s: Seating, m: number, order: number[]): boolean {
-  const catM = ctx.catIdxOf[m];
   let bestT = -1;
   let bestX = -1;
   let bestDest = -1;
   let bestCost = Infinity;
 
   for (const t of order) {
-    const sameCat = s.cats[t * ctx.C + catM];
-    if (sameCat > 1) continue; // two to evict — not a one-move repair
     for (const x of s.occ[t]) {
       if (ctx.anchorIdx[t] === x) continue; // anchors never move
-      if (sameCat === 1 && ctx.catIdxOf[x] !== catM) continue; // must evict the blocker
+      // With x gone, m must satisfy every rule at t (category and chapter).
+      if (!safe(ctx, s, m, t, x)) continue;
       for (const d of order) {
         if (d === t) continue;
         if (!hasRoom(ctx, s, d) || !safe(ctx, s, x, d)) continue;
@@ -338,7 +426,7 @@ function repair(ctx: RoundCtx, s: Seating, m: number, order: number[]): boolean 
 
 /** Swap members between tables while it lowers the round's repeat total. */
 function improve(ctx: RoundCtx, s: Seating, rng: Rng) {
-  const { T, C, catIdxOf, anchorIdx } = ctx;
+  const { T, anchorIdx } = ctx;
   if (T < 2) return;
   for (let pass = 0; pass < IMPROVE_PASSES; pass++) {
     let improved = false;
@@ -347,16 +435,14 @@ function improve(ctx: RoundCtx, s: Seating, rng: Rng) {
         if (anchorIdx[a] === m || s.tableOf[m] !== a) continue;
         const cm = cost(ctx, s, m, a);
         if (cm === 0) continue; // no repeats for m here
-        const catM = catIdxOf[m];
         const sample = Math.min(T - 1, SWAP_SAMPLE_TABLES);
         let done = false;
         for (let k = 0; k < sample && !done; k++) {
           const b = (a + 1 + Math.floor(rng() * (T - 1))) % T;
           for (const x of s.occ[b]) {
             if (anchorIdx[b] === x) continue;
-            const catX = catIdxOf[x];
-            // C1 after the swap: b without x must not hold catM; a without m must not hold catX.
-            if (catX !== catM && (s.cats[b * C + catM] > 0 || s.cats[a * C + catX] > 0)) continue;
+            // Every rule must hold after the swap: m at b without x, x at a without m.
+            if (!safe(ctx, s, m, b, x) || !safe(ctx, s, x, a, m)) continue;
             const before = cm + cost(ctx, s, x, b);
             const after = cost(ctx, s, m, b, x) + cost(ctx, s, x, a, m);
             if (after < before) {

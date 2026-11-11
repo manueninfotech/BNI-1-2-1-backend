@@ -1,7 +1,9 @@
 // The validation gate from the spec (§6). Runs BEFORE schedule generation.
 // Hard checks (errors) block generation; warnings are advisory.
 
+import { chapterKey } from "./matcher.js";
 import {
+  resolveSeatingRules,
   type ConclaveConfig,
   type Participant,
   type ValidationIssue,
@@ -34,6 +36,7 @@ export function validate(
   const maxRounds = config.maxRounds ?? DEFAULT_LIMITS.maxRounds;
   const captainSet = new Set(captainIds);
   const captainless = config.captainless === true;
+  const rules = resolveSeatingRules(config.rules);
 
   // --- 6.1 Data integrity ---------------------------------------------------
   // V1: every participant has a non-empty business category.
@@ -102,8 +105,9 @@ export function validate(
     if (c) categoryCounts.set(c, (categoryCounts.get(c) ?? 0) + 1);
   }
   const distinctCategories = categoryCounts.size;
+  // V10-V12 only apply while categories are kept apart (the default rule).
   // V10: a full table of P needs P distinct categories.
-  if (distinctCategories < P) {
+  if (rules.category === "separate" && distinctCategories < P) {
     err(
       "V10",
       `Only ${distinctCategories} distinct categories but tables seat ${P}. ` +
@@ -111,7 +115,8 @@ export function validate(
     );
   }
   // V11: per round, each table holds at most one person of a category.
-  const overRepresented = [...categoryCounts.entries()].filter(([, c]) => c > T);
+  const overRepresented =
+    rules.category === "separate" ? [...categoryCounts.entries()].filter(([, c]) => c > T) : [];
   for (const [cat, c] of overRepresented) {
     err(
       "V11",
@@ -125,12 +130,32 @@ export function validate(
       .map((id) => participants.find((p) => p.id === id)?.businessCategory)
       .filter(Boolean) as string[],
   );
-  if (captainIds.length > 0 && captainCategories.size < captainIds.length) {
+  if (rules.category === "separate" && captainIds.length > 0 && captainCategories.size < captainIds.length) {
     warn(
       "V12",
       `Captains span only ${captainCategories.size} categories across ${captainIds.length} tables; ` +
         `repeated captain categories reduce seating flexibility.`,
     );
+  }
+
+  // W4 (advisory): the chapter rule keeps chapter members apart only while a
+  // chapter has no more people than tables; a bigger chapter is spread evenly.
+  const chapterCounts = new Map<string, { name: string; n: number }>();
+  for (const p of rules.chapter === "separate" ? participants : []) {
+    const k = chapterKey(p.chapter);
+    if (!k) continue;
+    const e = chapterCounts.get(k) ?? { name: p.chapter!.trim(), n: 0 };
+    e.n++;
+    chapterCounts.set(k, e);
+  }
+  for (const { name, n } of chapterCounts.values()) {
+    if (T > 0 && n > T) {
+      warn(
+        "W4",
+        `Chapter "${name}" has ${n} people but only ${T} tables, so up to ${Math.ceil(n / T)} ` +
+          `of them will share a table. Add tables to keep them apart.`,
+      );
+    }
   }
 
   // --- 6.5 Advisory warnings ------------------------------------------------
