@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { auth } from "../config/firebase.js";
 import { pgdb } from "../db/client.js";
 import { admins, conclaves, registrations, users } from "../db/schema.js";
@@ -172,6 +172,7 @@ export async function getMe({ uid, email, emailVerified }: MeInput) {
 
   const [admin] = await pgdb.select().from(admins).where(eq(admins.uid, uid));
   if (admin) {
+    const [userRow] = await pgdb.select({ photoUrl: users.photoUrl }).from(users).where(eq(users.uid, uid)).limit(1);
     return {
       uid,
       id: uid,
@@ -184,6 +185,7 @@ export async function getMe({ uid, email, emailVerified }: MeInput) {
       designation: admin.designation || (admin.role === "superadmin" ? "Global Administrator" : "Regional Administrator"),
       organization: admin.organization || (admin.role === "superadmin" ? "BNI Global LLC" : "BNI Regional Office"),
       createdAt: admin.grantedAt.toISOString(),
+      photoUrl: userRow?.photoUrl ?? null,
     };
   }
 
@@ -196,10 +198,101 @@ export async function getMe({ uid, email, emailVerified }: MeInput) {
       .select()
       .from(users)
       .where(or(sql`lower(${users.email}) = ${e}`, sql`lower(${users.identifier}) = ${e}`))
+      .orderBy(desc(users.updatedAt))
       .limit(1);
   }
 
+  // Cross-sync profile fields across linked email/phone accounts (e.g. mobile app vs web portal)
+  if (user && (user.email || user.phone)) {
+    const conditions = [];
+    if (user.email) conditions.push(eq(sql`lower(${users.email})`, user.email.toLowerCase()));
+    if (user.phone) conditions.push(eq(users.phone, user.phone));
+    const [matching] = await pgdb
+      .select({
+        photoUrl: users.photoUrl,
+        chapter: users.chapter,
+        designation: users.designation,
+        membership: users.membership,
+        company: users.company,
+        category: users.category,
+        updatedAt: users.updatedAt,
+      })
+      .from(users)
+      .where(and(or(...conditions), ne(users.uid, uid)))
+      .orderBy(desc(users.updatedAt))
+      .limit(1);
+
+    if (matching) {
+      const updates: Partial<typeof users.$inferInsert> = {};
+      const matchingIsNewer = Boolean(matching.updatedAt && user.updatedAt && matching.updatedAt > user.updatedAt);
+
+      if (matchingIsNewer) {
+        // Newer record on mobile/other login wins — mirror state cleanly
+        user.chapter = matching.chapter;
+        updates.chapter = matching.chapter;
+        if (matching.designation !== undefined) {
+          user.designation = matching.designation;
+          updates.designation = matching.designation;
+        }
+        if (matching.membership !== undefined) {
+          user.membership = matching.membership;
+          updates.membership = matching.membership;
+        }
+        if (matching.company) {
+          user.company = matching.company;
+          updates.company = matching.company;
+        }
+        if (matching.category) {
+          user.category = matching.category;
+          updates.category = matching.category;
+        }
+        if (matching.photoUrl) {
+          user.photoUrl = matching.photoUrl;
+          updates.photoUrl = matching.photoUrl;
+        }
+      } else {
+        if (!user.photoUrl && matching.photoUrl) {
+          user.photoUrl = matching.photoUrl;
+          updates.photoUrl = matching.photoUrl;
+        }
+        if ((!user.designation || user.designation === "BNI Member") && matching.designation && matching.designation !== "BNI Member") {
+          user.designation = matching.designation;
+          updates.designation = matching.designation;
+        }
+        if (!user.membership && matching.membership) {
+          user.membership = matching.membership;
+          updates.membership = matching.membership;
+        }
+        if (!user.company && matching.company) {
+          user.company = matching.company;
+          updates.company = matching.company;
+        }
+        if (!user.category && matching.category) {
+          user.category = matching.category;
+          updates.category = matching.category;
+        }
+      }
+
+      if (Object.keys(updates).length > 0) {
+        void pgdb.update(users).set(updates).where(eq(users.uid, uid)).catch(() => {});
+      }
+    }
+  }
+
   const captain = (await isLiveCaptain(uid)) || (user?.role === "captain") || Boolean(user?.isCaptain);
+  let resolvedDesignation = user?.designation && user.designation !== "BNI Member" && user.designation !== "Guest Attendee" ? user.designation : "";
+  if (!resolvedDesignation) {
+    if (user?.membership === "Non-BNI") {
+      resolvedDesignation = "Non-BNI";
+    } else if (captain) {
+      resolvedDesignation = "Table Captain";
+    } else {
+      resolvedDesignation = "1-2-1 Connect Member";
+    }
+  }
+
+  const effectiveMembership = user?.membership || (resolvedDesignation === "Non-BNI" ? "Non-BNI" : "BNI");
+
   return {
     uid,
     id: uid,
@@ -211,13 +304,15 @@ export async function getMe({ uid, email, emailVerified }: MeInput) {
     businessName: user?.company ?? "",
     category: user?.category ?? "",
     businessCategory: user?.category ?? "",
-    chapter: user?.chapter ?? "",
+    chapter: effectiveMembership === "Non-BNI" ? "" : (user?.chapter ?? ""),
     region: user?.region ?? "",
     location: user?.location ?? "",
-    designation: user?.designation || (captain ? "Table Captain" : "BNI Member"),
+    membership: effectiveMembership,
+    designation: resolvedDesignation,
     createdAt: (user?.createdAt ?? new Date()).toISOString(),
     role: captain ? "captain" : "member",
     isCaptain: captain,
+    photoUrl: user?.photoUrl ?? null,
   };
 }
 
@@ -335,8 +430,14 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
   }
   // Same normalisation as registration: "Guntur", " guntur " group as one place.
   if (input.location !== undefined) patch.location = str(input.location).toLowerCase() || null;
-  if (input.designation !== undefined) patch.designation = str(input.designation);
-  if (input.membership !== undefined) patch.membership = str(input.membership);
+  if (input.designation !== undefined) patch.designation = str(input.designation) || null;
+  if (input.membership !== undefined) {
+    patch.membership = str(input.membership) || null;
+    if (patch.membership === "Non-BNI") {
+      patch.chapter = null;
+      if (!patch.designation) patch.designation = "Non-BNI";
+    }
+  }
   if (input.lookingFor !== undefined) patch.lookingFor = str(input.lookingFor, 1000);
   if (input.canOffer !== undefined) patch.canOffer = str(input.canOffer, 1000);
   if (input.state !== undefined) patch.state = str(input.state) || null;
@@ -365,6 +466,13 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
       }).where(eq(registrations.userId, uid));
     }
 
+    if (after.email || after.phone) {
+      const linkConditions = [];
+      if (after.email) linkConditions.push(eq(sql`lower(${users.email})`, after.email.toLowerCase()));
+      if (after.phone) linkConditions.push(eq(users.phone, after.phone));
+      await tx.update(users).set({ ...patch, updatedAt: new Date() }).where(and(or(...linkConditions), ne(users.uid, uid)));
+    }
+
     return {
       id: uid,
       uid,
@@ -385,6 +493,7 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
       membership: after.membership ?? "",
       lookingFor: after.lookingFor ?? "",
       canOffer: after.canOffer ?? "",
+      photoUrl: after.photoUrl ?? null,
       createdAt: after.createdAt?.toISOString(),
       updatedAt: after.updatedAt?.toISOString(),
     };

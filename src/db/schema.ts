@@ -121,9 +121,6 @@ export const conclaves = pgTable(
     venueLocation: text("venue_location").notNull().default(""),
     region: text("region"),
     coordinator: text("coordinator"),
-    creator: text("creator"),
-    theme: text("theme"),
-    dateRange: text("date_range"),
 
     startDate: ts("start_date"),
     endDate: ts("end_date"),

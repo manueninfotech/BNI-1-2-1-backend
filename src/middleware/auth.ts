@@ -27,7 +27,9 @@ export interface AuthedRequest extends Omit<Request, "params"> {
 
 function bearerToken(req: Request): string | null {
   const header = req.headers.authorization ?? "";
-  return header.startsWith("Bearer ") ? header.slice(7).trim() : null;
+  if (header.startsWith("Bearer ")) return header.slice(7).trim();
+  if (typeof req.query.token === "string" && req.query.token.trim()) return req.query.token.trim();
+  return null;
 }
 
 /**
