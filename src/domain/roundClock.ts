@@ -43,16 +43,42 @@ export interface ClockRow {
   moveSeconds?: number | null;
   isRoundPaused?: boolean | null;
   roundElapsedMsBeforePause?: number | null;
+  schedule?: any;
 }
 
-const people = (row: Pick<ClockRow, "personsPerTable">) =>
-  Math.min(MAX_PERSONS_PER_TABLE, Math.max(1, Number(row.personsPerTable) || 1));
+export function people(row: Partial<ClockRow>, roundNumber?: number | null): number {
+  const round = roundNumber ?? (Number(row.currentRound) || 1);
+  const schedule = (row as any).schedule;
+  if (schedule?.rounds && Array.isArray(schedule.rounds)) {
+    const r = schedule.rounds.find((rnd: any) => (rnd.roundNumber || rnd.round || rnd.number) === round);
+    if (r?.tables && Array.isArray(r.tables) && r.tables.length > 0) {
+      const maxTableSize = Math.max(
+        ...r.tables.map((t: any) => {
+          const membersCount = Array.isArray(t.memberIds)
+            ? t.memberIds.length
+            : Array.isArray(t.members)
+              ? t.members.length
+              : Array.isArray(t.participants)
+                ? t.participants.length
+                : 0;
+          const hasCaptain = t.captainId !== null && t.captainId !== undefined;
+          return membersCount + (hasCaptain ? 1 : 0);
+        }),
+        0
+      );
+      if (maxTableSize > 0) {
+        return Math.min(MAX_PERSONS_PER_TABLE, Math.max(maxTableSize, Number(row.personsPerTable) || 1));
+      }
+    }
+  }
+  return Math.min(MAX_PERSONS_PER_TABLE, Math.max(1, Number(row.personsPerTable) || 1));
+}
 
 export const isAutomatic = (row: Pick<ClockRow, "roundProgressionMode">) => row.roundProgressionMode === "automatic";
 
 /** Lengths of the parts of a round, in ms. */
-export function phases(row: Pick<ClockRow, "personsPerTable">) {
-  const p = people(row);
+export function phases(row: Partial<ClockRow>, roundNumber?: number | null) {
+  const p = people(row, roundNumber);
   const bioMs = p * BIO_MS_PER_PERSON;
   const referralMs = p * REFERRAL_MS_PER_PERSON;
   return { bioMs, referralMs, talkMs: bioMs + referralMs };
@@ -81,7 +107,7 @@ export function roundStartMs(row: ClockRow, k: number): number | null {
   const anchor = row.currentRoundStartedAt.getTime();
   if (k === cur) return anchor;
   if (!isAutomatic(row)) return null;
-  const { talkMs } = phases(row);
+  const { talkMs } = phases(row, cur);
   return anchor + (talkMs + extMs(row) + moveMs(row)) + (k - cur - 1) * (talkMs + moveMs(row));
 }
 
@@ -89,14 +115,14 @@ export function roundStartMs(row: ClockRow, k: number): number | null {
 export function roundEndMs(row: ClockRow, k: number): number | null {
   const start = roundStartMs(row, k);
   if (start === null) return null;
-  return start + phases(row).talkMs + (k === (Number(row.currentRound) || 0) ? extMs(row) : 0);
+  return start + phases(row, k).talkMs + (k === (Number(row.currentRound) || 0) ? extMs(row) : 0);
 }
 
 /** The referral slot of round `k` (ms), or null if that round has no start yet. */
 export function referralSlot(row: ClockRow, k: number): { opens: number; closes: number } | null {
   const start = roundStartMs(row, k);
   if (start === null) return null;
-  const { bioMs, referralMs } = phases(row);
+  const { bioMs, referralMs } = phases(row, k);
   return { opens: start + bioMs, closes: start + bioMs + referralMs };
 }
 
@@ -115,7 +141,7 @@ export function liveClock(row: ClockRow, now = Date.now()): LiveClock {
   const total = Number(row.roundCount) || 0;
   if (cur < 1 || !row.currentRoundStartedAt) return { round: 0, phase: "not_started", roundStartMs: null, phaseEndsMs: null };
   const t = clockNow(row, now);
-  const { bioMs, talkMs } = phases(row);
+  const { bioMs, talkMs } = phases(row, cur);
 
   let k = cur;
   // Automatic mode: walk forward through rounds the clock has started.

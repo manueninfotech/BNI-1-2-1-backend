@@ -197,12 +197,18 @@ export async function approveWalkIn(
         .find((r) => r.roundNumber === fromRound)
         ?.tables.find((t) => t.captainId === pid || t.memberIds.includes(pid))?.tableNumber ?? null;
 
+    const maxTableOccupancy = Math.max(
+      ...plan.schedule.rounds.flatMap((r) => r.tables.map((t) => (t.memberIds?.length || 0) + (t.captainId !== null ? 1 : 0))),
+      c.personsPerTable || 1
+    );
+
     await tx
       .update(conclaves)
       .set({
         schedule: plan.schedule as unknown as Record<string, unknown>,
         participants: plan.participants,
         scheduleSummary: { tableCount: plan.schedule.tableCount, coverage: plan.schedule.stats.coverage, repeatPairings: plan.schedule.stats.repeatPairings },
+        ...(maxTableOccupancy > (c.personsPerTable || 0) ? { personsPerTable: maxTableOccupancy } : {}),
         updatedAt: new Date(),
       })
       .where(eq(conclaves.id, conclaveId));

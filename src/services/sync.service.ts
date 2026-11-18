@@ -404,6 +404,7 @@ async function buildState(
     id: conclaveId,
     name: conclave.name,
     status,
+    captainMode: conclave.captainMode ?? "required",
     currentRound: conclave.currentRound,
     currentRoundStartedAt: view.currentRoundStartedAt,
     isRoundPaused: Boolean(conclave.isRoundPaused),
