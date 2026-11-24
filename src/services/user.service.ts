@@ -5,6 +5,7 @@ import { admins, conclaves, registrations, users } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import { getAutoLogoutHours } from "./settings.service.js";
+import { canonicalChapter } from "./chapters.service.js";
 import { placeholderCompany, placeholderEmail, placeholderName, placeholderPlace } from "../domain/placeholderProfile.js";
 
 /**
@@ -329,7 +330,8 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
   }
   if (input.company !== undefined || input.businessName !== undefined) patch.company = str(input.company ?? input.businessName);
   if (input.category !== undefined || input.businessCategory !== undefined) patch.category = str(input.category ?? input.businessCategory);
-  if (input.chapter !== undefined) patch.chapter = str(input.chapter) || null;
+  // Snap to the listed spelling, so "amaravathi chapter" files under "BNI Amaravathi".
+  if (input.chapter !== undefined) patch.chapter = (str(input.chapter) && (await canonicalChapter(str(input.chapter)))) || null;
   if (input.region !== undefined) {
     patch.region = str(input.region) || null;
     if (input.location === undefined) patch.location = patch.region ? patch.region.toLowerCase() : null;

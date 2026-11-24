@@ -11,6 +11,7 @@ import * as roles from "../services/role.service.js";
 import * as stats from "../services/stats.service.js";
 import * as passwordReset from "../services/passwordReset.service.js";
 import * as categories from "../services/categories.service.js";
+import * as chapters from "../services/chapters.service.js";
 import * as settings from "../services/settings.service.js";
 import * as feedback from "../services/feedback.service.js";
 import * as payments from "../services/payments.service.js";
@@ -83,6 +84,20 @@ export async function getNotificationTemplates(_req: AuthedRequest, res: Respons
 }
 export async function setNotificationTemplates(req: AuthedRequest, res: Response) {
   res.json(await settings.setNotificationTemplates(req.body || {}));
+}
+
+// ---- BNI chapters (the members' pick list) --------------------------------
+export async function listChapters(_req: AuthedRequest, res: Response) {
+  res.json({ chapters: await chapters.listChapters(), suggestions: await chapters.chapterSuggestions() });
+}
+export async function setChapters(req: AuthedRequest, res: Response) {
+  res.json({ chapters: await chapters.setChapters(req.body?.chapters) });
+}
+export async function addChapter(req: AuthedRequest, res: Response) {
+  res.json({ chapters: await chapters.addChapter(req.body?.name) });
+}
+export async function removeChapter(req: AuthedRequest, res: Response) {
+  res.json({ chapters: await chapters.removeChapter(req.body?.name) });
 }
 
 // ---- Business categories (managed here, read live by the app) -------------

@@ -31,6 +31,11 @@ router.get("/categories", asyncHandler(c.listCategories));
 router.put("/categories", asyncHandler(c.setCategories)); // replace whole list
 router.post("/categories", asyncHandler(c.addCategory)); // { name }
 router.post("/categories/remove", asyncHandler(c.removeCategory)); // { name }
+// BNI chapters: the members' pick list, plus suggestions from typed chapters
+router.get("/chapters", asyncHandler(c.listChapters));
+router.put("/chapters", asyncHandler(c.setChapters)); // replace whole list
+router.post("/chapters", asyncHandler(c.addChapter)); // { name }
+router.post("/chapters/remove", asyncHandler(c.removeChapter)); // { name }
 
 // Conclaves. Every /conclaves/:id/... route is region-checked here, once.
 router.use("/conclaves/:id", asyncHandler(requireConclaveAccess));
