@@ -16,3 +16,5 @@ uploads
 .idea
 README.md
 vercel.json
+temp.mjs
+*.local.mjs
