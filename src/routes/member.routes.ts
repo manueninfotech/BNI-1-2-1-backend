@@ -9,6 +9,7 @@ const router = Router();
 router.post("/auth/resolve-identifier", asyncHandler(c.resolveIdentifier));
 router.get("/app-config", asyncHandler(c.appConfig));
 router.get("/categories", asyncHandler(c.listCategories)); // sign-up / profile pickers
+router.get("/public/conclaves/:id", asyncHandler(c.publicConclave)); // shared-link preview, no sign-in
 
 /**
  * Member endpoints. Every one requires a verified Firebase token — the caller's

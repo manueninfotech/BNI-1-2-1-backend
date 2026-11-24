@@ -6,6 +6,7 @@ import { getForMember, listForMember } from "../services/conclave.service.js";
 import { subscribe } from "../services/live.service.js";
 import * as categoriesSvc from "../services/categories.service.js";
 import * as chaptersSvc from "../services/chapters.service.js";
+import { publicConclave as publicConclaveSvc } from "../services/publicConclave.service.js";
 import { getAutoLogoutHours, getRoundTiming, getConclaveDefaults } from "../services/settings.service.js";
 import { createOrder, razorpayConfigured } from "../services/razorpay.service.js";
 import * as feedback from "../services/feedback.service.js";
@@ -227,3 +228,9 @@ export async function removeLiveActivity(req: AuthedRequest, res: Response) {
   res.json(await liveActivity.removeToken(req.params.id, req.uid));
 }
 
+
+/** A shared conclave link's preview: public facts only, no sign-in needed. */
+export async function publicConclave(req: AuthedRequest, res: Response) {
+  res.set("Cache-Control", "public, max-age=300");
+  res.json(await publicConclaveSvc(String(req.params.id)));
+}
