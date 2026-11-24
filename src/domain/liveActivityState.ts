@@ -82,7 +82,7 @@ export function liveActivityFor(row: LiveActivityRow, uid: string, now = Date.no
   if (c.phase === "not_started" || c.roundStartMs === null) return null;
 
   const ext = c.round === (Number(row.currentRound) || 0) ? (Number(row.roundExtensionSeconds) || 0) * 1000 : 0;
-  const talkEnds = c.roundStartMs + phases(row).talkMs + ext;
+  const talkEnds = c.roundStartMs + phases(row, c.round).talkMs + ext;
   const captainHere = here?.captainId === pid;
 
   switch (c.phase) {

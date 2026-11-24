@@ -10,6 +10,7 @@ import { validateConfig } from "./conclave.service.js";
 import { fetchUsers, isActiveUser } from "./user.service.js";
 import { getAutoLogoutHours, getConclaveDefaults } from "./settings.service.js";
 import { notifyConclaveChanged } from "./live.service.js";
+import { roundPeopleFor } from "../domain/roundPeople.js";
 
 export interface GenerateOptions {
   /** Seat only ACTIVE users — the people actually in the room. */
@@ -173,6 +174,7 @@ export async function generateForConclave(conclaveId: string, opts: GenerateOpti
         roundCount,
         seed,
         schedule: schedule as unknown as Record<string, unknown>,
+        roundPeople: roundPeopleFor(schedule, personsPerTable),
         participants,
         // Generating the tables closes registration (organisers' rule).
         status: ConclaveStatus.registrationClosed,

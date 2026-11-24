@@ -78,6 +78,7 @@ export function toView(row: ConclaveRow, registrationCount?: number, referralCou
     agendaDocument: row.agendaDocument,
     allowAdminAddMembers: row.allowAdminAddMembers,
     personsPerTable: row.personsPerTable ?? getCachedConclaveDefaults().personsPerTable,
+    roundPeople: row.roundPeople ?? null,
     roundCount: row.roundCount ?? getCachedConclaveDefaults().roundCount,
     seed: row.seed,
     schedule: row.schedule,

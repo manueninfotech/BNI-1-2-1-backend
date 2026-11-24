@@ -37,6 +37,7 @@ export async function liveState(id: string) {
       roundElapsedMsBeforePause: conclaves.roundElapsedMsBeforePause,
       // Round clock inputs, so phones run exactly the server's clock.
       personsPerTable: conclaves.personsPerTable,
+      roundPeople: conclaves.roundPeople,
       roundProgressionMode: conclaves.roundProgressionMode,
       roundExtensionSeconds: conclaves.roundExtensionSeconds,
       moveSeconds: conclaves.moveSeconds,

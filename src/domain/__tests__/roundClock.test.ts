@@ -84,3 +84,33 @@ describe("pause", () => {
     expect(liveClock(paused, T0 + 60 * MIN)).toMatchObject({ round: 1, phase: "bio" });
   });
 });
+
+// Same cases in the panel (src/utils/roundClock.test.js) and the app
+// (test/round_clock_test.dart): keep all three in step.
+describe("per-round sizes (walk-ins enlarge later rounds)", () => {
+  // Tables of 5; a walk-in re-plan makes round 3's biggest table 6.
+  const sized = (over: Partial<ClockRow> = {}) =>
+    row({ personsPerTable: 5, roundPeople: [5, 5, 6, 5], roundProgressionMode: "automatic", ...over });
+
+  it("each round is timed for its own size", () => {
+    expect(phases(sized(), 1).talkMs).toBe(7.5 * MIN);
+    expect(phases(sized(), 3).talkMs).toBe(9 * MIN);
+    expect(referralSlot(sized(), 1)).toEqual({ opens: T0 + 5 * MIN, closes: T0 + 7.5 * MIN });
+  });
+
+  it("automatic: later rounds start after each earlier round's own length", () => {
+    // R1 7.5 + move 2 = 9.5; R2 7.5 + 2 = 19; R3 9 + 2 = 30.
+    expect(roundStartMs(sized(), 2)).toBe(T0 + 9.5 * MIN);
+    expect(roundStartMs(sized(), 3)).toBe(T0 + 19 * MIN);
+    expect(roundStartMs(sized(), 4)).toBe(T0 + 30 * MIN);
+    // In round 3 the bio phase runs 6 minutes, not 5.
+    expect(liveClock(sized(), T0 + 19 * MIN + 5.5 * MIN)).toMatchObject({ round: 3, phase: "bio" });
+    expect(liveClock(sized(), T0 + 19 * MIN + 6.5 * MIN)).toMatchObject({ round: 3, phase: "referral" });
+  });
+
+  it("without stored sizes, or out of range, it falls back to people-per-table", () => {
+    expect(phases(row({ personsPerTable: 5 }), 3).talkMs).toBe(7.5 * MIN);
+    expect(phases(sized(), 9).talkMs).toBe(7.5 * MIN);
+    expect(phases(sized({ roundPeople: [12] }), 1).talkMs).toBe(12 * MIN);
+  });
+});

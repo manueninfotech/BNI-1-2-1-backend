@@ -149,6 +149,12 @@ export const conclaves = pgTable(
 
     // Scheduling (engine output is read and written whole, so it stays JSON).
     personsPerTable: integer("persons_per_table"),
+    /** Each round's clock size (index = round - 1): the larger of
+     *  personsPerTable and that round's biggest table, at most 8. Written with
+     *  every schedule change (generation, walk-in re-plan); null = use
+     *  personsPerTable. Sent on the live stream so phones and the panel run
+     *  the same clock as the server. */
+    roundPeople: jsonb("round_people").$type<number[]>(),
     roundCount: integer("round_count"),
     seed: bigint("seed", { mode: "number" }),
     schedule: jsonb("schedule").$type<Record<string, unknown> | null>(),
