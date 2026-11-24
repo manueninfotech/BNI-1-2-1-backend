@@ -19,6 +19,7 @@ export interface PublicConclave {
   startTime: string;
   endTime: string;
   status: string;
+  coverImage: string | null;
 }
 
 const ID = /^[A-Za-z0-9_-]{6,64}$/;
@@ -36,6 +37,7 @@ export async function publicConclave(id: string): Promise<PublicConclave> {
       startTime: conclaves.startTime,
       endTime: conclaves.endTime,
       status: conclaves.status,
+      coverImage: conclaves.coverImage,
     })
     .from(conclaves)
     .where(eq(conclaves.id, id));
@@ -50,5 +52,6 @@ export async function publicConclave(id: string): Promise<PublicConclave> {
     startTime: c.startTime ?? "",
     endTime: c.endTime ?? "",
     status: c.status,
+    coverImage: c.coverImage?.url ?? null,
   };
 }

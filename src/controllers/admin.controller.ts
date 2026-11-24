@@ -177,6 +177,23 @@ export async function uploadAgendaDocument(req: AuthedRequest, res: Response) {
   });
 }
 
+// ---- Cover image and flyers ----------------------------------------------
+export async function setCover(req: AuthedRequest, res: Response) {
+  res.json({ coverImage: await conclaves.setCoverImage(req.params.id, req.body ?? {}) });
+}
+export async function removeCover(req: AuthedRequest, res: Response) {
+  res.json({ coverImage: await conclaves.setCoverImage(req.params.id, null) });
+}
+export async function addFlyer(req: AuthedRequest, res: Response) {
+  res.json({ flyers: await conclaves.addFlyer(req.params.id, req.body ?? {}) });
+}
+export async function removeFlyer(req: AuthedRequest, res: Response) {
+  res.json({ flyers: await conclaves.removeFlyer(req.params.id, req.params.flyerId) });
+}
+export async function reorderFlyers(req: AuthedRequest, res: Response) {
+  res.json({ flyers: await conclaves.reorderFlyers(req.params.id, req.body?.ids) });
+}
+
 export async function complete(req: AuthedRequest, res: Response) {
   const result = await conclaves.completeConclave(req.params.id);
   res.json({

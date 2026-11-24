@@ -1,6 +1,8 @@
 import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { pgdb } from "../db/client.js";
-import { conclaves, referrals, registrations, users } from "../db/schema.js";
+import { conclaves, referrals, registrations, users, type ConclaveImage } from "../db/schema.js";
+import { randomUUID } from "node:crypto";
+import { publicImage } from "../domain/conclaveImage.js";
 import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import {
@@ -45,6 +47,7 @@ type ConclavePatch = Partial<typeof conclaves.$inferInsert>;
 
 const iso = (d: Date | null | undefined) => (d ? d.toISOString() : null);
 
+
 export function toView(row: ConclaveRow, registrationCount?: number, referralCount?: number) {
   return {
     // Legacy-only fields first, so real columns always win.
@@ -79,6 +82,9 @@ export function toView(row: ConclaveRow, registrationCount?: number, referralCou
     allowAdminAddMembers: row.allowAdminAddMembers,
     personsPerTable: row.personsPerTable ?? getCachedConclaveDefaults().personsPerTable,
     roundPeople: row.roundPeople ?? null,
+    // Images only as links + names; storage paths stay on the server.
+    coverImage: publicImage(row.coverImage),
+    flyers: (row.flyers ?? []).map(publicImage).filter(Boolean),
     roundCount: row.roundCount ?? getCachedConclaveDefaults().roundCount,
     seed: row.seed,
     schedule: row.schedule,
@@ -1287,6 +1293,89 @@ export async function setAgenda(
   const previous = (row.agendaDocument as { storagePath?: string } | null)?.storagePath;
   if (previous && previous !== record?.storagePath) await deleteFile(previous);
   return record;
+}
+
+// ---------------------------------------------------------------------------
+// Cover image and flyers (set in the admin panel, shown in the app)
+//
+// Each change goes through mutate(): one audited transaction that also tells
+// every open phone and panel the conclave changed, so new images appear
+// without a reload. Replaced or removed files are deleted from storage after
+// the commit.
+// ---------------------------------------------------------------------------
+
+const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+export const MAX_FLYERS = 12;
+
+async function storeImage(folder: string, input: { dataUrl?: unknown; name?: unknown }): Promise<ConclaveImage> {
+  const { contentType, data } = decodeDataUrl(String(input.dataUrl ?? ""));
+  if (!IMAGE_TYPES.has(contentType)) throw ApiError.badRequest("Upload a JPEG, PNG or WebP image.");
+  if (data.length > MAX_IMAGE_BYTES) throw ApiError.badRequest("Images must be 8 MB or smaller.");
+  const ext = contentType === "image/png" ? "png" : contentType === "image/webp" ? "webp" : "jpg";
+  const stored = await uploadFile(folder, `image.${ext}`, contentType, data);
+  return {
+    id: randomUUID(),
+    url: stored.url,
+    path: stored.path,
+    name: String(input.name ?? "").trim().slice(0, 120) || `Image.${ext}`,
+    contentType,
+    bytes: stored.bytes,
+    uploadedAt: new Date().toISOString(),
+  };
+}
+
+/** Sets (or, with null, removes) the conclave's cover image. */
+export async function setCoverImage(id: string, input: { dataUrl?: unknown; name?: unknown } | null) {
+  const img = input ? await storeImage("conclave-covers", input) : null;
+  try {
+    const { before } = await mutate(id, img ? "conclave.cover_set" : "conclave.cover_clear", () => ({ coverImage: img }));
+    if (before.coverImage?.path) await deleteFile(before.coverImage.path);
+  } catch (e) {
+    if (img) await deleteFile(img.path); // don't orphan the upload
+    throw e;
+  }
+  return publicImage(img);
+}
+
+export async function addFlyer(id: string, input: { dataUrl?: unknown; name?: unknown }) {
+  const img = await storeImage("conclave-flyers", input);
+  try {
+    const { after } = await mutate(id, "conclave.flyer_add", (row) => {
+      const list = row.flyers ?? [];
+      if (list.length >= MAX_FLYERS) throw ApiError.badRequest(`A conclave can have up to ${MAX_FLYERS} flyers.`);
+      return { flyers: [...list, img] };
+    });
+    return (after.flyers ?? []).map(publicImage);
+  } catch (e) {
+    await deleteFile(img.path);
+    throw e;
+  }
+}
+
+export async function removeFlyer(id: string, flyerId: string) {
+  let removed: ConclaveImage | undefined;
+  const { after } = await mutate(id, "conclave.flyer_remove", (row) => {
+    const list = row.flyers ?? [];
+    removed = list.find((f) => f.id === flyerId);
+    if (!removed) throw ApiError.notFound("No such flyer.");
+    return { flyers: list.filter((f) => f.id !== flyerId) };
+  });
+  if (removed?.path) await deleteFile(removed.path);
+  return (after.flyers ?? []).map(publicImage);
+}
+
+/** Puts the flyers in the given order (every current flyer id, once). */
+export async function reorderFlyers(id: string, ids: unknown) {
+  const { after } = await mutate(id, "conclave.flyers_reorder", (row) => {
+    const list = row.flyers ?? [];
+    const order = Array.isArray(ids) ? ids.map(String) : [];
+    if (order.length !== list.length || new Set(order).size !== order.length || !order.every((x) => list.some((f) => f.id === x))) {
+      throw ApiError.badRequest("Send every flyer id once, in the new order.");
+    }
+    return { flyers: order.map((x) => list.find((f) => f.id === x)!) };
+  });
+  return (after.flyers ?? []).map(publicImage);
 }
 
 /** One conclave for a member: full detail (schedule included), contacts stripped. */

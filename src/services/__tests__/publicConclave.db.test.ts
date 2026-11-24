@@ -16,7 +16,7 @@ describe("public conclave preview", () => {
     await pgdb.insert(conclaves).values({ id: "conc-123456", name: "Guntur Mega 1-2-1", venueLocation: "Hotel Grand, Guntur", region: "Guntur", startDate: new Date("2026-12-12T04:30:00Z"), startTime: "10:00 AM" } as any);
     const p = await publicConclave("conc-123456");
     expect(p).toMatchObject({ id: "conc-123456", name: "Guntur Mega 1-2-1", venue: "Hotel Grand, Guntur", region: "Guntur", startTime: "10:00 AM" });
-    expect(Object.keys(p).sort()).toEqual(["endDate", "endTime", "id", "name", "region", "startDate", "startTime", "status", "venue"]);
+    expect(Object.keys(p).sort()).toEqual(["coverImage", "endDate", "endTime", "id", "name", "region", "startDate", "startTime", "status", "venue"]);
   });
 
   it("404s unknown or malformed ids", async () => {

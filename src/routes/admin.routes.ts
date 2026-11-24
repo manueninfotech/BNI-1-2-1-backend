@@ -53,6 +53,12 @@ router.post("/conclaves/:id/complete", asyncHandler(c.complete));
 router.post("/conclaves/:id/finish", asyncHandler(c.complete));
 router.post("/conclaves/:id/lock-schedule", asyncHandler(c.lockSchedule));
 router.post("/conclaves/:id/agenda-document", asyncHandler(c.uploadAgendaDocument));
+// Cover image and flyers: { dataUrl, name } (JPEG/PNG/WebP, 8 MB)
+router.put("/conclaves/:id/cover", asyncHandler(c.setCover));
+router.delete("/conclaves/:id/cover", asyncHandler(c.removeCover));
+router.post("/conclaves/:id/flyers", asyncHandler(c.addFlyer));
+router.put("/conclaves/:id/flyers/order", asyncHandler(c.reorderFlyers)); // { ids }
+router.delete("/conclaves/:id/flyers/:flyerId", asyncHandler(c.removeFlyer));
 router.post("/conclaves/:id/start-round", asyncHandler(c.startRound));
 router.post("/conclaves/:id/pause-round", asyncHandler(c.pauseRound));
 router.post("/conclaves/:id/resume-round", asyncHandler(c.resumeRound));

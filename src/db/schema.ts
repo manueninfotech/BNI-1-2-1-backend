@@ -155,6 +155,10 @@ export const conclaves = pgTable(
      *  personsPerTable. Sent on the live stream so phones and the panel run
      *  the same clock as the server. */
     roundPeople: jsonb("round_people").$type<number[]>(),
+    /** The conclave's feature image (cards, page header, link preview). */
+    coverImage: jsonb("cover_image").$type<ConclaveImage | null>(),
+    /** Flyers shown as a gallery on the conclave page, in this order. */
+    flyers: jsonb("flyers").$type<ConclaveImage[]>().notNull().default([]),
     roundCount: integer("round_count"),
     seed: bigint("seed", { mode: "number" }),
     schedule: jsonb("schedule").$type<Record<string, unknown> | null>(),
@@ -460,3 +464,13 @@ export const liveActivityTokens = pgTable(
   (t) => [primaryKey({ columns: [t.conclaveId, t.userId] })],
 );
 
+/** An image stored for a conclave (cover or flyer). `url` is our /api/files link. */
+export interface ConclaveImage {
+  id: string;
+  url: string;
+  path: string;
+  name: string;
+  contentType: string;
+  bytes: number;
+  uploadedAt: string;
+}

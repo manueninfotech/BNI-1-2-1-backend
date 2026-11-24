@@ -5,6 +5,7 @@ import { eq, sql } from "drizzle-orm";
 import { env } from "../config/env.js";
 import { pgdb } from "../db/client.js";
 import { conclaves } from "../db/schema.js";
+import { publicImage } from "../domain/conclaveImage.js";
 
 /**
  * Live conclave state for the app (replaces Firestore snapshot listeners).
@@ -44,6 +45,10 @@ export async function liveState(id: string) {
       isScheduleLocked: conclaves.isScheduleLocked,
       isRegistrationOpen: conclaves.isRegistrationOpen,
       updatedAt: conclaves.updatedAt,
+      // Cover and flyers are small (links + names), so phones and the panel
+      // apply them straight from the stream: a new flyer appears at once.
+      coverImage: conclaves.coverImage,
+      flyers: conclaves.flyers,
     })
     .from(conclaves)
     .where(eq(conclaves.id, id));
@@ -60,6 +65,8 @@ export async function liveState(id: string) {
       phaseEndsAt: clock.phaseEndsMs !== null ? new Date(clock.phaseEndsMs).toISOString() : null,
       extensionSeconds: clock.round === c.currentRound ? c.roundExtensionSeconds : 0,
     },
+    coverImage: publicImage(c.coverImage),
+    flyers: (c.flyers ?? []).map(publicImage).filter(Boolean),
     currentRoundStartedAt: c.currentRoundStartedAt?.toISOString() ?? null,
     roundPausedAt: c.roundPausedAt?.toISOString() ?? null,
     updatedAt: c.updatedAt.toISOString(),
