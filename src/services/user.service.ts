@@ -5,6 +5,7 @@ import { admins, conclaves, registrations, users } from "../db/schema.js";
 import { audit } from "../audit/audit.service.js";
 import { ApiError } from "../middleware/errors.js";
 import { getAutoLogoutHours } from "./settings.service.js";
+import { placeholderCompany, placeholderEmail, placeholderName, placeholderPlace } from "../domain/placeholderProfile.js";
 
 /**
  * Members (the `users` table). Login stays on Firebase Auth; `uid` is the
@@ -344,6 +345,23 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
 
   return pgdb.transaction(async (tx) => {
     const [before] = await tx.select().from(users).where(eq(users.uid, uid)).for("update");
+    // No test or placeholder details. Checked only when a value changes, so an
+    // older profile can still save its other fields.
+    if (patch.name && patch.name !== before?.name && placeholderName(patch.name)) {
+      throw ApiError.badRequest("Please enter your real full name, using letters only.");
+    }
+    if (patch.company && patch.company !== before?.company && placeholderCompany(patch.company)) {
+      throw ApiError.badRequest("Please enter your real business name.");
+    }
+    if (patch.email && patch.email !== before?.email && placeholderEmail(patch.email)) {
+      throw ApiError.badRequest("Please enter an email address you use.");
+    }
+    for (const key of ["location", "region", "state"] as const) {
+      const v = patch[key];
+      if (v && v !== before?.[key] && placeholderPlace(v)) {
+        throw ApiError.badRequest("Please enter a real place, like Guntur.");
+      }
+    }
     const [after] = before
       ? await tx.update(users).set({ ...patch, updatedAt: new Date() }).where(eq(users.uid, uid)).returning()
       : await tx
