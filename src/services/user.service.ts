@@ -255,6 +255,49 @@ const str = (v: unknown, max = 200) => String(v ?? "").trim().slice(0, max);
  * fields (name, phone, designation, organization) are editable — `region` drives
  * regional authorization, so it changes only through the coordinator screen.
  */
+/**
+ * Stops one person from ending up with several profiles. A phone number (and,
+ * for a new profile, an email) may belong to one live account only.
+ *
+ * How duplicates happened (Ganesh, 26 Nov): an account whose login was gone,
+ * or one an admin created by email, left a profile behind; signing up again
+ * by OTP made a new login and a second profile with the same number.
+ *
+ * Another profile counts as live only if its Firebase login still exists. A
+ * profile whose login is gone is an orphan: it is removed (audited) so the
+ * person can sign up again, instead of being blocked forever.
+ */
+async function assertNotTaken(
+  tx: Parameters<Parameters<typeof pgdb.transaction>[0]>[0],
+  uid: string,
+  wanted: { phone: string | null; email: string | null },
+) {
+  const conds = [];
+  if (wanted.phone) conds.push(eq(users.phone, wanted.phone));
+  if (wanted.email) conds.push(sql`lower(${users.email}) = ${wanted.email.toLowerCase()}`);
+  if (conds.length === 0) return;
+  const others = await tx.select().from(users).where(and(ne(users.uid, uid), or(...conds)));
+  for (const other of others) {
+    const live = await auth.getUser(other.uid).then(
+      () => true,
+      (e: { code?: string }) => {
+        if (e?.code === "auth/user-not-found") return false;
+        throw e; // can't tell: fail closed rather than allow a duplicate
+      },
+    );
+    if (live) {
+      const byPhone = wanted.phone && other.phone === wanted.phone;
+      throw ApiError.conflict(
+        byPhone
+          ? "This number already has an account. Sign in with your number and password, or use Forgot password."
+          : "This email is already used by another account. Sign in with that account, or use a different email.",
+      );
+    }
+    await tx.delete(users).where(eq(users.uid, other.uid));
+    await audit.change({ action: "user.orphan_removed", entityType: "user", entityId: other.uid, before: other, after: null, metadata: { replacedBy: uid } }, tx);
+  }
+}
+
 export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: string) {
   const [admin] = await pgdb.select().from(admins).where(eq(admins.uid, uid));
   if (admin) {
@@ -347,6 +390,12 @@ export async function updateMe(uid: string, input: UpdateMeInput, signInEmail?: 
 
   return pgdb.transaction(async (tx) => {
     const [before] = await tx.select().from(users).where(eq(users.uid, uid)).for("update");
+    // One profile per person: a new profile, or a changed number/email, may
+    // not reuse another live account's phone or email.
+    await assertNotTaken(tx, uid, {
+      phone: patch.phone && patch.phone !== before?.phone ? patch.phone : null,
+      email: !before && patch.email ? patch.email : null,
+    });
     // No test or placeholder details. Checked only when a value changes, so an
     // older profile can still save its other fields.
     if (patch.name && patch.name !== before?.name && placeholderName(patch.name)) {
