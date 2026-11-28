@@ -105,7 +105,10 @@ function cleanList(list: unknown, fallback: string[]): string[] {
   const out: string[] = [];
   for (const e of list) {
     const raw = String(e ?? "").trim();
-    const s = raw ? capitalizeFirst(raw) : "";
+    // Strip control characters (including null bytes \u0000) that crash Postgres jsonb
+    const clean = raw.replace(/[\u0000-\u001F\u007F-\u009F]/g, "").trim();
+    if (!clean || clean.length > 100) continue;
+    const s = capitalizeFirst(clean);
     if (!s || seen.has(s.toLowerCase())) continue;
     seen.add(s.toLowerCase());
     out.push(s);

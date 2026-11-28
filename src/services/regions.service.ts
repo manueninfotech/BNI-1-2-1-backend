@@ -25,7 +25,7 @@ export interface RegionView {
 }
 
 function cleanName(v: unknown): string {
-  const name = String(v ?? "").trim();
+  const name = String(v ?? "").replace(/[\u0000-\u001F\u007F-\u009F]/g, "").trim();
   if (!name) throw ApiError.badRequest("Region name is required.");
   if (name.length > 100) throw ApiError.badRequest("Region name is too long (max 100 characters).");
   return name;
